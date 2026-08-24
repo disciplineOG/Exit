@@ -1,0 +1,132 @@
+{
+  "title": "Java Backend Deep Dive",
+  "subtitle": "A complete, from-first-principles reference across Java, Spring, and system design.",
+  "phases": [
+    {
+      "id": "phase-1",
+      "title": "Phase 1 — Foundation & Low-Level Mastery",
+      "days": "Days 01–20",
+      "focus": "JVM mechanics, OOD, Collections internals, streams, concurrency.",
+      "dayRanges": [
+        {
+          "range": "01–05",
+          "topics": [
+            { "id": "jvm-architecture", "track": "Java / LLD", "title": "JVM Architecture, Memory Model & GC", "file": "content/jvm-architecture.html" },
+            { "id": "hld-basics-scaling", "track": "HLD", "title": "HLD Basics: Scaling & Load Balancers", "file": "content/hld-basics-scaling.html" }
+          ]
+        },
+        {
+          "range": "06–10",
+          "topics": [
+            { "id": "collections-internals", "track": "Java / LLD", "title": "Java Collections Framework Internals", "file": "content/collections-internals.html" },
+            { "id": "caching-strategies", "track": "HLD", "title": "Caching Strategies & Redis Architecture", "file": "content/caching-strategies.html" }
+          ]
+        },
+        {
+          "range": "11–15",
+          "topics": [
+            { "id": "streams-functional", "track": "Java / LLD", "title": "Java 8+ Streams API & Functional Programming", "file": "content/streams-functional.html" },
+            { "id": "database-architecture", "track": "HLD", "title": "Database Architecture: SQL/NoSQL, Indexing, Sharding", "file": "content/database-architecture.html" }
+          ]
+        },
+        {
+          "range": "16–20",
+          "topics": [
+            { "id": "concurrency-multithreading", "track": "Java / LLD", "title": "Multithreading, Concurrency & Virtual Threads", "file": "content/concurrency-multithreading.html" },
+            { "id": "distributed-systems-core", "track": "HLD", "title": "Distributed Systems Core: CAP, ACID/BASE, Sagas", "file": "content/distributed-systems-core.html" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "phase-2",
+      "title": "Phase 2 — Framework Core & Mid-Scale Architecture",
+      "days": "Days 21–40",
+      "focus": "Spring Boot internals, REST APIs, persistence, async messaging, design patterns.",
+      "dayRanges": [
+        {
+          "range": "21–25",
+          "topics": [
+            { "id": "spring-core-mechanics", "track": "Spring / LLD", "title": "Spring Core Mechanics: IoC, DI, AOP, Auto-Config", "file": "content/spring-core-mechanics.html" },
+            { "id": "microservice-patterns", "track": "Microservices / HLD", "title": "Microservice Patterns: Discovery, Gateway, Tracing", "file": "content/microservice-patterns.html" }
+          ]
+        },
+        {
+          "range": "26–30",
+          "topics": [
+            { "id": "jpa-hibernate", "track": "Spring / LLD", "title": "Spring Data JPA & Hibernate Internals", "file": "content/jpa-hibernate.html" },
+            { "id": "async-messaging", "track": "Microservices / HLD", "title": "Async Communication: Kafka, RabbitMQ, Outbox Pattern", "file": "content/async-messaging.html" }
+          ]
+        },
+        {
+          "range": "31–35",
+          "topics": [
+            { "id": "solid-design-patterns", "track": "Spring / LLD", "title": "SOLID Principles & Design Patterns", "file": "content/solid-design-patterns.html" },
+            { "id": "resilience-fault-tolerance", "track": "Microservices / HLD", "title": "Resilience: Circuit Breakers, Bulkhead, Rate Limiting", "file": "content/resilience-fault-tolerance.html" }
+          ]
+        },
+        {
+          "range": "36–40",
+          "topics": [
+            { "id": "lld-parking-lot", "track": "LLD Machine Coding", "title": "LLD #1: Parking Lot System", "file": "content/lld-parking-lot.html" },
+            { "id": "hld-url-shortener", "track": "HLD Problem", "title": "HLD #1: URL Shortener", "file": "content/hld-url-shortener.html" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "phase-3",
+      "title": "Phase 3 — Advanced Systems, Security & LLD Machine Coding",
+      "days": "Days 41–60",
+      "focus": "Distributed systems design, security, observability, advanced Java, HLD case studies.",
+      "dayRanges": [
+        {
+          "range": "41–45",
+          "topics": [
+            { "id": "spring-security", "track": "Security / LLD", "title": "Spring Security: OAuth2, OIDC, JWT, RBAC", "file": "content/spring-security.html" },
+            { "id": "hld-ecommerce-flash-sale", "track": "HLD Problem", "title": "HLD #2: E-Commerce / Flash Sale System", "file": "content/hld-ecommerce-flash-sale.html" }
+          ]
+        },
+        {
+          "range": "46–50",
+          "topics": [
+            { "id": "modern-java-features", "track": "Java / LLD", "title": "Modern Java: Records, Sealed Classes, Pattern Matching", "file": "content/modern-java-features.html" },
+            { "id": "hld-distributed-messaging", "track": "HLD Problem", "title": "HLD #3: Distributed Messaging / Notification Engine", "file": "content/hld-distributed-messaging.html" }
+          ]
+        },
+        {
+          "range": "51–55",
+          "topics": [
+            { "id": "lld-rate-limiter-cache", "track": "LLD Machine Coding", "title": "LLD #2: Rate Limiter / TTL Cache", "file": "content/lld-rate-limiter-cache.html" },
+            { "id": "observability-production", "track": "HLD", "title": "Observability & Production Readiness", "file": "content/observability-production.html" }
+          ]
+        },
+        {
+          "range": "56–60",
+          "topics": [
+            { "id": "lld-elevator-bookmyshow", "track": "LLD Machine Coding", "title": "LLD #3: Elevator System / BookMyShow", "file": "content/lld-elevator-bookmyshow.html" },
+            { "id": "hld-design-recap", "track": "HLD", "title": "System Design Synthesis: Putting Scaling, Consistency & Resilience Together", "file": "content/hld-design-recap.html" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "phase-4",
+      "title": "Phase 4 — Additional Topics",
+      "days": "Ongoing",
+      "focus": "Topics frequently skipped in study plans but valuable for a complete backend engineering picture.",
+      "dayRanges": [
+        {
+          "range": "Bonus",
+          "topics": [
+            { "id": "testing-strategies", "track": "Bonus", "title": "Testing Strategy: JUnit5, Mockito, TestContainers, Contract Tests", "file": "content/testing-strategies.html" },
+            { "id": "docker-kubernetes", "track": "Bonus", "title": "Containers & Orchestration: Docker, Kubernetes Fundamentals", "file": "content/docker-kubernetes.html" },
+            { "id": "api-design-versioning", "track": "Bonus", "title": "API Design: REST Maturity, OpenAPI, Versioning, Idempotency", "file": "content/api-design-versioning.html" },
+            { "id": "ci-cd-deployment", "track": "Bonus", "title": "CI/CD & Deployment Strategies: Blue-Green, Canary, Feature Flags", "file": "content/ci-cd-deployment.html" },
+            { "id": "cloud-fundamentals", "track": "Bonus", "title": "Cloud Fundamentals for Backend Engineers (AWS core services)", "file": "content/cloud-fundamentals.html" }
+          ]
+        }
+      ]
+    }
+  ]
+}
