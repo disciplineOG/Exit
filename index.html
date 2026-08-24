@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Java Backend Deep Dive</title>
+
+<!-- Home screen / PWA support (iOS + Android) -->
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="assets/favicon-32.png" sizes="32x32" type="image/png" />
+<link rel="apple-touch-icon" href="assets/icon-180.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Java Deep Dive" />
+<meta name="theme-color" content="#000000" />
+<meta name="mobile-web-app-capable" content="yes" />
+
+<link rel="stylesheet" href="assets/styles.css" />
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <button id="menu-toggle" class="menu-toggle" title="Menu" aria-label="Toggle navigation">☰</button>
+      <div class="brand">
+        <span class="brand-mark">☕︎</span>
+        <span class="brand-name">Java&nbsp;Backend&nbsp;Deep&nbsp;Dive</span>
+      </div>
+      <div class="search-wrap">
+        <input id="search" type="text" placeholder="Search topics… (e.g. GC, Kafka, CAP)" autocomplete="off" />
+      </div>
+      <button id="theme-toggle" class="theme-toggle" title="Toggle appearance" aria-label="Toggle appearance">◐</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <div id="sidebar-scrim" class="sidebar-scrim"></div>
+    <nav id="sidebar" class="sidebar">
+      <!-- injected by app.js -->
+    </nav>
+
+    <main id="content" class="content">
+      <section id="hero" class="hero">
+        <h1>Java Backend<br/>Deep‑Dive Reference</h1>
+        <p class="hero-sub">A complete, from-first-principles reference across Java internals, Spring, and system design.<br/>Pick any topic on the left — each page is self‑contained with everything adjacent to it.</p>
+        <div class="hero-hint desktop-only">Tip: use <kbd>⌘K</kbd> / <kbd>Ctrl K</kbd> to jump straight to a topic.</div>
+        <div class="hero-hint mobile-only">Tip: tap ☰ to browse topics.</div>
+      </section>
+    </main>
+  </div>
+
+  <div id="cmdk" class="cmdk-overlay hidden">
+    <div class="cmdk-box">
+      <input id="cmdk-input" type="text" placeholder="Jump to a topic…" autocomplete="off" />
+      <div id="cmdk-results" class="cmdk-results"></div>
+    </div>
+  </div>
+
+  <script src="assets/app.js"></script>
+</body>
+</html>
