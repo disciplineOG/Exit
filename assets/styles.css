@@ -394,6 +394,16 @@ th { font-weight: 650; color: var(--text-secondary); font-size: 13px; text-trans
 }
 
 @media (max-width: 900px) {
+  .topbar-inner {
+    flex-wrap: wrap;
+    gap: 10px 12px;
+    padding-left: calc(16px + env(safe-area-inset-left));
+    padding-right: calc(16px + env(safe-area-inset-right));
+    padding-bottom: 10px;
+  }
+  .brand { flex: 1; min-width: 0; }
+  .brand-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+  .search-wrap { order: 3; flex-basis: 100%; max-width: none; }
   .sidebar {
     position: fixed;
     top: 0;
