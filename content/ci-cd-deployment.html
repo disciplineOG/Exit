@@ -1,0 +1,186 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Bonus · Bonus</p>
+<h1>CI/CD & Deployment Strategies: Blue-Green, Canary, Feature Flags</h1>
+<div class="topic-tags">
+<span class="tag">CI vs CD</span>
+<span class="tag">Pipeline Design</span>
+<span class="tag">Rolling Deployment</span>
+<span class="tag">Blue-Green</span>
+<span class="tag">Canary Releases</span>
+<span class="tag">Feature Flags</span>
+<span class="tag">Expand-Contract Migrations</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Most production incidents that get blamed on "a bad deploy" are actually failures in the deployment <em>strategy</em>, not the code — a schema change that isn't backward-compatible during a rolling rollout, a Blue-Green switch that forgets long-lived database connections pin clients to the old environment, or a canary that ships to 5% of traffic but is judged against metrics that take ten minutes to aggregate. Understanding how these mechanisms actually route traffic and manage state lets you predict exactly which class of bug survives each strategy and design migrations that never require the deploy and the schema change to be atomic — because they never actually are.</p>
+</div>
+
+<h2>1. Continuous Integration, Delivery, and Deployment — precise distinctions</h2>
+<p>These three terms describe an increasing amount of trust placed in the automated pipeline, and conflating them (as marketing material routinely does) hides the actual engineering question, which is: <em>how much of the release process is a human still gating, versus how much has been proven safe enough to automate?</em></p>
+
+<h3>Continuous Integration (CI)</h3>
+<p>CI is a practice about the <em>codebase</em>, not about releasing. It means every developer merges their changes into a shared trunk (or a short-lived branch that merges quickly) frequently — multiple times a day rather than in long-lived feature branches — and every merge automatically triggers a build and test run. The problem CI solves is integration cost: if ten developers each work in isolation for two weeks and then try to merge, the combined diff is enormous, conflicts are numerous, and nobody remembers why a particular line changed. Merging small diffs constantly and verifying each one immediately means integration problems are caught within minutes of being introduced, when the change causing them is still small and fresh in the author's mind.</p>
+
+<h3>Continuous Delivery</h3>
+<p>Continuous Delivery extends CI with the guarantee that <strong>every change that passes the pipeline produces an artifact that is deployable to production at any time</strong> — but a human still decides <em>when</em> to actually deploy it. The pipeline builds, tests, and packages automatically; a release manager or the on-call engineer clicks a button (or runs a command) to push a specific, already-verified artifact live. The trust boundary here is: the pipeline is trusted to produce something safe to ship, but the business decision of timing (avoid Friday afternoon, wait for a marketing announcement, batch several changes) is still manual.</p>
+
+<h3>Continuous Deployment</h3>
+<p>Continuous Deployment removes that manual gate entirely: every change that passes the automated pipeline is deployed to production automatically, with no human in the loop. This is a strictly stronger claim than Continuous Delivery — it requires trusting the pipeline's test suite, static analysis, and any canary/rollback automation enough that a human review step adds no real safety, only latency. Teams that reach this stage typically compensate for the removed manual gate with automated progressive rollout (canary analysis, automatic rollback on error-rate spikes) rather than dropping safety altogether — the gate moves from "a person looks at it" to "the system watches metrics and decides."</p>
+
+<table>
+<tr><th>Stage</th><th>What's automated</th><th>What's still manual</th><th>Trust required in pipeline</th></tr>
+<tr><td>Continuous Integration</td><td>Merge, build, test on every commit</td><td>Deciding to release at all</td><td>Low — just catches integration bugs early</td></tr>
+<tr><td>Continuous Delivery</td><td>Build, test, package into a releasable artifact</td><td>Triggering the actual deployment</td><td>Medium — pipeline output is trusted as release-ready</td></tr>
+<tr><td>Continuous Deployment</td><td>Build, test, package, <em>and</em> deploy</td><td>Nothing — rollback is the only manual lever left</td><td>High — pipeline decides what reaches users</td></tr>
+</table>
+
+<div class="callout">
+<div class="callout-title">A common misreading</div>
+<p>People often say "we do CI/CD" to mean nothing more than "we have a Jenkins job." The distinction that actually matters operationally is whether a human is a required step between a green pipeline and code running in production. If yes, you have Continuous Delivery at best. If a merge to trunk can reach production users within minutes with zero human click, you have Continuous Deployment — and that has real implications for how much you invest in automated progressive rollout and rollback, covered below.</p>
+</div>
+
+<h2>2. Anatomy of a pipeline: ordering stages by cost and confidence</h2>
+<p>A pipeline is a sequence of gates, and each gate should be ordered so that the <strong>cheapest, fastest checks that catch the most common failures run first</strong>. The reason this ordering matters is feedback latency: if a trivial typo that would be caught by a linter in two seconds only gets caught after a twenty-minute integration test suite, every contributor who makes that mistake burns twenty minutes waiting for something a compiler or linter could have told them near-instantly. A well-ordered pipeline fails fast.</p>
+
+<ol>
+<li><strong>Build / compile.</strong> Does the code even compile (or, for interpreted languages, does static parsing succeed)? This is seconds to low minutes and catches syntax and type errors before anything else runs.</li>
+<li><strong>Static analysis / linting.</strong> Style violations, banned API usage, obvious null-safety issues, dependency vulnerability scans (e.g., a Software Composition Analysis step checking for known-CVE libraries). These tools run against source without executing anything, so they're cheap and can run in parallel with the build.</li>
+<li><strong>Unit tests.</strong> Fast, isolated, no network or database — a suite of thousands of unit tests should complete in well under a few minutes. They catch logic errors in a single class or function in isolation.</li>
+<li><strong>Integration tests.</strong> Slower — they spin up a real (or containerized) database, message broker, or call between services, so they take longer and are flakier. They validate that components actually cooperate correctly, which unit tests with mocks cannot guarantee. See <a href="#/testing-strategies">testing-strategies</a> for the deeper trade-offs between these test levels and where contract tests fit.</li>
+<li><strong>Artifact packaging.</strong> Once tests pass, build the actual deployable unit — a container image, a JAR, a native package — and push it to an artifact registry with an immutable version tag. This artifact is what every later stage will reference; you never rebuild it from source again, because rebuilding risks a different result (a dependency resolving to a newer patch version, for instance) than what was tested.</li>
+<li><strong>Deployment.</strong> The packaged, already-tested artifact is rolled out to an environment using one of the strategies in the next section, typically progressing through a staging or pre-production environment before production.</li>
+</ol>
+
+<div class="callout tip">
+<div class="callout-title">Why packaging must come after tests, not before</div>
+<p>A subtle but important invariant: the artifact that gets deployed to production must be the <em>exact same binary</em> that was tested, not a fresh build from the same source. If your pipeline rebuilds the artifact separately for the deploy stage, you lose the guarantee that "what we tested is what we're shipping" — a dependency version could float, a non-deterministic build step could produce different bytecode, or a flag could differ between environments. Build once, test that one artifact, promote it unchanged through every environment.</p>
+</div>
+
+<h2>3. Rolling deployment — the default, and its hidden requirement</h2>
+<p>A rolling deployment replaces old instances with new ones gradually: take one instance (or a small batch) out of the load balancer pool, terminate it, start an instance running the new version, wait for its health check to pass, add it back to the pool, then repeat for the next batch until all instances are on the new version. This is the default strategy in most orchestration systems — it's what Kubernetes does with a `Deployment` object's default `RollingUpdate` strategy, controlled by `maxSurge` (how many extra instances beyond the desired count can exist temporarily) and `maxUnavailable` (how many instances can be down at once).</p>
+
+<p>Its appeal is that it requires no extra infrastructure: you don't need double the servers, just enough headroom to take one batch out of rotation at a time. The cost is the one non-obvious requirement it imposes: <strong>for the entire duration of the rollout, both the old and new version are simultaneously live and serving real traffic</strong>. If a request from a client using the new version's response schema hits an old-version instance behind a shared cache or a stale API contract, or if the new version writes a database row shape the old version's read path can't parse, you get intermittent, load-balancer-dependent failures that are maddening to reproduce because they only occur on requests that happen to be routed to the "wrong" version. This is why every change deployed via rolling strategy must be backward- and forward-compatible for the rollout window — the database schema, the message formats on any queue, and any shared cache entries must all be readable by both the version being replaced and the version replacing it.</p>
+
+<h2>4. Blue-Green deployment — atomic cutover, doubled cost</h2>
+<p>Blue-Green deployment maintains two complete, independent production environments — call them Blue (currently live) and Green (idle, or being prepared). To deploy, you provision the new version fully into Green, run smoke tests against it directly (bypassing the main traffic router), and once you're confident it's healthy, you flip a router or load balancer configuration to send <strong>all</strong> traffic to Green atomically. Blue is left running, untouched, for some soak period.</p>
+
+<p>The mechanic that makes rollback effectively instant is that Blue never stopped running — rolling back is just flipping the router back to Blue, which takes as long as a DNS or load-balancer config change propagates (seconds, not the minutes a redeploy-and-restart would take). This is qualitatively different from rolling deployment's rollback, which requires re-rolling the previous version through every instance again.
+
+<p>The cost is that during the overlap window you are running (and paying for) two full copies of your production capacity. For a fleet of a few instances this is trivial; for a large fleet it's a real capacity and cost concern, which is why Blue-Green is more common for services with modest fleet sizes or for infrastructure where the "environment" is defined at a coarser grain (an entire cluster, a whole region) rather than per-instance.</p>
+
+<div class="callout warn">
+<div class="callout-title">The atomic cutover is a lie for stateful clients</div>
+<p>"All traffic switches atomically" is true at the router level, but any client holding a long-lived connection — a persistent database connection pool, a WebSocket, a gRPC stream with keep-alive — may not immediately reconnect through the new route. A load balancer flip doesn't forcibly sever existing TCP connections unless you configure it to (or set a short keep-alive/max-connection-age). If Green expects clients to send a new field that Blue never required, and some clients are still mid-session against Blue-routed infrastructure via a stale connection, you can see errors that look like the cutover "didn't work" for a subset of traffic even though the router config is correct. Plan explicit connection draining, not just a router flip.</p>
+</div>
+
+<h2>5. Canary deployment — limiting blast radius instead of switching atomically</h2>
+<p>Canary deployment routes a small percentage of real production traffic — say 1% or 5% — to the new version while the rest continues to hit the old version, then compares metrics (error rate, p99 latency, CPU, business metrics like conversion rate) between the canary and the baseline. If the canary looks healthy, the percentage is increased in steps (5% → 25% → 50% → 100%); if it looks unhealthy, traffic is routed away from it and the rollout is aborted, with only a small fraction of users ever having been exposed to the bad version.</p>
+
+<p>The core difference from Blue-Green is the shape of the risk being managed. Blue-Green gives you <em>fast rollback</em> from a full cutover — everyone is exposed the instant you flip, but you can un-expose them quickly. Canary instead limits the <em>blast radius</em> of the initial exposure itself — only a small slice of traffic ever sees the new code before you've gathered evidence it's safe. These aren't mutually exclusive: many real pipelines run a canary phase first (to catch the errors that only show up under real production traffic patterns, not synthetic smoke tests) and then perform a Blue-Green-style or rolling cutover for the remaining bulk of traffic once the canary passes.</p>
+
+<table>
+<tr><th>Strategy</th><th>Risk mitigated</th><th>Rollback speed</th><th>Infra cost</th><th>Requires compatibility across versions?</th></tr>
+<tr><td>Rolling</td><td>None inherently — just avoids full-fleet downtime</td><td>Slow (re-roll previous version)</td><td>Low (small headroom)</td><td>Yes — old and new coexist during rollout</td></tr>
+<tr><td>Blue-Green</td><td>Bad deploy affecting 100% of users for long</td><td>Instant (flip router back)</td><td>High (2x fleet during switch)</td><td>Mostly no — cutover is atomic, but connection draining matters</td></tr>
+<tr><td>Canary</td><td>Bad deploy affecting most/all users at all</td><td>Fast (route away from canary)</td><td>Low-medium (small extra pool)</td><td>Yes — old and new coexist for the canary window</td></tr>
+</table>
+
+<p>Canary analysis is only as good as the metrics it compares against — if you don't already have solid dashboards for error rate, latency percentiles, and saturation broken down per-version, you have no way to judge whether the canary is actually healthy, which is why this strategy is inseparable from the practices in <a href="#/observability-production">observability-production</a>. A canary rollout with no per-version metrics segmentation is really just a rolling deployment with extra steps and a false sense of safety.</p>
+
+<div class="callout tip">
+<div class="callout-title">Statistical significance at low traffic percentages</div>
+<p>A subtlety worth internalizing: at 1% traffic on a moderately busy service, your canary might be handling only a few requests per second. Comparing a raw error count between a canary pool of 50 requests and a baseline pool of 5,000 requests is not a fair comparison — a single failed request in the canary is a 2% error rate, which might look alarming purely from small-sample noise. Real canary analysis tools (like Kayenta, used in Netflix's Spinnaker) use statistical comparison methods that account for sample size, not naive threshold checks, precisely because naive comparisons produce false aborts at low traffic percentages.</p>
+</div>
+
+<h2>6. Feature flags — decoupling deployment from release</h2>
+<p>All the strategies above answer "how do we get new code running on production servers safely." Feature flags answer a different question entirely: "when does a piece of already-deployed code actually start affecting users." A feature flag is a runtime conditional, typically backed by an external configuration service (LaunchDarkly, Unleash, a simple database-backed flag table, or even a config file reloaded without restart) rather than a compiled-in constant:</p>
+
+<pre><code>if (featureFlags.isEnabled("new-checkout-flow", userId)) {
+    return newCheckoutService.process(order);
+} else {
+    return legacyCheckoutService.process(order);
+}</code></pre>
+
+<p>The code for <code>newCheckoutService</code> is deployed to every production instance the moment its containing build ships — but it is dormant, unreachable, until someone flips the flag, whether for 100% of users, a specific percentage, or a named allow-list (internal employees, beta users, a specific customer). This is the crucial decoupling: <strong>deployment</strong> (code physically present and running on production hardware) and <strong>release</strong> (code actually affecting user-visible behavior) become two independent events, controlled by two different mechanisms and, often, two different teams — engineering controls deploys, product management controls flag rollout timing.</p>
+
+<p>This decoupling is what makes true Continuous Deployment tractable for features that take weeks to build. Instead of maintaining a long-lived feature branch (reintroducing exactly the integration pain CI exists to avoid), a team merges incomplete work to trunk continuously behind a flag that defaults to off. The half-built feature ships to production dozens of times over its development, invisible to users, fully integrated with the rest of the codebase the entire time. When it's finally ready, "releasing" it is a configuration change, not a deployment — which also means it can be turned back off instantly if it misbehaves, without any redeploy or rollback of code at all.</p>
+
+<div class="callout warn">
+<div class="callout-title">Flags are a source of combinatorial complexity, not a free lunch</div>
+<p>Every live flag doubles the number of code paths that can execute in production (flag on vs. off), and flags accumulate — a service with fifteen active flags theoretically has 2^15 possible behavioral combinations, though in practice most combinations are never actually tested. Stale flags left in "temporarily" long past their feature's full rollout are one of the most common sources of code that's dead in production practice but still live in source, silently rotting because nobody remembers which branch is actually exercised. Treat flag removal (deleting the old code path once a flag is permanently on) as a required, scheduled follow-up task, not an optional cleanup.</p>
+</div>
+
+<h2>7. Database migrations: the part that isn't really solved by any deployment strategy above</h2>
+<p>Every strategy discussed so far assumes the application code can be swapped, split-traffic, or rolled back independently. A database schema cannot be treated the same way, because <strong>a schema migration and an application deployment are never truly atomic together</strong> — the migration runs against one shared database while application instances roll over one at a time (or, in Blue-Green, while both Blue and Green potentially point at the same database). There is always a window where old code, new code, old schema, or new schema coexist in some combination, and if any combination in that window is invalid, you have an outage regardless of how careful your deployment strategy is.</p>
+
+<p>The pattern that resolves this is usually called <strong>expand-contract</strong> (also "parallel change"), and it works by breaking one logical schema change into multiple independently-safe deployments:</p>
+
+<ol>
+<li><strong>Expand.</strong> Add the new column, table, or index in a way that is purely additive and backward-compatible — the old code, which doesn't know the new column exists, keeps working unmodified because nothing it depends on was removed or renamed. Example: adding a nullable <code>shipping_address_v2</code> column alongside the existing <code>shipping_address</code>.</li>
+<li><strong>Migrate/dual-write.</strong> Deploy application code that writes to <em>both</em> the old and new shape simultaneously (or backfills the new column from the old one via a background job), while still reading from whichever shape is authoritative. This version of the code must tolerate the old schema, the new schema, and rows that exist in only one shape (written before vs. after this deploy), because rolling or canary deployment guarantees exactly that mix will exist transiently.</li>
+<li><strong>Cut over reads.</strong> Once you're confident the new column/table is fully and correctly populated for all rows, deploy a version that reads from the new shape as authoritative, still writing to both for safety.</li>
+<li><strong>Contract.</strong> Only in a <em>later</em>, separate deployment — after you're certain no running instance and no in-flight rollback path depends on the old shape anymore — drop the old column or table and stop dual-writing.</li>
+</ol>
+
+<div class="callout">
+<div class="callout-title">Worked example: renaming a column under a rolling deployment</div>
+<p>Suppose you want to rename <code>user.email</code> to <code>user.primary_email</code>, and you deploy via rolling update with three instances. If you naively run <code>ALTER TABLE ... RENAME COLUMN</code> and deploy new code that reads/writes <code>primary_email</code> at the same time, here's what actually happens: instance 1 is updated and restarted first while instances 2 and 3 are still running old code expecting the column <code>email</code>. The moment the migration runs, instances 2 and 3 start throwing SQL errors on every query touching that table — a full outage caused not by a code bug, but by the migration and the code rollout racing each other with no ordering guarantee between "which instance restarts first" and "when the ALTER TABLE commits."</p>
+<p>The expand-contract way: (1) add <code>primary_email</code> as a new nullable column, deploy — old code ignores it, nothing breaks. (2) deploy code that writes to both <code>email</code> and <code>primary_email</code> on every write, and backfill existing rows in a background job — at this point every instance, old or new, mid-rollout or not, can read <code>email</code> successfully. (3) once backfill is confirmed complete, deploy code that reads from <code>primary_email</code> exclusively (still dual-writing for one more cycle as a safety margin). (4) in a later deploy, stop writing to <code>email</code> and drop the column. Four deployments instead of one, but zero windows where any live instance can be running code incompatible with the schema it's querying.</p>
+</div>
+
+<h2>8. Rollback strategy must be decided before you deploy, not during the incident</h2>
+<p>A rollback plan improvised in the middle of an active incident is a plan written by someone under stress, with an incomplete view of what state has already changed, trying to reason about second-order effects in real time — exactly the conditions under which people make mistakes. Deciding the rollback mechanism in advance, as part of the deployment plan itself, converts "what do we do now" into "execute the pre-agreed runbook," which is faster and safer precisely because no judgment calls are needed under pressure.</p>
+
+<p>Concretely, planning rollback in advance means answering, before the deploy ships, questions like:</p>
+<ul>
+<li><strong>Is this deploy backward-compatible with the previous version's database expectations?</strong> If you followed expand-contract properly, rolling back the application code to the previous version should never require rolling back the schema too — the previous code never depended on the old shape being the only one present. If a rollback would require an accompanying schema rollback, you no longer have an instant rollback; you have a second migration, with all the same coexistence hazards as the forward migration.</li>
+<li><strong>What is the automatic trigger for rollback, if any?</strong> In canary rollouts, this usually means codifying "abort and roll back automatically if error rate exceeds baseline by X% for Y minutes" rather than relying on someone noticing a dashboard.</li>
+<li><strong>Does rolling back also require reverting a feature flag, independently of the code rollback?</strong> If a bug is actually in flagged-off code that got accidentally enabled, the fix is flipping the flag, not redeploying — much faster, and worth having as an explicit, separately-documented first response step.</li>
+<li><strong>How long does the previous version's artifact remain available and deployable?</strong> If your artifact registry garbage-collects old container images after seven days, and you don't discover a regression until day ten, "roll back to the last known-good version" requires rebuilding it from source, which reintroduces exactly the non-determinism risk that build-once/promote-everywhere was meant to avoid.</li>
+</ul>
+<p>This is also where deployment strategy composes directly with resilience thinking more broadly — a rollback is really just a deliberate, controlled failover to a known-good state, and the same principles about limiting blast radius, having fast detection, and avoiding cascading failure covered in <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a> apply to planning it.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does Continuous Deployment require more investment in canary analysis and automated rollback than Continuous Delivery does?</summary>
+<div class="qa-body">In Continuous Delivery, a human decides when to deploy an already-verified artifact, and that human is implicitly a final safety check — they can hold off if something feels off, check recent changes, or coordinate timing around known-risky periods. Continuous Deployment removes that check entirely: the moment a change passes automated tests, it goes live with nobody looking at it first. Automated tests are good at catching logic errors against known scenarios, but they can't catch every failure mode that only appears under real production traffic patterns, real data distributions, or real infrastructure interactions. To compensate for removing the human gate, teams practicing Continuous Deployment push the safety check later, into production itself, via canary analysis (only expose a small fraction of real traffic first) and automated rollback (detect regressions in that small fraction and revert without waiting for a person). Without this, Continuous Deployment isn't actually safer than Continuous Delivery with a careless human clicking deploy immediately — it's just faster and blinder.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why can't a rolling deployment simply be made "instant" by increasing maxSurge and reducing the batch count to one big batch?</summary>
+<div class="qa-body">Even if you replace every instance in a single batch (maxUnavailable equal to the whole fleet, or maxSurge large enough to stand up the entire new fleet before tearing down the old one), there is still a window — however short — where in-flight requests that started against an old instance are completing while new instances are already accepting new requests, and where any shared state (database rows, cache entries, messages already enqueued in the old format) was written under the old version's assumptions. Reducing the batch size to one changes the duration of version coexistence, not whether it exists. The only way to get a truly instant, non-overlapping cutover is to route all traffic to a separate, fully-provisioned environment atomically — which is exactly what Blue-Green does, at the cost of running two environments rather than reusing the same fleet.</div>
+</details>
+
+<details class="concept-qa">
+<summary>If Blue-Green gives an instant rollback, why would anyone choose canary deployment instead?</summary>
+<div class="qa-body">Blue-Green's rollback is fast, but it doesn't limit how many users are affected before you notice the problem and decide to roll back — everyone hits Green the instant the switch flips. If the bug is subtle (a slow memory leak, an edge case that only 2% of requests trigger, a data-corruption bug that isn't visible until a batch job runs hours later), 100% of your users were exposed to it, and "fast rollback" doesn't undo requests that were already served incorrectly or data that was already written wrong. Canary deployment trades rollback speed for a smaller blast radius up front: even if detection is slow, only the small percentage of traffic routed to the canary was ever exposed, so the total harm is bounded from the start rather than bounded only after the fact. The two strategies optimize for different failure shapes — Blue-Green for "fix it fast once we notice," canary for "limit exposure even if we're slow to notice."</div>
+</details>
+
+<details class="concept-qa">
+<summary>How does a feature flag differ from an environment variable or a config file setting checked at startup?</summary>
+<div class="qa-body">The defining property of a feature flag, as used in progressive delivery, is that it can change value at runtime without restarting or redeploying the process, and it can vary per-request based on attributes like user ID, account tier, or a randomized bucket — not just be a single global on/off value for the whole fleet. A startup-time environment variable requires a restart (and typically a coordinated one across the fleet) to change, which reintroduces exactly the deployment risk flags are meant to avoid, and it can't easily express "on for 10% of users" or "on for this specific beta cohort" without extra machinery. Flag systems like LaunchDarkly or Unleash maintain this targeting logic and push updates to running processes (via streaming or periodic polling), which is what lets a flag change propagate to the whole fleet in seconds without any deployment event at all.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Walk through why "add a column, deploy, migrate data, deploy again, drop the old column" needs to be four separate deployments rather than combined into fewer steps.</summary>
+<div class="qa-body">Each step exists to guarantee that every version of the application code that could possibly be running at any moment during a rollout is compatible with whatever schema shape the database currently has. If you combined the "add column" and "migrate data" steps, you'd have old code (which knows nothing about the new column) running concurrently with a backfill job that assumes the new column is the source of truth — any old instance still reading only the old column would see stale or partial data during the backfill window, and if the old code writes to only the old column and does not know to also update the new column, later dual-write logic wouldn't be present yet to keep them in sync. If you combined "cut over reads" and "drop old column," instances that are rolling back (or simply mid-rollout on a lagging batch) that still expect the old column to exist would break the instant it's dropped. Each deployment boundary exists specifically to make sure the previous deployment's assumptions have fully "landed" across the whole fleet before the next assumption is introduced — collapsing steps reintroduces exactly the race condition expand-contract is designed to eliminate.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is a rollback plan considered part of the deployment itself, rather than a separate incident-response concern?</summary>
+<div class="qa-body">Whether a rollback is actually safe and fast depends on decisions made at deploy time, not at incident time — by the time an incident is underway, it's too late to retroactively make a schema change backward-compatible or to make an artifact that was already garbage-collected reappear. If the deploy didn't follow expand-contract, rolling back the code might require also rolling back a migration, which has its own coexistence hazards and is not something you want to be improvising for the first time under pressure. Planning rollback in advance means the rollback path was already exercised in your head (or in a staging environment) with the same rigor as the forward path, so executing it during an actual incident is just following a pre-validated runbook rather than performing novel engineering under time pressure.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does canary analysis fundamentally depend on having good observability, rather than just being a routing configuration?</summary>
+<div class="qa-body">Routing a percentage of traffic to a new version is only half of what "canary" means — the other half is deciding, based on evidence, whether that traffic is healthy enough to proceed. That decision requires metrics broken down per-version (error rate, latency percentiles, saturation) with enough granularity and low enough delay that you can compare the canary pool against the baseline pool while the canary is still small and the blast radius is still limited. Without per-version metric segmentation, a canary deployment is just a routing rule with no actual analysis behind it — you're exposing a fraction of users to unverified code and calling it safe purely because the fraction is small, not because you've confirmed it's healthy. The quality of a canary process is bounded entirely by the quality of the observability feeding its analysis step.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/observability-production'"><div class="rc-title">Observability in Production</div><div class="rc-sub">Bonus · canary analysis is only as good as the per-version metrics feeding it</div></div>
+<div class="related-card" onclick="window.location.hash='/docker-kubernetes'"><div class="rc-title">Docker & Kubernetes</div><div class="rc-sub">Bonus · rolling updates, maxSurge/maxUnavailable, and health checks are implemented at this layer</div></div>
+<div class="related-card" onclick="window.location.hash='/testing-strategies'"><div class="rc-title">Testing Strategies</div><div class="rc-sub">Bonus · pipeline stage ordering depends on the cost and scope of each test level</div></div>
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience & Fault Tolerance</div><div class="rc-sub">Bonus · rollback is a deliberate, planned failover with the same blast-radius principles</div></div>
+</div>

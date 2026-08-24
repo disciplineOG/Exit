@@ -1,0 +1,253 @@
+<p class="topic-breadcrumb">Phase 3 — Advanced Systems, Security &amp; LLD Machine Coding · Days 51–55 · LLD Machine Coding</p>
+<h1>LLD #2: Rate Limiter / TTL Cache</h1>
+<div class="topic-tags">
+<span class="tag">Token Bucket</span>
+<span class="tag">Sliding Window Counter</span>
+<span class="tag">Striped Locking</span>
+<span class="tag">LRU via Doubly Linked List</span>
+<span class="tag">TTL Expiry</span>
+<span class="tag">Concurrent Eviction</span>
+<span class="tag">Caffeine / Guava Design</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>A rate limiter and a TTL cache look like unrelated exercises, but they are the same problem wearing two costumes: both bound an in-memory resource (requests allowed per unit time, or entries allowed in a table) and both must make the "am I over the bound?" check cheap even when a thousand threads ask it per second. If you build either one with a single <code>synchronized</code> block around all state, you will not see the bug in a single-threaded test — you will see it as a mysterious throughput ceiling in production once traffic fans out across cores, because every request is now serialized behind one lock regardless of whether it even touches the same client or key as the request ahead of it. Understanding how per-key state is isolated (striped locks, atomics, segment maps) is what explains why <code>ConcurrentHashMap</code>, Guava <code>RateLimiter</code>, and Caffeine all look the way they do internally.</p>
+</div>
+
+<h2>1. The Shared Shape of Both Problems</h2>
+<p>Strip away the domain vocabulary and a rate limiter and a TTL cache are structurally identical:</p>
+<ul>
+<li><strong>Keyed state:</strong> a rate limiter tracks state per <code>clientId</code> (or API key, or IP); a cache tracks state per cache key. Both need O(1) lookup of "the state object for this key," which means both start from a <code>Map&lt;K, State&gt;</code>.</li>
+<li><strong>A bound that must be enforced cheaply:</strong> the rate limiter's bound is "no more than N permits per window"; the cache's bound is "no more than <code>maxSize</code> entries" and/or "no entry older than <code>ttl</code>." Both bounds must be checked on every single operation, so the check itself cannot be expensive or heavily contended.</li>
+<li><strong>Passive decay of state over time:</strong> a token bucket's tokens replenish as time passes even with no explicit "tick" thread; a cache entry becomes stale as time passes even with no explicit expiry thread. Both designs face the same question — do you recompute/check "is this still valid" lazily, only when someone touches the key, or do you run a background process that sweeps proactively?</li>
+<li><strong>Concurrent access to the same keyed state is the hard part, not the algorithm.</strong> The token bucket refill formula and the LRU eviction rule are each a few lines of arithmetic or pointer manipulation. What makes both of these genuine low-level design problems instead of one-line utilities is guaranteeing correctness when multiple threads hit the same client or the same cache key at once, without serializing unrelated keys behind each other.</li>
+</ul>
+<p>Keeping this parallel explicit is useful because the concurrency techniques transfer directly: striping a lock array by <code>clientId.hashCode()</code> for a rate limiter is the same technique as striping by cache key for a cache, and both are the same idea <a href="#/collections-internals">segment locking in the pre-Java-8 <code>ConcurrentHashMap</code></a> used before it moved to per-bucket CAS operations.</p>
+
+<h2>2. Rate Limiter: Token Bucket as an Actual Class</h2>
+<p>The conceptual algorithm — tokens refill at a steady rate up to a capacity, each request consumes one token — is covered as a concept on <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a>. Here the concern is different: what class actually holds this state per client, and what does <code>allowRequest(clientId)</code> do internally without a global lock serializing every client's requests through one critical section.</p>
+
+<h3>Per-client bucket state</h3>
+<p>Each client needs exactly two mutable fields: how many tokens are currently available, and when the bucket was last refilled. There is no need to run a background thread ticking every bucket — refill is computed lazily, on demand, as elapsed time since the last check:</p>
+<pre><code>class TokenBucket {
+    private final long capacity;
+    private final double refillTokensPerNano;
+    private volatile double availableTokens;
+    private volatile long lastRefillTimestampNanos;
+
+    TokenBucket(long capacity, double refillRatePerSecond) {
+        this.capacity = capacity;
+        this.availableTokens = capacity;
+        this.refillTokensPerNano = refillRatePerSecond / 1_000_000_000.0;
+        this.lastRefillTimestampNanos = System.nanoTime();
+    }
+
+    synchronized boolean tryConsume() {
+        refill();
+        if (availableTokens &gt;= 1.0) {
+            availableTokens -= 1.0;
+            return true;
+        }
+        return false;
+    }
+
+    private void refill() {
+        long now = System.nanoTime();
+        long elapsed = now - lastRefillTimestampNanos;
+        double refilled = elapsed * refillTokensPerNano;
+        if (refilled &gt; 0) {
+            availableTokens = Math.min(capacity, availableTokens + refilled);
+            lastRefillTimestampNanos = now;
+        }
+    }
+}</code></pre>
+<p>Note the <code>synchronized</code> here is scoped to <em>one client's bucket object</em>, not to the whole limiter. That distinction is the entire design.</p>
+
+<h3>The registry: where per-client buckets live and how they're cleaned up</h3>
+<pre><code>class RateLimiter {
+    private final ConcurrentHashMap&lt;String, TokenBucket&gt; buckets = new ConcurrentHashMap&lt;&gt;();
+    private final long capacity;
+    private final double refillRatePerSecond;
+
+    boolean allowRequest(String clientId) {
+        TokenBucket bucket = buckets.computeIfAbsent(clientId,
+            id -&gt; new TokenBucket(capacity, refillRatePerSecond));
+        return bucket.tryConsume();
+    }
+}</code></pre>
+<p><code>ConcurrentHashMap.computeIfAbsent</code> is doing real work here: it guarantees that even if a thousand threads call <code>allowRequest("client-42")</code> for the very first time simultaneously, exactly one <code>TokenBucket</code> is created and every thread gets the same instance — the map's own internal per-bucket locking (not a global lock) arbitrates that race. Once the bucket exists, contention is scoped to threads hitting <em>that specific client</em>; a burst from <code>client-99</code> never blocks on a lock held by <code>client-42</code>'s bucket. This is the difference between "one global lock around all rate-limiting state" (which serializes all clients through one critical section, turning a multi-core service into an effectively single-threaded gate) and "one lock per client's own bucket" (where contention only exists among concurrent requests from the <em>same</em> client, which for most rate limiting use cases is a small number of threads).</p>
+
+<div class="callout warn">
+<div class="callout-title">A ConcurrentHashMap of buckets grows forever unless you clean it up</div>
+<p><code>computeIfAbsent</code> never removes entries. A rate limiter serving millions of distinct clients (real IPs, API keys, or worse, unauthenticated request fingerprints that an attacker can vary at will) will accumulate one <code>TokenBucket</code> object per distinct client forever, which is a slow, unbounded memory leak that won't show up until the map has been running for days. Two real fixes: (1) wrap entries with a last-access timestamp and run a low-frequency sweep (e.g. every few minutes) that removes buckets untouched for longer than some multiple of the window, or (2) back the map with time-bound eviction directly — which is precisely the TTL cache problem from the next section, applied to bucket storage instead of business data. In production this is usually solved by literally using a cache (Caffeine, with <code>expireAfterAccess</code>) as the bucket registry instead of a raw <code>ConcurrentHashMap</code>, folding the cleanup problem into infrastructure that already solves it.</p>
+</div>
+
+<h3>Alternative: atomics instead of synchronized, when only a counter is needed</h3>
+<p>If the algorithm is a fixed or sliding window counter rather than a floating-point token bucket, the per-client state can often be reduced to a single mutable integer, and then <code>AtomicLong</code>/<code>AtomicInteger</code> with compare-and-swap replaces the lock entirely — no thread ever blocks, it just retries the CAS if another thread updated the counter first:</p>
+<pre><code>class SlidingWindowCounter {
+    private final AtomicLong currentWindowCount = new AtomicLong();
+    private final AtomicLong previousWindowCount = new AtomicLong();
+    private volatile long currentWindowStartMillis;
+    private final long windowSizeMillis;
+    private final long limit;
+
+    boolean allow() {
+        long now = System.currentTimeMillis();
+        rotateWindowIfNeeded(now);
+        double elapsedFraction = (now - currentWindowStartMillis) / (double) windowSizeMillis;
+        double estimated = previousWindowCount.get() * (1 - elapsedFraction)
+                          + currentWindowCount.get();
+        if (estimated &gt;= limit) return false;
+        currentWindowCount.incrementAndGet();
+        return true;
+    }
+    // rotateWindowIfNeeded swaps current into previous and resets
+    // current to 0 once now crosses into a new window boundary.
+}</code></pre>
+<p>Compare-and-swap avoids blocking, but it is not free of coordination cost — under very high contention on the <em>same</em> atomic (many threads incrementing the same client's counter simultaneously), CAS retries can spin, and the cache line backing that counter bounces between CPU cores (false sharing at the hardware level even though there's no software lock). For a rate limiter this is rarely the bottleneck because the whole point of per-client keying is that only requests from one client contend on one counter — but it's worth knowing that "lock-free" is not synonymous with "contention-free."</p>
+
+<h3>Sliding window boundary swap and clock skew</h3>
+<p>The trickiest part of the sliding window counter to get right in code, not just in theory, is the window rotation: exactly one thread should perform the "shift current into previous, reset current to zero" transition when the clock crosses a boundary, not every thread that happens to observe <code>now</code> past the boundary simultaneously. A common bug is checking <code>now &gt;= currentWindowStartMillis + windowSizeMillis</code> and unconditionally rotating — under concurrent access, multiple threads pass that check before any of them updates <code>currentWindowStartMillis</code>, so the window rotates multiple times and legitimate counts get discarded. The fix is the same compare-and-swap pattern used everywhere else: use an <code>AtomicLong</code> for <code>currentWindowStartMillis</code> and rotate only inside a successful <code>compareAndSet(oldStart, newStart)</code>, so exactly one thread wins the rotation and the rest simply proceed with the (now current) window.</p>
+
+<h2>3. TTL Cache: The Data Structure Underneath LinkedHashMap, Built by Hand</h2>
+<p>A TTL cache with size bounding needs two things working together: O(1) lookup by key (a hash map) and O(1) knowledge of "which entry was least recently used" (an ordering). The mechanism that makes both O(1) simultaneously is a doubly linked list threaded <em>through</em> the hash map's own entry objects — each hash map value is also a linked-list node, so moving an entry to the front of the recency order is a pointer swap, not a search. This is exactly the internal mechanic <a href="#/collections-internals">LinkedHashMap</a> uses in access-order mode; building it by hand here makes the pointer manipulation explicit instead of hidden behind <code>removeEldestEntry</code>.</p>
+
+<h3>The combined structure</h3>
+<pre><code>class TtlLruCache&lt;K, V&gt; {
+    private class Node {
+        K key; V value;
+        long expiryTimestampMillis;
+        Node prev, next;
+    }
+
+    private final Map&lt;K, Node&gt; index = new HashMap&lt;&gt;();
+    private final Node head = new Node(); // dummy sentinel, most-recently-used side
+    private final Node tail = new Node(); // dummy sentinel, least-recently-used side
+    private final int capacity;
+    private final long ttlMillis;
+
+    TtlLruCache(int capacity, long ttlMillis) {
+        this.capacity = capacity;
+        this.ttlMillis = ttlMillis;
+        head.next = tail;
+        tail.prev = head;
+    }
+    // get/put below
+}</code></pre>
+<p>Using dummy sentinel <code>head</code>/<code>tail</code> nodes (rather than leaving <code>head</code>/<code>tail</code> as nullable references to real entries) removes every null check from the pointer-relinking code — every real node always has a non-null <code>prev</code> and <code>next</code>, even the first and last real entries, because the sentinels bracket them. This is the single biggest source of off-by-one and null-pointer bugs in hand-rolled linked-list LRU implementations, and it is worth internalizing as a general pattern for any doubly linked list you build yourself.</p>
+
+<h3>The general algorithm for get and put</h3>
+<p><strong>get(key):</strong></p>
+<ol>
+<li>Look up <code>index.get(key)</code>. If absent, return miss.</li>
+<li>If present but <code>node.expiryTimestampMillis &lt; now</code> (lazy expiry check), unlink the node from the list, remove it from the map, and return miss — the entry is logically dead even though it physically still occupied a slot until this access found it.</li>
+<li>Otherwise, unlink the node from its current position and re-insert it immediately after <code>head</code> (mark it most-recently-used), then return the value.</li>
+</ol>
+<p><strong>put(key, value):</strong></p>
+<ol>
+<li>If <code>key</code> already exists in <code>index</code>, update its value and expiry timestamp, unlink and move it to the front (same as a successful get), and return.</li>
+<li>Otherwise create a new node with <code>expiryTimestampMillis = now + ttlMillis</code>, insert it immediately after <code>head</code>, and add it to <code>index</code>.</li>
+<li>If <code>index.size() &gt; capacity</code>, evict: take the node immediately before <code>tail</code> (the actual least-recently-used entry), unlink it, and remove its key from <code>index</code>.</li>
+</ol>
+
+<h3>Worked example: interleaved gets, puts, TTL expiry, and eviction together</h3>
+<p>Consider <code>capacity = 3</code>, <code>ttlMillis = 100</code>, and this sequence of operations, timestamped from an arbitrary <code>t = 0</code>:</p>
+<pre><code>t=0    put(A, "a")     -&gt; list (MRU..LRU): A
+t=10   put(B, "b")     -&gt; list: B, A
+t=20   put(C, "c")     -&gt; list: C, B, A      (at capacity: 3 entries)
+t=30   get(A)          -&gt; hit; A moves to front -&gt; list: A, C, B
+t=40   put(D, "d")     -&gt; insert D at front -&gt; list: D, A, C, B (size 4 &gt; capacity 3)
+                            evict LRU (node before tail) = B -&gt; list: D, A, C
+t=115  get(C)          -&gt; C's expiry was set at t=20, ttl=100, expires at t=120.
+                            now=115 &lt; 120, so still valid -&gt; hit; C moves to front
+                            -&gt; list: C, D, A
+t=125  get(A)          -&gt; A's expiry was refreshed at t=30 (put/get resets TTL here),
+                            expires at t=130. now=125 &lt; 130 -&gt; hit -&gt; list: A, C, D
+t=135  get(D)          -&gt; D's expiry set at t=40, expires at t=140. Still valid -&gt; hit.
+t=145  get(D)          -&gt; now=145 &gt; 140 -&gt; expired. Lazily evicted here, not before.
+                            Even though D "died" at t=140, it sat in the list,
+                            still consuming a capacity slot, from t=140 to t=145
+                            simply because nothing accessed it in that window.</code></pre>
+<p>This example exercises four mechanics at once worth noticing: TTL refresh on touch (whether a <code>get</code>/<code>put</code> resets the clock is a design choice you must state explicitly — a sliding TTL like above versus an absolute TTL fixed at creation are genuinely different caching semantics), LRU reordering happening independently of expiry, eviction firing purely on the size bound with no regard for how "fresh" the evicted entry was (B was evicted at t=40 despite not being expired — LRU and TTL are two independent bounds, and either one can trigger removal first), and the core trade-off of lazy expiration: <strong>an expired entry occupies memory and a map slot for as long as nothing touches it</strong>, which is exactly the risk called out in the next section.</p>
+
+<h3>Lazy expiration vs. a background sweep thread</h3>
+<table>
+<tr><th>Aspect</th><th>Lazy (check-on-access)</th><th>Background sweep</th></tr>
+<tr><td>CPU cost when idle</td><td>Zero — no work happens unless something accesses the key</td><td>Nonzero — a thread wakes periodically and scans, even if nothing changed</td></tr>
+<tr><td>Memory behavior for keys never re-accessed</td><td>Stale entries linger indefinitely, holding memory and (if values are large or reference external resources) potentially leaking those resources</td><td>Reclaimed within one sweep interval regardless of access pattern</td></tr>
+<tr><td>Lock contention profile</td><td>Contention only on keys actually being read/written</td><td>Sweep thread must lock (or briefly pause) the structure to safely walk and remove entries, adding a periodic contention spike even for keys under normal traffic</td></tr>
+<tr><td>Worst case</td><td>A cache that's mostly write-once-read-never accumulates unbounded garbage until size-bound eviction (LRU) eventually forces it out — if there even is a size bound</td><td>Sweep interval too long: entries linger almost as badly as pure laziness; too short: wasted CPU scanning for little gain</td></tr>
+</table>
+<p>Real caches combine both rather than choosing one: Caffeine and Guava check expiry lazily on every <code>get</code> (so a stale read is never returned), but also perform incremental cleanup piggybacked on ordinary write operations, and Caffeine additionally uses a scheduled expiration wheel-like mechanism for time-based eviction so that entries which are never touched again still get reclaimed without a dedicated always-on thread per cache. The size-bound (LRU/LFU) eviction acts as a backstop in both designs: even if TTL cleanup is imperfect or delayed, the map still cannot exceed its configured maximum size, because eviction on that bound is checked on every write, not on a timer.</p>
+
+<h2>4. Concurrency for the Cache: Why One Lock Around get/put Doesn't Scale</h2>
+<p>The naive thread-safe version of the hand-built cache above wraps every method in one <code>synchronized</code> block, because both the hash map lookup and the linked-list pointer surgery touch shared mutable state that must not be corrupted by concurrent writers. This works, and it is even the right starting point for a correctness-first implementation — but it means every single <code>get()</code>, including read-only cache hits, must acquire a mutex that serializes it against every other thread's <code>get()</code> and <code>put()</code>, on any key. A cache that is supposed to make hot paths faster becomes a bottleneck precisely under the high-concurrency conditions where caching matters most.</p>
+
+<h3>Segment striping</h3>
+<p>The first production-grade fix, historically used by Java's own <code>ConcurrentHashMap</code> before Java 8 and still used in many hand-rolled concurrent caches, is to split the single map into N independent segments, each with its own lock and (in the LRU case) its own linked list:</p>
+<pre><code>int segmentIndex = (key.hashCode() &amp; 0x7fffffff) % segmentCount;
+Segment&lt;K, V&gt; segment = segments[segmentIndex];
+synchronized (segment.lock) {
+    return segment.get(key);
+}</code></pre>
+<p>With, say, 16 segments, two threads operating on keys that happen to hash into different segments never contend at all — they acquire different locks and proceed fully in parallel. The cost is that each segment now independently tracks its own LRU order and its own capacity fraction (<code>capacity / segmentCount</code> per segment), which means global LRU ordering across the whole cache is only approximate — an entry that's "hot" in one segment has no bearing on eviction decisions in another. This is an accepted trade-off: approximate LRU under real concurrency beats exact LRU that can't scale past one core's worth of throughput.</p>
+
+<h3>Lock-free reads via a concurrent map, with a separate eviction bookkeeping structure</h3>
+<p>The more modern approach — what Caffeine actually does — goes further: use a lock-free concurrent hash map (Java's <code>ConcurrentHashMap</code>, whose reads since Java 8 require no locking at all in the common case) for the key-to-value lookup, and keep the eviction policy's bookkeeping (the LRU/LFU ordering structure) as a logically separate data structure that is updated asynchronously rather than inline with every read.</p>
+<p>Concretely, Caffeine's reads do not touch a linked list at all in the hot path. Instead, a <code>get()</code> records "this key was accessed" onto a lock-free ring buffer (a striped buffer per thread, to avoid write contention on the buffer itself), and a background maintenance step — triggered opportunistically by subsequent writes, not a dedicated always-spinning thread — drains that buffer and applies the recency/frequency updates to the actual eviction policy structure (a variant of LRU combined with a frequency sketch, called Window TinyLFU) in bulk. The effect: a cache hit under heavy concurrent read load costs one lock-free map lookup plus a cheap buffer write, never a lock acquisition and never a pointer-chasing linked-list update on the critical path. Writes are heavier — they do need to interact with the eviction structure more directly — but reads, which dominate in almost every cache workload, are effectively as cheap as a plain <code>ConcurrentHashMap.get()</code>.</p>
+
+<div class="callout tip">
+<div class="callout-title">The general principle: decouple "is the answer correct" from "is the bookkeeping up to date"</div>
+<p>The reason lock-free reads are safe here is that a cache's eviction bookkeeping is allowed to be slightly stale without breaking correctness — if the LRU order is a few accesses behind reality, the cache still returns correct values for every key it holds, it just might evict a slightly wrong entry once in a while under memory pressure. That's a tolerable, bounded imprecision. Compare this to the rate limiter's counter: an incorrect count there directly changes whether a request is allowed or rejected, which is why a rate limiter typically cannot tolerate the same kind of eventually-consistent bookkeeping and instead needs the count itself (not just its ordering metadata) to be exact at the moment of the check, via CAS or a per-client lock. This is the same read-vs-write, correctness-vs-bookkeeping distinction discussed for eventual consistency in <a href="#/distributed-systems-core">distributed-systems-core</a>, just applied inside a single process instead of across a cluster.</p>
+</div>
+
+<h2>5. Where the Two Designs Genuinely Diverge</h2>
+<table>
+<tr><th>Aspect</th><th>Rate Limiter</th><th>TTL Cache</th></tr>
+<tr><td>What is bounded</td><td>Requests allowed per unit time, per client</td><td>Number of entries held, and/or entry lifetime</td></tr>
+<tr><td>Effect of the bound check</td><td>Binary: allow or reject the caller's request outright</td><td>Eviction: silently drop an entry; the caller just recomputes / re-fetches on next miss</td></tr>
+<tr><td>Cost of a wrong bookkeeping value</td><td>High — an off-by-a-few token count directly changes accept/reject decisions, which is externally visible behavior</td><td>Low — an entry evicted slightly early or late just changes hit rate, not correctness</td></tr>
+<tr><td>State per key</td><td>Small, fixed-size (a count or float + timestamp)</td><td>Proportional to value size (the cached object itself) plus fixed node overhead</td></tr>
+<tr><td>Natural concurrency primitive</td><td>Atomics/CAS or a lock scoped to one client's small state</td><td>Concurrent map for the index, plus batched/striped updates to a separate ordering structure</td></tr>
+<tr><td>What "decay" means</td><td>Tokens replenishing / windows rotating</td><td>Entries expiring / becoming stale</td></tr>
+</table>
+<p>The unifying idea that makes both of these worth studying together is this: <strong>bounding a resource under concurrency is not primarily an algorithm problem — token bucket math and LRU pointer manipulation are each a few lines — it is a problem of scoping contention.</strong> The correct answer to "how do I make this bound cheap to check under concurrent access" is almost never "add a bigger lock"; it's "identify the smallest unit of state that actually needs to be consistent (one client's bucket, one cache key's value) and make everything outside that unit independent." Every technique covered here — striped locks, per-key atomics, segment maps, lock-free reads with deferred bookkeeping — is a variation on that one idea, and it is the same idea that motivates <a href="#/concurrency-multithreading">lock striping and CAS-based structures</a> generally, and that governs how <a href="#/caching-strategies">distributed caches</a> shard state across nodes once a single process's memory isn't enough.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+<details class="concept-qa">
+<summary>Why does keying a rate limiter's state by client in a ConcurrentHashMap avoid the throughput ceiling that a single global lock would cause, even though the map itself has internal locking?</summary>
+<div class="qa-body">A single global lock around all rate-limiting state forces every request, regardless of which client it belongs to, through one critical section — the work is trivial, but the serialization means only one thread can even be checking a limit at any instant, capping total throughput at roughly one lock acquisition's worth of latency per request across the entire service, no matter how many cores are available. Keying by client with a <code>ConcurrentHashMap&lt;String, TokenBucket&gt;</code> changes what needs to be mutually exclusive: the map's own internal structure (its buckets and resize state) is protected by fine-grained per-bucket synchronization or CAS operations that only briefly lock a small slice of the map, and once a thread has retrieved the specific <code>TokenBucket</code> object for its client, further contention exists only among other threads acting on that same client's bucket. Two requests from different clients never wait on each other at all, because they're touching different bucket objects protected by different (or no) locks. The map's internal locking is real, but it's scoped to structural map operations, which are rare relative to the per-client `tryConsume()` calls, and even those are extremely brief.</div>
+</details>
+<details class="concept-qa">
+<summary>Walk through what physically happens to the pointers when get(key) is called on a hand-built LRU structure and the key is found in the middle of the list.</summary>
+<div class="qa-body">First, the hash map lookup (`index.get(key)`) returns the `Node` object in O(1) — this step never touches the linked list at all. Once you have the node, you unlink it from its current position by taking its `prev` and `next` neighbors and pointing them directly at each other (`node.prev.next = node.next; node.next.prev = node.prev;`), which removes the node from wherever it was in the list in O(1) regardless of how deep in the list it was, because you never had to walk to find it — the map handed you the reference directly. Then you re-insert the same node object immediately after the sentinel `head`: point `head.next`'s old value's `prev` at the node, point the node's `next` at what used to be `head.next`, point the node's `prev` at `head`, and point `head.next` at the node. No new node is allocated and no data is copied — only six pointer assignments total, which is what makes "move to most-recently-used position" O(1) rather than O(n), even though logically it feels like it should require re-sorting.</div>
+</details>
+<details class="concept-qa">
+<summary>What specifically goes wrong if you check the sliding window boundary with a plain if-statement instead of compare-and-swap on the window start timestamp?</summary>
+<div class="qa-body">If multiple threads concurrently evaluate `now >= currentWindowStartMillis + windowSizeMillis` right around the moment the window should roll over, all of them can see the condition as true before any of them has updated `currentWindowStartMillis`, because reading the condition and acting on it are two separate, non-atomic steps. Each of those threads then independently performs the "shift current into previous, reset current to zero" transition, which means the rotation logic runs multiple times for what should be a single boundary crossing — legitimate request counts recorded in the (very briefly) current window by other threads get wiped out by a second or third redundant reset, and the previous-window count gets overwritten multiple times, losing data needed for the sliding estimate. Wrapping the transition in `compareAndSet(oldStart, newStart)` fixes this because only the thread whose compare-and-swap succeeds (i.e., the one that still sees the pre-rotation timestamp at the exact instant it attempts the swap) actually performs the rotation; every other thread's CAS fails, so it simply proceeds using the timestamp some other thread already updated, without redoing the transition.</div>
+</details>
+<details class="concept-qa">
+<summary>Why is it acceptable for Caffeine's LRU/LFU ordering to be updated asynchronously and slightly out of date, but not acceptable for a rate limiter's token count to be similarly stale?</summary>
+<div class="qa-body">A cache's eviction ordering is bookkeeping metadata about which entries are more or less valuable to keep — it does not affect whether a `get()` for a key currently in the map returns the right value. If the recency information is a few accesses behind reality, the worst outcome is that the cache evicts an entry that was actually accessed slightly more recently than the stale bookkeeping suggests, which costs one extra cache miss somewhere down the line, a hit-rate degradation, not a correctness violation. A rate limiter's token count, by contrast, is not metadata about something else — it *is* the thing being checked to decide whether to accept or reject a request right now. If that count is stale or under-synchronized, the limiter can let through more requests than intended (defeating the entire purpose of the limiter, potentially allowing a downstream to be overwhelmed) or reject requests that should have been allowed (a correctness-visible failure to the caller). This is why caches can afford deferred, batched, eventually-consistent bookkeeping for eviction while rate limiters need the actual counted value to be exact at the moment of the decision.</div>
+</details>
+<details class="concept-qa">
+<summary>In the worked cache example, entry D expired at t=140 but wasn't removed until it was accessed again at t=145. Is this a bug?</summary>
+<div class="qa-body">No — it is the defining, expected trade-off of lazy (check-on-access) expiration, not a defect in the implementation. Lazy expiration deliberately does no work unless and until something touches the key; the cost of that laziness is that a logically-expired entry can continue occupying a map slot and its associated memory for an unbounded amount of time after its expiry instant, as long as nothing calls get/put on that specific key. The correctness guarantee lazy expiration actually provides is narrower than "expired entries are removed promptly" — it only guarantees "an expired entry is never *returned* as a valid hit," which the design still upholds, since the t=145 access correctly detects the expiry and reports a miss rather than serving stale data. If prompt reclamation (not just prompt invalidation on read) is a hard requirement — for example, because cached values hold expensive external resources that must be released quickly — that requirement has to be met by adding a background sweep, not by lazy expiration alone.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does treating capacity eviction (LRU) and time eviction (TTL) as two independent mechanisms, rather than trying to unify them into one rule, make the design easier to reason about?</summary>
+<div class="qa-body">LRU eviction answers "which entry should go if the table is too full," a question purely about relative recency of access, while TTL eviction answers "is this specific entry still allowed to be trusted as fresh," a question purely about elapsed wall-clock time since it was written or last touched. These are genuinely different questions with different failure modes: an entry can be extremely fresh (well within its TTL) yet still be the least recently used one and get evicted for space, and conversely an entry can be the most recently used one yet still be expired if enough time passed since it was set even without being touched. Trying to fold both into a single score (e.g., some weighted combination of recency and age) makes the eviction decision harder to reason about and harder to test, because you can no longer isolate "did this get evicted because of the size bound" from "did this get evicted because it went stale." Keeping them as two independent checks — the linked list purely for recency ordering, the expiry timestamp purely for staleness — means each mechanism can be tested, tuned, and explained in isolation, and the worked example's outcome (B evicted despite being fresh; D found stale despite being untouched since a moment before) is exactly what falls out of that separation.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience: Circuit Breakers, Bulkhead, Rate Limiting</div>
+<div class="rc-sub">Days 21–25 · The conceptual token bucket / sliding window algorithms this page turns into actual class designs</div></div>
+<div class="related-card" onclick="window.location.hash='/collections-internals'"><div class="rc-title">Java Collections Framework Internals</div>
+<div class="rc-sub">Days 06–10 · LinkedHashMap's access-order linked list is the exact mechanic the hand-built LRU cache reimplements</div></div>
+<div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Concurrency &amp; Multithreading</div>
+<div class="rc-sub">Days 16–20 · Striped locks, CAS, and ConcurrentHashMap internals underpin both the limiter's and the cache's thread safety</div></div>
+<div class="related-card" onclick="window.location.hash='/caching-strategies'"><div class="rc-title">Caching Strategies</div>
+<div class="rc-sub">Days 21–25 · Eviction policy design (LRU, LFU, TinyLFU) and distributed cache sharding extend this single-process cache</div></div>
+</div>

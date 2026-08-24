@@ -1,0 +1,245 @@
+<p class="topic-breadcrumb">Phase 1 — Foundation &amp; Low-Level Mastery · Days 16–20 · HLD</p>
+<h1>Distributed Systems Core: CAP, ACID/BASE, Sagas</h1>
+
+<div class="topic-tags">
+<span class="tag">CAP Theorem</span>
+<span class="tag">PACELC</span>
+<span class="tag">ACID</span>
+<span class="tag">Isolation Levels</span>
+<span class="tag">BASE</span>
+<span class="tag">Two-Phase Commit</span>
+<span class="tag">Sagas</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Almost every "weird" production behavior in a distributed system — a payment that succeeded but the order shows pending, a read that returns stale data right after a write, a distributed lock that two processes both think they hold — traces back to one of a handful of trade-offs made explicit by CAP, ACID/BASE, and the transaction protocols built on top of them. If you don't have a precise mental model of what a database's isolation level actually guarantees, or why 2PC blocks forever when a coordinator dies, you'll misdiagnose these as bugs in your code when they're actually the system behaving exactly as designed. This page builds that model from the ground up so you can predict, not just explain after the fact, how a system will behave when a network partition or a mid-transaction crash happens.</p>
+</div>
+
+<h2>1. The CAP Theorem, Precisely</h2>
+<p>CAP is a statement about a very specific situation: a distributed data store, replicated across multiple nodes, experiences a <strong>network partition</strong> — some nodes can no longer talk to each other, but each side of the partition is still up and reachable by clients. The theorem says that when this happens, you must choose between two of the following three properties, but you cannot have all three:</p>
+<ul>
+<li><strong>Consistency (C)</strong> — every read receives the most recent write, or an error. This is linearizability: all nodes appear to agree on a single, up-to-date version of the data at all times.</li>
+<li><strong>Availability (A)</strong> — every request to a non-failing node receives a (non-error) response, without guarantee that it contains the most recent write.</li>
+<li><strong>Partition tolerance (P)</strong> — the system continues to operate despite an arbitrary number of messages being dropped or delayed between nodes.</li>
+</ul>
+
+<div class="callout warn">
+<div class="callout-title">Partition tolerance is not actually a choice</div>
+<p>A common misreading of CAP is "pick any two of C, A, P." In practice you cannot opt out of P. A network partition is a fact about the physical world — cables get cut, switches fail, packets get dropped, cross-region links degrade. You do not get to decide whether partitions happen; you only get to decide what your system does <em>when</em> one does. So the real, useful form of CAP is: <strong>when a partition occurs, choose C or A</strong>. Systems that claim to be "CA" are really systems that behave correctly when there is no partition, and that's a much weaker guarantee than it sounds like — it says nothing about the moment a partition actually occurs, which is precisely the moment you need a guarantee.</p>
+</div>
+
+<h3>What CP and AP actually look like</h3>
+<p>Concretely, imagine a 5-node cluster split into a majority side (3 nodes) and a minority side (2 nodes) by a partition.</p>
+<ul>
+<li><strong>CP behavior</strong>: the minority side refuses to serve writes (and often reads) because it cannot confirm it has the latest data or reach quorum. Clients talking only to the minority side get errors or timeouts until the partition heals. ZooKeeper, etcd, and Google Spanner in its cross-region commit path are built this way — they would rather return an error than return a value that might be stale or that might conflict with a concurrent write on the other side.</li>
+<li><strong>AP behavior</strong>: both sides keep accepting reads and writes independently during the partition. Cassandra (with weaker consistency levels like <code>ONE</code> or <code>QUORUM</code> per-region) and DynamoDB's original design are built this way. The cost is that the two sides can now diverge — the same key might get written differently on each side — and the system needs a reconciliation strategy (last-write-wins by timestamp, vector clocks, CRDTs, or application-level merge logic) for when the partition heals.</li>
+</ul>
+
+<table>
+<tr><th>System</th><th>Choice under partition</th><th>Mechanism</th></tr>
+<tr><td>ZooKeeper / etcd</td><td>CP</td><td>Requires a quorum (majority) to accept writes; minority partition becomes read-only or unavailable</td></tr>
+<tr><td>Google Spanner (multi-region writes)</td><td>CP</td><td>Paxos-based quorum commit; a partitioned minority cannot commit</td></tr>
+<tr><td>Cassandra (QUORUM reads/writes)</td><td>Tunable, defaults toward AP</td><td>Per-query consistency level lets you trade off, but base design favors availability</td></tr>
+<tr><td>DynamoDB (default)</td><td>AP</td><td>Accepts writes on both sides of a partition; resolves conflicts later</td></tr>
+</table>
+
+<h2>2. PACELC: What CAP Doesn't Tell You</h2>
+<p>CAP only describes behavior during a partition — but partitions are rare compared to normal operation. Most of the time, your system is up, all nodes can reach each other, and yet you still face a trade-off: how many replicas do you wait for before acknowledging a write? <strong>PACELC</strong> (proposed by Daniel Abadi) extends CAP to cover this:</p>
+<p><em>"If there is a Partition (P), how does the system trade off Availability and Consistency (A and C)? Else (E), in the normal case with no partition, how does it trade off Latency and Consistency (L and C)?"</em></p>
+<p>This second half matters enormously in practice. Even with zero network partitions, if you want strong consistency you generally need to wait for acknowledgment from a quorum of replicas (or all of them), which adds latency proportional to the slowest replica you wait for. If you want low latency, you acknowledge after writing to one node (usually the leader) and replicate asynchronously — which means a read against a follower can return stale data, and a leader crash before replication completes can lose the write entirely.</p>
+
+<table>
+<tr><th>System</th><th>Under partition (PA/PC)</th><th>Else — normal case (EL/EC)</th></tr>
+<tr><td>DynamoDB</td><td>PA — stays available</td><td>EL — favors low latency, eventual consistency by default</td></tr>
+<tr><td>MongoDB (default write concern)</td><td>PC — steps toward consistency</td><td>EC/EL tunable via write concern / read preference</td></tr>
+<tr><td>Cassandra</td><td>PA</td><td>EL by default, tunable to EC per query</td></tr>
+<tr><td>Spanner</td><td>PC</td><td>EC — pays latency (TrueTime commit wait) for strong consistency</td></tr>
+</table>
+
+<div class="callout tip">
+<div class="callout-title">Why this is the more actionable half</div>
+<p>Most engineering decisions you actually make — read replica lag, whether to read-your-own-writes after a POST, whether a cache can serve a slightly stale value — are PACELC decisions, not CAP decisions, because you're not usually mid-partition. When someone says "our database is eventually consistent," they are almost always describing the EL/EC choice, not a CAP failover mode.</p>
+</div>
+
+<h2>3. ACID, Precisely, and What Breaks Without Each Letter</h2>
+<p>ACID describes guarantees a single transactional system (classically a single relational database instance) gives you around a unit of work. It's worth knowing exactly what each letter buys you, because in a distributed system you will lose some of them by default and have to consciously re-earn them.</p>
+
+<h3>Atomicity</h3>
+<p>A transaction's operations either all happen or none do — there is no partial completion visible to anyone. <strong>Without it</strong>: imagine transferring money — debit account A, credit account B — as two separate statements with no transaction wrapper. If the process crashes after the debit but before the credit, money has vanished. Atomicity is what lets you treat "debit + credit" as a single indivisible unit; if any part fails, the database rolls back the parts that already ran.</p>
+
+<h3>Consistency</h3>
+<p>A transaction moves the database from one valid state to another valid state, respecting all declared constraints (foreign keys, unique constraints, check constraints, triggers). <strong>Without it</strong>: an order could reference a customer_id that doesn't exist in the customers table, or a "quantity" column could go negative despite a business rule that it never should. Note this "C" is unrelated to CAP's "C" — ACID consistency is about application-defined invariants; CAP consistency is about replicas agreeing on the latest value. Conflating the two is one of the most common terminology traps in this space.</p>
+
+<h3>Isolation</h3>
+<p>Concurrent transactions appear to execute as if they ran one at a time, even though the database is actually interleaving their work for performance. <strong>Without it</strong>: two concurrent transactions could each read a bank balance of 100, each independently add 50, and each write back 150 — losing one of the updates entirely (a lost update), because neither transaction saw the other's write.</p>
+
+<h3>Durability</h3>
+<p>Once a transaction commits, it survives any subsequent crash — power loss, process kill, OS crash. <strong>Without it</strong>: a database could acknowledge a commit, then lose the data because it was only sitting in an OS page cache buffer that never made it to disk before a crash. Durability is why databases use write-ahead logs (WAL) — the log entry is fsynced to durable storage before the commit is acknowledged, so replay after a crash can reconstruct the committed state.</p>
+
+<div class="callout">
+<div class="callout-title">Durability has a knob, and it's usually turned down for latency</div>
+<p>Many systems let you trade durability for throughput — Postgres's <code>synchronous_commit = off</code>, or MySQL's <code>innodb_flush_log_at_trx_commit = 2</code>, acknowledge the client before the WAL entry is guaranteed to be on disk. This is a real, deliberate PACELC-style trade-off: you get lower commit latency at the cost of possibly losing the last few hundred milliseconds of "committed" transactions if the OS crashes (though not if only the database process crashes, since the OS buffer usually survives that).</p>
+</div>
+
+<h2>4. Isolation Levels and the Anomalies They Prevent</h2>
+<p>Isolation is not all-or-nothing — full serializability (true one-at-a-time execution) is expensive, so SQL defines four standard levels, each permitting fewer anomalies than the last, at the cost of more locking or more transaction aborts.</p>
+
+<table>
+<tr><th>Level</th><th>Dirty Read</th><th>Non-Repeatable Read</th><th>Phantom Read</th></tr>
+<tr><td>Read Uncommitted</td><td>Possible</td><td>Possible</td><td>Possible</td></tr>
+<tr><td>Read Committed</td><td>Prevented</td><td>Possible</td><td>Possible</td></tr>
+<tr><td>Repeatable Read</td><td>Prevented</td><td>Prevented</td><td>Possible (mostly — see below)</td></tr>
+<tr><td>Serializable</td><td>Prevented</td><td>Prevented</td><td>Prevented</td></tr>
+</table>
+
+<h3>Dirty read — prevented starting at Read Committed</h3>
+<pre><code>T1: UPDATE accounts SET balance = 50 WHERE id = 1;   -- not yet committed
+T2: SELECT balance FROM accounts WHERE id = 1;        -- reads 50
+T1: ROLLBACK;                                         -- balance is actually still 100</code></pre>
+<p>T2 read a value that was never actually committed. At Read Uncommitted, transactions can see each other's in-flight, uncommitted writes. This level is rarely used in practice precisely because it makes "reading garbage that gets rolled back" a normal possibility.</p>
+
+<h3>Non-repeatable read — prevented starting at Repeatable Read</h3>
+<pre><code>T1: SELECT balance FROM accounts WHERE id = 1;   -- reads 100
+T2: UPDATE accounts SET balance = 200 WHERE id = 1; COMMIT;
+T1: SELECT balance FROM accounts WHERE id = 1;   -- reads 200, same transaction!</code></pre>
+<p>The same row read twice within one transaction returns different values because another transaction committed a change to it in between. Read Committed only guarantees you won't see uncommitted data — it says nothing about a row changing between two reads in the same transaction. Repeatable Read fixes this by ensuring that once T1 reads a row, it will see the same value for that row for the rest of the transaction (typically via multi-version concurrency control (MVCC): T1 keeps reading from the snapshot as of when the transaction, or in some engines the first statement, began).</p>
+
+<h3>Phantom read — prevented at Serializable</h3>
+<pre><code>T1: SELECT COUNT(*) FROM orders WHERE status = 'PENDING';   -- returns 5
+T2: INSERT INTO orders (status) VALUES ('PENDING'); COMMIT;
+T1: SELECT COUNT(*) FROM orders WHERE status = 'PENDING';   -- returns 6</code></pre>
+<p>A phantom is a <em>new row</em> matching T1's filter that appears between two reads — different from a non-repeatable read, which is about an <em>existing</em> row changing. Repeatable Read locks or snapshots the rows it has already read, but a plain range predicate can still admit newly inserted rows in some implementations. Serializable closes this gap, typically via range locks (locking the predicate, not just matched rows) or, in modern MVCC engines like Postgres, via serializable snapshot isolation (SSI), which detects dangerous read/write dependency cycles between concurrent transactions and aborts one of them rather than locking proactively.</p>
+
+<div class="callout warn">
+<div class="callout-title">"Repeatable Read" doesn't mean the same thing everywhere</div>
+<p>Postgres's Repeatable Read is actually implemented as a form of snapshot isolation that also happens to prevent phantoms in most cases (though not all write-skew scenarios), which is stronger than the SQL standard requires for that level. MySQL's InnoDB Repeatable Read uses next-key locking (row locks plus gap locks) specifically to close the phantom-read gap for the common case. The standard defines a floor of guarantees per level, not an exact implementation — always check what your specific engine actually does at a given level rather than assuming the textbook definition maps 1:1 to production behavior.</p>
+</div>
+
+<h2>5. BASE: The Alternative Philosophy</h2>
+<p>ACID assumes you can afford to coordinate tightly — lock rows, hold transactions open, block until every party agrees. That assumption breaks down once your "database" is actually many independently-failing nodes across racks or regions: the latency and availability cost of coordinating a strict ACID transaction across a wide-area network, for every write, is often unacceptable at scale. <strong>BASE</strong> is the deliberate alternative:</p>
+<ul>
+<li><strong>Basically Available</strong> — the system prioritizes responding (possibly with stale or approximate data) over refusing to respond. This is the AP choice from CAP, applied as a general design philosophy rather than just a partition-time fallback.</li>
+<li><strong>Soft state</strong> — the state of the system can change over time even without new input, because replicas are still converging via background processes (anti-entropy, read-repair, hinted handoff). There isn't one authoritative value at every instant — there's a value that's still settling.</li>
+<li><strong>Eventual consistency</strong> — if no new writes occur, all replicas will eventually converge to the same value. "Eventually" is doing a lot of work in that sentence — it might be milliseconds or, under sustained load or partition, much longer.</li>
+</ul>
+<p>The trade is explicit: give up the guarantee that every read reflects the latest write, in exchange for lower latency and the ability to keep serving traffic even when some replicas are unreachable or lagging. This is why systems like Cassandra, DynamoDB, and most CDN/cache layers are BASE by default, and why <a href="#/database-architecture">database replication topology</a> choices (synchronous vs. asynchronous replication) directly determine how "eventual" eventual consistency actually is.</p>
+
+<h2>6. Two-Phase Commit: Distributed Atomicity, and Why It Blocks</h2>
+<p>If you need a single atomic transaction that spans multiple independent nodes (say, two different databases, or a database and a message queue), you need a distributed transaction protocol. <strong>Two-Phase Commit (2PC)</strong> is the classic approach.</p>
+<h3>The protocol</h3>
+<ol>
+<li><strong>Phase 1 — Prepare</strong>: a coordinator sends a "prepare" message to every participant. Each participant does everything necessary to guarantee it <em>can</em> commit — acquiring locks, writing to its own durable log — then replies "yes" (voted to commit) or "no." Critically, after voting "yes," a participant must be able to commit no matter what happens next; it has surrendered the right to unilaterally abort.</li>
+<li><strong>Phase 2 — Commit or Abort</strong>: if all participants voted "yes," the coordinator logs the decision and sends "commit" to everyone. If any participant voted "no," or timed out, the coordinator sends "abort" to everyone. Participants apply the decision and release their locks.</li>
+</ol>
+
+<div class="callout warn">
+<div class="callout-title">Why 2PC is fundamentally blocking</div>
+<p>Consider a participant that voted "yes" in phase 1, then the coordinator crashes before sending the phase 2 decision to anyone. That participant is now stuck: it cannot unilaterally commit (the coordinator might have decided to abort based on another participant's "no"), and it cannot unilaterally abort (the coordinator might have already told other participants to commit, and its own commit is contractually promised). Its only option is to hold its locks and <strong>wait</strong> for the coordinator to recover and tell it the decision. Every other transaction that needs those locked rows also blocks. This is the defining weakness of 2PC — a single coordinator crash at the wrong moment can freeze part of the system indefinitely, and no participant-side timeout can safely resolve it without risking inconsistency. (Three-Phase Commit and Paxos/Raft-based commit protocols address this by replicating the coordinator's decision so a new coordinator can be elected and safely resume, but that adds real complexity and latency.)</p>
+</div>
+
+<p>2PC also couples every participant's availability to every other's: if any one node in the transaction is slow or down, all locks across all nodes stay held. This is the opposite of the BASE philosophy, and it's why 2PC is rarely used across service boundaries in modern systems — it's mostly seen inside a single database engine, or via XA transactions across a small, tightly-controlled set of resources.</p>
+
+<h2>7. The Saga Pattern: 2PC's Practical Alternative</h2>
+<p>A <strong>saga</strong> replaces one large distributed transaction with a sequence of local transactions, each committing independently, plus a <strong>compensating transaction</strong> defined for each step to semantically undo it if a later step fails. Nothing is held locked across steps — each local transaction commits for real, immediately, in its own service's database. This trades atomicity (all-or-nothing, instantly) for eventual consistency (all-or-eventually-undone).</p>
+
+<h3>Choreography vs. orchestration</h3>
+<table>
+<tr><th></th><th>Choreography</th><th>Orchestration</th></tr>
+<tr><td>Coordination</td><td>Each service publishes events; the next service reacts to events it's interested in</td><td>A central orchestrator explicitly calls each step and decides what happens next</td></tr>
+<tr><td>Coupling</td><td>Loose — services only know about events, not each other</td><td>Orchestrator knows about all participants; participants only know the orchestrator</td></tr>
+<tr><td>Visibility of the flow</td><td>Implicit, spread across services — harder to see the whole saga in one place</td><td>Explicit, defined as a single state machine or workflow definition</td></tr>
+<tr><td>Failure handling</td><td>Each service must know how to react to failure events for steps it doesn't own</td><td>Orchestrator centrally decides which compensations to fire and in what order</td></tr>
+<tr><td>Good fit</td><td>Small number of steps, simple reactions</td><td>Longer flows, need for observability/retries, complex branching</td></tr>
+</table>
+
+<div class="callout">
+<div class="callout-title">Compensating transactions must be idempotent — and why that's harder than it sounds</div>
+<p>A compensation might be triggered more than once — the orchestrator retries after a timeout, a message gets redelivered by an <a href="#/async-messaging">at-least-once messaging</a> layer, or a crash-recovery process replays an in-flight saga. If "refund payment" isn't idempotent, a redelivered compensation message could refund the customer twice. In practice this means every compensating action needs a way to recognize "I already did this for saga instance X, step Y" — usually a unique idempotency key derived from the saga/step identifiers, checked against a record of already-applied compensations before doing the work.</p>
+</div>
+
+<h3>Worked example: order → payment → inventory, with a failure and reverse compensation</h3>
+<p>Consider an order placement saga with three steps, orchestrated by an Order Saga Coordinator:</p>
+<pre><code>Step 1: Order Service      -> create order (status = PENDING)
+Step 2: Payment Service    -> charge customer's card
+Step 3: Inventory Service  -> reserve stock for the item(s)</code></pre>
+<p>Each step is a local transaction, committed immediately in that service's own database. Now suppose Step 3 fails — the item just went out of stock. The saga cannot simply stop; Steps 1 and 2 already committed real state (a persisted order, a real charge on a card). The coordinator must now run compensations for every <em>already-completed</em> step, strictly in reverse order:</p>
+<pre><code>Step 3: Reserve stock            -> FAILS (out of stock)
+Compensate Step 2: Refund payment            (undo the charge)
+Compensate Step 1: Cancel order (status = CANCELLED)   (undo the creation)</code></pre>
+<p>Reverse order matters because later steps may have been built assuming earlier steps' effects still hold — inventory reservation assumed a valid, paid order existed. Unwinding out of order (say, canceling the order before refunding) can leave the system in a state no compensation was designed to handle, such as a payment service trying to refund a charge tied to an order that no longer exists in a valid state as far as its own logic is concerned.</p>
+<p>Note also that "cancel order" is not literally "delete the row" — it's a genuine compensating action (a new state transition to CANCELLED), because the original create-order transaction already committed and is visible to other transactions; there is no rollback in the ACID sense once a local transaction has committed. This is the core semantic difference from 2PC: a saga's compensation is a forward-moving business operation that semantically reverses an effect, not a mechanical undo.</p>
+
+<div class="callout tip">
+<div class="callout-title">Sagas give up isolation, and you have to design around it</div>
+<p>Between Step 2 committing and Step 3 failing, any other part of the system that reads the order will see a PENDING order with a completed payment and no reserved inventory — a state that would never be externally visible under ACID isolation, where the whole multi-step transaction would be invisible until it fully committed. This is called a "dirty read" at the business level (not the SQL-anomaly sense from Section 4, but analogous), and it's why saga-based flows typically expose intermediate statuses explicitly (PENDING, PAYMENT_CONFIRMED, RESERVED, CONFIRMED, CANCELLED) rather than pretending the operation is atomic. Anything reading order state mid-saga needs to be written with the assumption that "not yet fully consistent" is a normal, expected condition, not an error.</p>
+</div>
+
+<h2>8. Distributed Locking and Redlock</h2>
+<p>A single-node mutex (like Java's <code>synchronized</code> or a <code>ReentrantLock</code>, covered in <a href="#/concurrency-multithreading">concurrency fundamentals</a>) only coordinates threads inside one JVM. Once you have multiple service instances across multiple machines that need mutual exclusion over a shared resource (e.g., "only one instance should run this scheduled job right now"), you need a lock whose state lives somewhere all instances can see — typically a shared store like Redis, ZooKeeper, or a database row.</p>
+
+<h3>Why a naive single-node lock (e.g., one Redis instance) isn't safe</h3>
+<p>A simple approach — <code>SET lock_key client_id NX PX 30000</code> against one Redis node — has two failure modes:</p>
+<ul>
+<li><strong>Single point of failure</strong>: if that one Redis node goes down, no one can acquire or release the lock.</li>
+<li><strong>Failover data loss</strong>: if that Redis node is backed by an asynchronous replica and it fails over, the lock key might not have replicated yet — the new primary comes up with no record of the lock, and a second client can acquire it while the first client still believes it holds it.</li>
+</ul>
+
+<h3>Redlock: the majority-quorum idea</h3>
+<p>Redlock (proposed by Redis's author) addresses this by running N independent Redis instances (typically 5), with no replication between them. To acquire the lock, a client:</p>
+<ol>
+<li>Records the current time, then tries to set the same key with the same random value on all N instances, using a short per-instance timeout so a down instance doesn't stall the whole attempt.</li>
+<li>Considers the lock acquired only if it successfully set the key on a <strong>majority</strong> (at least N/2 + 1) of the instances, <em>and</em> the total time elapsed doing so is less than the lock's validity window.</li>
+<li>If acquisition fails or times out, it releases the key on every instance it did manage to set it on, to avoid leaving stale partial locks around.</li>
+</ol>
+<p>The majority-quorum requirement is the same idea behind Raft/Paxos leader election and quorum reads/writes: as long as more than half the instances are up and reachable, any two clients' quorums are guaranteed to overlap in at least one instance, so two clients cannot both reach a majority for conflicting values at the same time.</p>
+
+<div class="callout warn">
+<div class="callout-title">The known criticism: Redlock's safety depends on clock assumptions that don't always hold</div>
+<p>Martin Kleppmann's widely-cited critique of Redlock points out that it implicitly assumes bounded clock drift and bounded process pauses. If a client acquires the lock, then experiences a long stop-the-world garbage collection pause (or its VM is suspended, or there's a large NTP clock jump) that exceeds the lock's expiry, the lock can expire and be acquired by a second client while the first client — unaware time has passed — resumes and continues acting as if it still holds it. Now two clients believe they hold the same lock simultaneously, which is exactly the failure distributed locking was supposed to prevent. Redlock isn't "wrong" so much as it's making a fencing-free, clock-dependent safety argument, whereas systems like ZooKeeper or etcd provide a <strong>fencing token</strong> — a strictly increasing number issued with the lock — that the protected resource itself can check and reject stale, out-of-order requests from a client that no longer actually holds a valid lock. If your locking use case genuinely requires correctness (not just "reduce the chance of double-processing"), a fencing token from a consensus-based store is a stronger guarantee than time-based lock expiry alone.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does CAP force a choice specifically between C and A, and not, say, between P and something else?</summary>
+<div class="qa-body">Because P isn't optional in reality — you cannot prevent a network from occasionally partitioning, so you can't design a system that simply "doesn't have" partition tolerance and call that a valid, permanent operating mode. The only real decision point is what the system does in the moment a partition is actually happening: does it keep answering requests on both sides (possibly with divergent data), or does it refuse to answer on the side that can't confirm it has the latest state? That's the entirety of the "choice" CAP describes. Systems marketed as "CA" are describing their behavior in the no-partition case, which PACELC (not CAP) actually characterizes.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What's the difference between the "C" in CAP and the "C" in ACID?</summary>
+<div class="qa-body">ACID's Consistency means a transaction preserves application-level invariants — foreign keys stay valid, check constraints hold, business rules aren't violated. It's about the correctness of a single transaction's outcome. CAP's Consistency means linearizability across replicas — every read sees the most recent acknowledged write, no matter which replica answers it. It's about agreement between copies of data, not about business rule correctness. A system can have perfect ACID consistency on each individual node while being CAP-inconsistent because two nodes' copies of the "correct" data have diverged.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does Repeatable Read not fully solve phantom reads, and what closes the gap?</summary>
+<div class="qa-body">Repeatable Read (in the classic locking model) locks the specific rows a transaction has already read, guaranteeing those particular rows won't change underneath it. But a phantom is a brand-new row that didn't exist yet when the first read ran, so there was nothing to lock — the predicate itself (e.g., "status = PENDING") wasn't locked, only the rows that matched it at that instant. Closing this gap requires either locking the predicate/range itself (next-key/gap locking, as InnoDB does) or using snapshot-based detection of read/write dependency cycles between concurrent transactions (serializable snapshot isolation), which is what true Serializable isolation does.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Concretely, why does 2PC block forever if the coordinator crashes right after collecting all "yes" votes?</summary>
+<div class="qa-body">Because a participant that has voted "yes" has made a binding promise: it must be able to commit if told to, so it can no longer unilaterally abort even if it wanted to. But it also cannot unilaterally commit, because it doesn't know whether some other participant voted "no" and the coordinator was about to broadcast an abort instead. With the coordinator down, the only source of truth for "what did the group actually decide" is gone, so the participant has no safe move except to sit and hold its locks until the coordinator (or a recovery process with access to the coordinator's durable decision log) comes back. This is precisely the scenario 3PC and consensus-replicated coordinators are built to avoid, by ensuring the decision itself survives a coordinator crash.</div>
+</details>
+
+<details class="concept-qa">
+<summary>In the order-payment-inventory saga, why must compensations run in reverse order rather than, say, all in parallel?</summary>
+<div class="qa-body">Because later steps' local transactions may have been executed under the assumption that earlier steps' effects were valid and durable — inventory reservation logic might assume a real, paid order exists, and could behave unpredictably if that assumption is violated mid-compensation. Reverse order guarantees that when you compensate step N, steps 1..N-1 are still in their fully-completed state exactly as they were when step N originally ran, so the compensation logic for step N is undoing a well-defined, known state. Running compensations out of order or in parallel risks a compensation acting on a system that's already been partially unwound by another compensation, which is a scenario the compensating logic was never designed to handle.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does the Redlock algorithm require a majority of nodes rather than all of them?</summary>
+<div class="qa-body">Requiring all N nodes would make the lock unavailable the moment even one node is down or briefly unreachable — that reintroduces a single point of failure, just spread across more machines. Requiring only a majority means the system tolerates up to floor((N-1)/2) node failures while still being able to acquire locks. The correctness argument relies on the fact that any two majorities out of N nodes must overlap in at least one node — so two clients can never both simultaneously hold a majority for two different lock values, because they'd have to have both "won" on that overlapping node, which is impossible since it can only hold one value at a time.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is "eventual consistency" not actually a single, well-defined guarantee?</summary>
+<div class="qa-body">Because "eventually" specifies no bound on time, and different systems achieve convergence through very different mechanisms with very different practical latencies — background anti-entropy repair, read-repair triggered opportunistically during normal reads, hinted handoff replaying missed writes once a node comes back, or explicit conflict resolution via vector clocks or CRDTs. Two systems can both be honestly described as "eventually consistent" while one converges in tens of milliseconds under normal load and the other takes minutes under partition or high write pressure. This is why, in practice, you need to know the specific propagation mechanism and its typical/worst-case lag for your system, not just the label "eventually consistent," if you're relying on freshness for correctness anywhere.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">Replication topology and how synchronous vs. asynchronous replication determines how "eventual" consistency really is</div></div>
+<div class="related-card" onclick="window.location.hash='/async-messaging'"><div class="rc-title">Async Messaging</div><div class="rc-sub">At-least-once delivery is exactly why saga compensations and event handlers must be idempotent</div></div>
+<div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Concurrency &amp; Multithreading</div><div class="rc-sub">Single-node locking primitives that distributed locks like Redlock are trying to generalize across machines</div></div>
+<div class="related-card" onclick="window.location.hash='/hld-ecommerce-flash-sale'"><div class="rc-title">E-Commerce Flash Sale Design</div><div class="rc-sub">A concrete system where CAP trade-offs, inventory reservation sagas, and distributed locking all show up together</div></div>
+</div>

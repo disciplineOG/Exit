@@ -1,0 +1,296 @@
+<p class="topic-breadcrumb">Phase 3 — Advanced Systems, Security &amp; LLD Machine Coding · Days 56–60 · LLD Machine Coding</p>
+<h1>LLD #3: Elevator System / BookMyShow</h1>
+<div class="topic-tags">
+<span class="tag">State Pattern</span>
+<span class="tag">Strategy Pattern</span>
+<span class="tag">SCAN/LOOK Scheduling</span>
+<span class="tag">Concurrency</span>
+<span class="tag">Seat Holds / TTL</span>
+<span class="tag">Distributed Locking</span>
+<span class="tag">Resource Allocation</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Both of these systems fail in the same way if you model them carelessly: someone writes <code>if (state == IDLE) { ... } else if (state == MOVING) { ... }</code> scattered across a dozen methods, and eventually a transition gets missed — a door opens while the elevator is moving, or two payment attempts both succeed against the same seat. Modeling state as an explicit, closed set of objects (rather than a mutable field checked ad hoc) turns "illegal transition" from a runtime bug into a compile-time impossibility. And the booking system's seat-hold mechanic is the same TTL-expiry idea from <a href="#/lld-rate-limiter-cache">caching and rate limiting</a> applied to a business-critical resource — understanding it here is what lets you reason correctly about why a "confirm seat" button that works fine in testing can silently double-book seats in production under real concurrent traffic.</p>
+</div>
+
+<h2>1. The Elevator System — Entities and Requests</h2>
+<p>An elevator system is fundamentally a scheduling problem wearing physical clothing. Before touching algorithms, get the entity model right, because a sloppy entity model is what forces people into if/else soup later.</p>
+<ul>
+<li><strong>Elevator</strong> — has an id, a <code>currentFloor</code>, a <code>Direction</code> (UP, DOWN, IDLE), an internal <code>ElevatorState</code> (see Section 4), and a sorted collection of pending stops, typically split into two sets: stops above the current floor and stops below it.</li>
+<li><strong>ElevatorController</strong> (or <code>ElevatorManager</code>) — owns the fleet (a <code>List&lt;Elevator&gt;</code>), receives all incoming requests, decides which elevator services which request, and dispatches commands to elevators.</li>
+<li><strong>Request</strong> — split into two distinct types because they carry different information and originate from different places:
+<ul>
+<li><strong>HallCall (external request)</strong> — pressed on a floor, outside any elevator. Carries <code>originFloor</code> and a desired <code>Direction</code> (UP or DOWN) — the person hasn't chosen an elevator yet, only a direction. This is what the controller uses to decide <em>which</em> elevator to send.</li>
+<li><strong>CabinRequest (internal request)</strong> — pressed inside a specific elevator's panel. Carries only a <code>destinationFloor</code>; direction is implied by comparing it to the elevator's current floor. There is no assignment decision here — the request belongs to the elevator whose button was pressed.</li>
+</ul>
+</li>
+</ul>
+<div class="callout">
+<div class="callout-title">Why two request types, not one</div>
+<p>Conflating them is a common modeling shortcut that breaks the scheduling algorithm. A hall call is a request for <em>capacity</em> — the system must choose which of several elevators responds, and that choice is what the assignment strategy in Section 3 is for. A cabin request has no such choice to make; it's simply added to the stop list of the elevator that received it. If you model both as "a floor number," you lose the direction intent of hall calls (a person on floor 5 wanting to go down should not be picked up by an elevator passing floor 5 going up, even though it stops there) and you lose the distinction between "which elevator should I dispatch" and "where does this specific elevator go next."</p>
+</div>
+
+<h2>2. Scheduling Within One Elevator: SCAN / LOOK</h2>
+<p>Given a single elevator with a set of pending stops above and below it, in what order should it serve them? The naive approach — serve requests in the order they arrived (FIFO) — produces pathological behavior: an elevator on floor 1 asked to go to floor 10, then interrupted by a request for floor 2, would go 1 → 10 → 2, wasting enormous travel distance. The fix is to sort by geography, not by arrival time, and this is exactly the disk-scheduling SCAN/LOOK algorithm applied to a vertical shaft instead of a disk arm.</p>
+
+<h3>The general algorithm</h3>
+<ol>
+<li>Maintain two ordered stop sets relative to the elevator's current position: <code>upStops</code> (a min-heap or sorted set of floors above current, so the nearest is served first) and <code>downStops</code> (a max-heap or sorted set of floors below current, nearest served first).</li>
+<li>While moving UP: serve every floor in <code>upStops</code> in ascending order — pick up hall calls requesting UP along the way, drop off cabin requests — until <code>upStops</code> is empty or a stop is reached that is the topmost requested floor.</li>
+<li>When <code>upStops</code> is exhausted, check <code>downStops</code>. If non-empty, reverse direction and repeat the process descending. If both are empty, transition to IDLE and await the next request.</li>
+<li>A new hall call is inserted into <code>upStops</code> or <code>downStops</code> based on where it lies relative to current floor and current direction — a call from a floor below the elevator, while the elevator is heading up, only gets added to the "serve on the way up" set if the call's direction is also UP <em>and</em> its floor is still ahead; otherwise it waits for the return sweep.</li>
+</ol>
+<p>This is called <strong>LOOK</strong> (as opposed to pure SCAN) because the elevator only travels as far as the furthest <em>requested</em> floor in a direction before reversing — it doesn't senselessly travel to the physical end of the shaft (the top or bottom floor) if nobody requested it. Pure SCAN always sweeps to the boundary; LOOK "looks ahead" at the pending queue and reverses early. Every production elevator scheduling system uses some variant of LOOK, not naive SCAN, for exactly this reason.</p>
+
+<h3>Why this minimizes wait/travel time</h3>
+<p>The key insight is that reversing direction is the expensive operation — not distance traveled per se, but the number of direction changes, because each reversal means every request "behind" the elevator has to wait for a full round trip. SCAN/LOOK guarantees monotonic progress in one direction, so a request that lies "in front of" the elevator's current sweep gets served with zero extra travel — it's free, since the elevator was going that way anyway. The only requests that pay a wait penalty are ones behind the current direction of travel, and even those wait at most one full sweep, bounded by the shaft height, rather than an unbounded amount under FIFO ordering.</p>
+
+<pre><code>class Elevator {
+    int currentFloor;
+    Direction direction; // UP, DOWN, IDLE
+    ElevatorState state; // Idle, Moving, DoorOpen (Section 4)
+    TreeSet&lt;Integer&gt; upStops = new TreeSet&lt;&gt;();
+    TreeSet&lt;Integer&gt; downStops = new TreeSet&lt;&gt;(Comparator.reverseOrder());
+
+    void step() {
+        if (direction == Direction.UP) {
+            if (!upStops.isEmpty()) {
+                currentFloor = upStops.pollFirst();
+                openDoorAndServe();
+            } else if (!downStops.isEmpty()) {
+                direction = Direction.DOWN; // reverse only when the sweep is exhausted
+            } else {
+                direction = Direction.IDLE;
+            }
+        } else if (direction == Direction.DOWN) {
+            // symmetric
+        }
+    }
+}
+</code></pre>
+
+<h2>3. Fleet Dispatch: Which Elevator Answers the Hall Call?</h2>
+<p>SCAN/LOOK solves ordering <em>within</em> one elevator. In a multi-elevator bank, there's a prior question: when a hall call arrives, which elevator gets it? This is a completely separate decision and should live in its own component so it can be swapped without touching per-elevator scheduling logic — a textbook application of the <a href="#/solid-design-patterns">Strategy pattern</a>.</p>
+
+<pre><code>interface ElevatorSelectionStrategy {
+    Optional&lt;Elevator&gt; selectElevator(List&lt;Elevator&gt; fleet, HallCall call);
+}
+
+class NearestElevatorInDirectionStrategy implements ElevatorSelectionStrategy {
+    public Optional&lt;Elevator&gt; selectElevator(List&lt;Elevator&gt; fleet, HallCall call) {
+        return fleet.stream()
+            .filter(e -&gt; isUsable(e, call))
+            .min(Comparator.comparingInt(e -&gt; distanceCost(e, call)));
+    }
+}
+
+class ElevatorController {
+    private ElevatorSelectionStrategy strategy; // injected, swappable at runtime
+    void onHallCall(HallCall call) {
+        strategy.selectElevator(elevators, call)
+                 .ifPresentOrElse(e -&gt; e.addStop(call), () -&gt; queueUnassigned(call));
+    }
+}
+</code></pre>
+
+<p>The "nearest elevator in the right direction" heuristic ranks candidate elevators by a cost function, typically preferring, in order:</p>
+<ol>
+<li>An elevator already moving <em>toward</em> the call's floor in the <em>same</em> direction the caller wants to go (it can pick them up for free, mid-sweep, with zero detour).</li>
+<li>An IDLE elevator, ranked by raw floor distance.</li>
+<li>An elevator moving <em>away</em> from the call (it will have to finish its sweep, reverse, and come back) — ranked last, and only chosen if no better option is free.</li>
+<li>An elevator already moving toward the floor but in the <em>opposite</em> direction of what the caller wants is usually excluded entirely from immediate assignment — it will pass the floor without being able to serve the request, since its cabin is committed to its current directional sweep.</li>
+</ol>
+<div class="callout tip">
+<div class="callout-title">Why Strategy, not a hardcoded method</div>
+<p>Real dispatch systems tune this constantly: weight by current cabin load to avoid overloading one car, reserve one elevator for a fire-service or VIP mode, or switch to a zoned strategy during peak hours (each elevator owns a fixed floor range). None of that should require touching <code>Elevator</code> or the SCAN logic — it's purely a different implementation of <code>selectElevator</code>. This mirrors why you'd inject a rate-limiting algorithm rather than hardcode it, as covered in <a href="#/lld-rate-limiter-cache">rate limiter design</a> — the selection policy and the mechanism it acts on are different axes of change and should vary independently.</p>
+</div>
+
+<h2>4. The State Pattern: Elevator Lifecycle</h2>
+<p>An elevator's behavior depends entirely on its current phase, and several transitions must be structurally forbidden: you cannot move while the door is open, you cannot accept new floor stops while doors are opening for safety-interlock reasons in some designs, and a door cannot "close" from Idle because it was never open. Representing state as an <code>enum</code> field checked with conditionals means every one of these invariants has to be manually re-verified at every call site that touches the field — miss one, and you get a door-open-while-moving bug that's a safety issue, not just a UI glitch.</p>
+<p>The State pattern fixes this by making each state its own class implementing a common interface, where each state only exposes the transitions that are legal <em>from</em> it:</p>
+<pre><code>interface ElevatorState {
+    ElevatorState requestMove(Elevator ctx);
+    ElevatorState arriveAtFloor(Elevator ctx);
+    ElevatorState openDoor(Elevator ctx);
+    ElevatorState closeDoor(Elevator ctx);
+}
+
+class IdleState implements ElevatorState {
+    public ElevatorState requestMove(Elevator ctx) { return new MovingState(); }
+    public ElevatorState openDoor(Elevator ctx) { return new DoorOpenState(); }
+    public ElevatorState arriveAtFloor(Elevator ctx) { return this; } // no-op, already idle
+    public ElevatorState closeDoor(Elevator ctx) {
+        throw new IllegalStateException("Door is not open");
+    }
+}
+
+class MovingState implements ElevatorState {
+    public ElevatorState requestMove(Elevator ctx) { return this; } // already moving
+    public ElevatorState openDoor(Elevator ctx) {
+        throw new IllegalStateException("Cannot open door while moving");
+    }
+    public ElevatorState arriveAtFloor(Elevator ctx) {
+        return ctx.hasPendingStops() ? this : new IdleState();
+    }
+    public ElevatorState closeDoor(Elevator ctx) { return this; }
+}
+
+class DoorOpenState implements ElevatorState {
+    public ElevatorState closeDoor(Elevator ctx) { return new MovingState(); }
+    public ElevatorState requestMove(Elevator ctx) {
+        throw new IllegalStateException("Cannot move with door open");
+    }
+    public ElevatorState arriveAtFloor(Elevator ctx) { return this; }
+    public ElevatorState openDoor(Elevator ctx) { return this; }
+}
+</code></pre>
+<p>The controller never checks "what state am I in" — it just calls <code>elevator.getState().requestMove(elevator)</code> and reassigns the returned state. Every illegal transition either doesn't compile as a reachable path or throws immediately at the point of misuse, instead of silently corrupting the elevator's physical behavior three method calls later.</p>
+
+<h2>5. The Booking System — Entities</h2>
+<p>Switch domains but keep the same discipline. A ticket-booking system's core entities:</p>
+<ul>
+<li><strong>Movie</strong> — static metadata (title, duration, language, certification).</li>
+<li><strong>Theater</strong> — a physical venue with one or more <strong>Screen</strong>s, each with a fixed seating layout.</li>
+<li><strong>Show</strong> — the actual bookable unit: a <code>Movie</code> + <code>Screen</code> + start time slot. This is the entity that owns seat inventory for that specific showing — the same physical seat A12 is a completely independent bookable resource per <code>Show</code>, not per <code>Theater</code>.</li>
+<li><strong>Seat</strong> — belongs to a <code>Show</code> (or references a <code>Screen</code> seat template plus per-show status), with a <code>SeatStatus</code>: AVAILABLE, HELD, or BOOKED.</li>
+<li><strong>Booking</strong> — a confirmed transaction: user, show, list of seats, payment reference, timestamp.</li>
+</ul>
+<p>The entity that deserves the most design attention isn't any of these nouns — it's the seat's status field, because that's where concurrent users collide.</p>
+
+<h2>6. The Core Concurrency Problem: Double-Booking</h2>
+<p>Picture the obvious, wrong implementation: a user selects seat A12, the backend checks <code>if (seat.status == AVAILABLE)</code>, and if true, proceeds to build a booking and eventually sets <code>seat.status = BOOKED</code> once payment succeeds. This is a classic <strong>check-then-act</strong> race condition.</p>
+<div class="callout warn">
+<div class="callout-title">How the race actually plays out</div>
+<p>Two users, A and B, both request seat A12 for the same show within milliseconds of each other, hitting two different application server instances (or even the same instance on two threads). Both read <code>status == AVAILABLE</code> before either has written anything back — the check and the eventual write are separated by an entire payment flow that can take 30+ seconds. Both proceed to payment. Both payments succeed independently, because nothing has told either payment gateway that the seat is contested. Both bookings get written as CONFIRMED. The theater now has two people holding tickets for one physical seat. The bug isn't in the payment integration or the UI — it's that "check availability" and "commit the booking" are not atomic, and the gap between them is wide enough (an entire external payment round trip) that collisions aren't rare edge cases, they're routine under any real load.</p>
+</div>
+<p>Note that this is structurally identical to the lost-update problem discussed with optimistic/pessimistic locking in <a href="#/concurrency-multithreading">concurrency and multithreading</a> — the difference here is that the "critical section" spans an external, slow, unreliable step (payment), so you cannot simply wrap it in a database transaction or a synchronized block and hold a lock for 30 seconds without destroying throughput for every other seat on that show.</p>
+
+<h3>The fix: a short-lived seat hold with a TTL</h3>
+<p>The standard resolution is to introduce a third state between AVAILABLE and BOOKED: <strong>HELD</strong>. The moment a user clicks "proceed to checkout" — before payment even starts — the system atomically transitions the seat from AVAILABLE to HELD and stamps an expiry (typically 5–10 minutes out). This has two effects: no other user can select that seat while it's held, and if the user abandons checkout or payment fails, the hold expires on its own and the seat reverts to AVAILABLE without anyone having to remember to clean it up.</p>
+<p>This is the same TTL-expiry mechanic used in cache eviction (see <a href="#/lld-rate-limiter-cache">TTL caches and rate limiters</a>), applied to a business resource instead of a cache entry. Two implementation strategies are common:</p>
+<table>
+<tr><th>Approach</th><th>Mechanism</th><th>Trade-offs</th></tr>
+<tr>
+<td>Status + expiry column</td>
+<td><code>UPDATE seats SET status='HELD', held_by=?, expires_at=? WHERE seat_id=? AND status='AVAILABLE'</code> — the <code>WHERE status='AVAILABLE'</code> clause makes the transition atomic and conditional at the database level; if zero rows are affected, someone else won the race. A background sweeper job (or a check on every read) treats any HELD seat whose <code>expires_at</code> has passed as effectively AVAILABLE again.</td>
+<td>No extra infrastructure — reuses the relational store. Requires either a periodic sweep job or defensive "is this hold actually expired" checks on every read path, since the row doesn't disappear automatically the instant the TTL elapses.</td>
+</tr>
+<tr>
+<td>Distributed lock (e.g. Redis key with <code>SET seat:{id} {userId} NX PX 600000</code>)</td>
+<td>The lock's existence <em>is</em> the hold; Redis expires the key automatically at the TTL, no sweeper needed. <code>NX</code> (set-if-not-exists) gives the same atomic conditional-write guarantee as the SQL <code>WHERE</code> clause.</td>
+<td>True automatic expiry with no polling. Introduces a second system that must stay consistent with the database's notion of seat status — on payment success you must both confirm the booking in the database and release/convert the Redis lock, and that pair of writes is itself not atomic unless handled carefully (e.g. confirm-then-delete-lock, tolerating a brief window where both exist).</td>
+</tr>
+</table>
+<div class="callout tip">
+<div class="callout-title">Why the conditional write matters more than the lock itself</div>
+<p>The actual concurrency safety doesn't come from "using Redis" or "using a status column" as such — it comes from making the AVAILABLE→HELD transition a single atomic conditional operation (<code>NX</code>, or a <code>WHERE status = 'AVAILABLE'</code> guard) so that when two requests race, exactly one of them observes success and the other observes failure at the same instant it attempts the write, rather than both observing success at read-time and only discovering the conflict much later. This is the general fix for check-then-act races anywhere in a system: collapse the check and the act into one atomic operation instead of performing them as two separate steps with a gap in between.</p>
+</div>
+
+<h3>Sequence with holds</h3>
+<pre><code>User A: SELECT seat A12 -> attempt HOLD (atomic) -> SUCCESS -> pay -> CONFIRM -> status=BOOKED
+User B: SELECT seat A12 -> attempt HOLD (atomic) -> FAILS (already HELD) -> shown "seat taken"
+
+// If User A abandons checkout:
+[TTL expires] -> status reverts HELD -> AVAILABLE (via sweep or key expiry)
+User B: retries -> attempt HOLD -> SUCCESS -> proceeds normally
+</code></pre>
+
+<h2>7. The State Pattern Applied to Seats</h2>
+<p>Just as with the elevator, the seat's lifecycle is a small closed set of states with strict legal transitions, and modeling it explicitly prevents an entire category of bug where a seat gets booked twice or a hold gets confirmed after it already expired.</p>
+<pre><code>interface SeatState {
+    SeatState hold(SeatContext ctx, String userId);
+    SeatState confirmBooking(SeatContext ctx, String userId);
+    SeatState release(SeatContext ctx);
+}
+
+class AvailableState implements SeatState {
+    public SeatState hold(SeatContext ctx, String userId) {
+        ctx.setHeldBy(userId);
+        ctx.setExpiresAt(now().plusMinutes(10));
+        return new HeldState();
+    }
+    public SeatState confirmBooking(SeatContext ctx, String userId) {
+        throw new IllegalStateException("Cannot book a seat with no active hold");
+    }
+    public SeatState release(SeatContext ctx) { return this; }
+}
+
+class HeldState implements SeatState {
+    public SeatState hold(SeatContext ctx, String userId) {
+        throw new IllegalStateException("Seat already held");
+    }
+    public SeatState confirmBooking(SeatContext ctx, String userId) {
+        if (ctx.isExpired()) {
+            return new AvailableState().hold(ctx, userId); // hold lapsed; caller must retry
+        }
+        if (!ctx.getHeldBy().equals(userId)) {
+            throw new IllegalStateException("Held by a different user");
+        }
+        return new BookedState();
+    }
+    public SeatState release(SeatContext ctx) { return new AvailableState(); }
+}
+
+class BookedState implements SeatState {
+    public SeatState hold(SeatContext ctx, String userId) {
+        throw new IllegalStateException("Seat already booked");
+    }
+    public SeatState confirmBooking(SeatContext ctx, String userId) { return this; }
+    public SeatState release(SeatContext ctx) {
+        throw new IllegalStateException("Cannot release a confirmed booking directly");
+    }
+}
+</code></pre>
+<p>Notice that <code>confirmBooking</code> re-checks expiry and ownership <em>inside</em> the state transition itself, rather than trusting that the caller already validated those things — because the caller's validation and this call are separated by the payment gateway round trip, during which the hold could have expired. The state object is the last line of defense, and it's exactly one atomic check away from the underlying storage-level conditional write described in Section 6 — the in-memory state machine and the database-level atomic transition are two layers enforcing the same invariant, which is the correct amount of redundancy for a bug class this costly (a double-booked seat usually means a refund, an angry customer, and a support escalation, not just a retried request).</p>
+
+<h2>8. Where These Two Designs Rhyme</h2>
+<table>
+<tr><th>Concern</th><th>Elevator System</th><th>Booking System</th></tr>
+<tr><td>Resource being contended</td><td>An elevator car's capacity/time</td><td>A specific seat for a specific show</td></tr>
+<tr><td>State machine</td><td>Idle / Moving / DoorOpen</td><td>Available / Held / Booked</td></tr>
+<tr><td>Assignment decision</td><td>Which elevator answers a hall call (Strategy)</td><td>N/A — seat is user-selected, but which lock/hold wins is analogous</td></tr>
+<tr><td>Ordering/scheduling</td><td>SCAN/LOOK within one elevator's stop list</td><td>N/A — no ordering, just atomic exclusive acquisition</td></tr>
+<tr><td>Failure-recovery mechanism</td><td>Reassign a hall call if the assigned elevator breaks down</td><td>TTL expiry reverts an abandoned hold automatically</td></tr>
+<tr><td>What makes illegal transitions impossible</td><td>State classes exposing only legal transitions</td><td>State classes plus an atomic conditional write at the storage layer</td></tr>
+</table>
+<p>Both systems illustrate the same broader lesson applicable to almost any <a href="#/lld-parking-lot">resource-allocation system</a> (parking spot assignment has the identical "many seekers, one exclusive resource, need atomic acquisition" shape): identify the finite state machine of the contended resource first, make transitions explicit objects rather than flags, and only then layer scheduling or assignment policy on top as a separate, swappable concern.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+<details class="concept-qa">
+<summary>Why does LOOK reverse direction only when the pending-stop set in the current direction is empty, rather than reversing whenever a closer request appears behind the elevator?</summary>
+<div class="qa-body">Because reversing mid-sweep to chase a "closer" request behind the elevator would reintroduce the exact pathology SCAN/LOOK exists to avoid: unbounded direction changes driven by arrival order rather than geography. If the elevator reverses every time a nearer-but-behind request shows up, a steady trickle of such requests could keep it oscillating near one region of the shaft indefinitely, starving requests further along its original sweep. Committing to finish the current directional sweep before reversing guarantees every request gets served within one full up-down cycle, which is the actual fairness and worst-case-wait guarantee the algorithm provides. The trade-off is that a request appearing just behind the elevator has to wait for the return trip — but that wait is bounded, whereas the alternative's worst case is not.</div>
+</details>
+<details class="concept-qa">
+<summary>In the elevator selection strategy, why exclude an elevator moving toward the requested floor but in the opposite direction of what the caller wants?</summary>
+<div class="qa-body">Because that elevator's cabin is already committed to a directional sweep and won't stop to reverse just for one hall call — physically, and by the LOOK algorithm's own rules, it will pass that floor without opening its doors for a call going the other way (someone on floor 5 wanting to go up won't be picked up by a car passing floor 5 while descending). Assigning the call to that elevator anyway would mean the call sits unserved until the elevator finishes its current sweep, reverses, and comes back — which is often worse than assigning it to a genuinely idle elevator or one already heading the correct direction, even if that one is technically farther away in raw floor distance. This is exactly why the cost function in a dispatch strategy needs to reason about direction and commitment, not just Euclidean floor distance.</div>
+</details>
+<details class="concept-qa">
+<summary>Why is "check if seat is available, then book it" unsafe even inside a single database transaction with default isolation?</summary>
+<div class="qa-body">Because the dangerous gap in a booking flow isn't a few milliseconds of database processing — it's the entire external payment round trip, which can take tens of seconds and cannot be held open inside a single database transaction without holding locks that long and destroying concurrency for every other request touching that show's seats. Even under a strict isolation level, a transaction that reads "available," returns control to the application, waits on a payment gateway, and only then writes "booked" leaves the read and the write as two separate transactions from the database's point of view (or one absurdly long-lived one), during which another transaction can freely read the same "available" state and proceed identically. Correctness requires making the state transition itself — not the surrounding business logic — atomic and conditional, exactly as the AVAILABLE-to-HELD hold does at the moment checkout begins, well before payment is even attempted.</div>
+</details>
+<details class="concept-qa">
+<summary>What actually goes wrong if a seat hold expires while payment is mid-flight, and how does the design handle it without corrupting data?</summary>
+<div class="qa-body">If the TTL fires while the user is still in the payment gateway, the seat reverts to AVAILABLE and another user can legitimately acquire a fresh hold on it — the system deliberately favors availability of inventory over indefinitely trusting a possibly-abandoned session. The subtlety is in what happens when the first user's payment then succeeds a moment later: the confirmation step must re-check, atomically, whether the hold is still valid and still owned by that user before marking the seat BOOKED. If it isn't (because it expired and was reassigned), the confirmation must fail gracefully — refund or void the charge — rather than blindly setting status to BOOKED and silently overwriting whatever the second user is now doing with that seat. This is why the state object's confirmBooking method re-validates expiry and ownership internally rather than trusting a stale check performed before payment started.</div>
+</details>
+<details class="concept-qa">
+<summary>Why model HallCall and CabinRequest as distinct types instead of one generic Request with an optional direction field?</summary>
+<div class="qa-body">Because they participate in different decisions and merging them either loses information or forces awkward null-checking. A hall call needs a direction because the controller must decide which elevator to dispatch, and direction is the caller's stated intent before any elevator is involved. A cabin request has no such ambiguity — it was pressed inside a specific car, so there's no assignment decision to make, only an insertion into that car's stop list, and its "direction" is entirely derived from comparing the destination to the car's current floor. Treating them as one type with a nullable direction field means every piece of code that consumes a Request has to first figure out which kind it's looking at before it can act correctly, which is exactly the kind of implicit, easy-to-forget branching that a clean type split avoids.</div>
+</details>
+<details class="concept-qa">
+<summary>Why put the seat's status transition logic inside State pattern objects instead of just adding an expiry check to a single method that also updates the database?</summary>
+<div class="qa-body">A single procedural method can enforce one invariant correctly today but tends to accumulate special cases as new transitions are added — cancellations, admin overrides, partial refunds — each requiring another nested conditional that checks the current status before proceeding. Splitting the states into their own classes means each transition method only needs to reason about the rules for leaving one specific state, which is a much smaller and more reviewable unit, and adding a new global rule (like re-validating expiry) is done once per relevant state rather than threaded through one large method's branching logic. It also means the compiler and the type system, not a comment or a code review, are what prevent a call site from invoking a transition that state doesn't support.</div>
+</details>
+<details class="concept-qa">
+<summary>Does using a distributed lock like Redis for seat holds eliminate the need for a status column in the database, or do you need both?</summary>
+<div class="qa-body">In practice you need both, because they answer different questions with different reliability guarantees. The Redis key with a TTL is the fast, self-expiring mechanism that adjudicates concurrent hold attempts and automatically reclaims abandoned holds without a background job. But the database row is the durable source of truth for what actually got booked — Redis is not typically the system of record for financial/booking data, and if the cache is flushed, evicted under memory pressure, or the process restarts before persistence, you don't want the authoritative record of a paid booking to have vanished with it. The pattern is: use the lock to serialize the hold attempt, and once payment succeeds, write the confirmed booking to durable storage as the definitive record, treating the lock's job as done at that point.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/solid-design-patterns'"><div class="rc-title">SOLID &amp; Design Patterns</div><div class="rc-sub">Phase 3 · the Strategy and State patterns used throughout both designs here</div></div>
+<div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Concurrency &amp; Multithreading</div><div class="rc-sub">Phase 3 · check-then-act races, atomic conditional writes, and lock semantics</div></div>
+<div class="related-card" onclick="window.location.hash='/lld-rate-limiter-cache'"><div class="rc-title">LLD: Rate Limiter &amp; Cache</div><div class="rc-sub">Phase 3 · the TTL-expiry mechanic reused for seat holds</div></div>
+<div class="related-card" onclick="window.location.hash='/lld-parking-lot'"><div class="rc-title">LLD: Parking Lot</div><div class="rc-sub">Phase 3 · another exclusive-resource-allocation design with the same shape</div></div>
+</div>

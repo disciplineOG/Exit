@@ -1,0 +1,228 @@
+<p class="topic-breadcrumb">Phase 1 — Foundation & Low-Level Mastery · Days 01–05 · HLD</p>
+<h1>HLD Basics: Scaling & Load Balancers</h1>
+<div class="topic-tags">
+<span class="tag">Horizontal vs Vertical Scaling</span>
+<span class="tag">L4 vs L7 LB</span>
+<span class="tag">Load Balancing Algorithms</span>
+<span class="tag">Consistent Hashing</span>
+<span class="tag">Health Checks</span>
+<span class="tag">DNS Load Balancing</span>
+<span class="tag">Sticky Sessions</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Almost every "why is this service slow under load" or "why did adding more servers not help" investigation traces back to a wrong mental model of how scaling and load balancing actually work. If you don't understand why horizontal scaling demands statelessness, you'll ship a feature that stores session state in memory and then watch it randomly log users out the moment a second instance joins the fleet. If you don't understand consistent hashing, you won't understand why your cache hit rate collapsed the moment you resized a cluster. This page builds the reasoning from the ground up so those failures become predictable instead of mysterious.</p>
+</div>
+
+<h2>1. Vertical vs Horizontal Scaling</h2>
+<p>Scaling means increasing a system's capacity to handle load — more requests per second, more data, more concurrent connections. There are exactly two axes along which you can do this, and they have fundamentally different failure modes and cost curves.</p>
+
+<h3>Vertical scaling (scale up)</h3>
+<p>Vertical scaling means giving a single machine more resources: more CPU cores, more RAM, faster disks (NVMe over spinning disk), a faster network interface. Nothing about the application's architecture changes — you still have one process, one memory space, one filesystem. This is why it's the first thing teams reach for: no code changes, no coordination logic, no new failure modes to reason about.</p>
+<p>The problem is that it doesn't compose. Hardware has a ceiling — at some point you simply cannot buy a bigger machine, and even before that ceiling, cost stops scaling linearly. A machine with 2x the cores of a mid-range server frequently costs far more than 2x the price, because you're paying for exotic silicon binning, more DIMM channels, and higher-tier support contracts. And critically, vertical scaling gives you exactly one machine as your single point of failure — if it dies, panics, or needs a kernel patch and reboot, the entire service is down. There's no redundancy to fall back on.</p>
+
+<h3>Horizontal scaling (scale out)</h3>
+<p>Horizontal scaling means adding more machines and spreading load across all of them. This is the only strategy with no hard ceiling — you can keep adding commodity machines more or less indefinitely (subject to data-partitioning limits, which is a separate concern covered under sharding below). It also buys you fault tolerance for free: if one of ten instances crashes, you lose 10% of capacity, not 100% of it.</p>
+<p>But horizontal scaling isn't free — it has a structural precondition that people frequently get wrong: <strong>any request must be able to be served by any instance</strong>. The moment that's true, a load balancer can freely route to whichever instance is healthiest or least loaded. The moment it's false — because instance B has some state in memory that instance A doesn't — you've built a system where correctness depends on routing, and routing is exactly the thing you wanted freedom to change.</p>
+
+<div class="callout warn">
+<div class="callout-title">Why "just add statelessness" is not a slogan, it's a constraint</div>
+<p>If your application keeps anything in local process memory that a later request depends on — an HTTP session object, an in-memory cache of "which users are currently uploading," a mutex protecting a local counter — then horizontal scaling silently breaks correctness rather than failing loudly. A user logs in on instance A, their session cookie references session state that lives only in instance A's heap, and their very next request gets routed to instance B, which has never heard of them. They appear logged out. This class of bug is maddening because it works perfectly in local development (one instance) and in low-traffic staging (round robin gets lucky), and only manifests once you actually run 2+ replicas under real traffic.</p>
+<p>The fix is always the same shape: externalize the state. Move sessions to Redis or a database (or eliminate them via JWTs, discussed below), move counters and rate-limit windows to Redis with atomic INCR, move any "which node is doing X" coordination to a shared store or a proper distributed lock (see <a href="#/distributed-systems-core">distributed-systems-core</a>). Once state lives outside the process, every instance becomes interchangeable, and interchangeability is the actual thing that makes horizontal scaling work.</p>
+</div>
+
+<table>
+<tr><th>Dimension</th><th>Vertical scaling</th><th>Horizontal scaling</th></tr>
+<tr><td>What changes</td><td>Resources on one machine</td><td>Number of machines</td></tr>
+<tr><td>Ceiling</td><td>Hard hardware limit</td><td>Effectively unbounded (until data layer limits)</td></tr>
+<tr><td>Cost curve</td><td>Superlinear near the top end</td><td>Roughly linear (commodity hardware)</td></tr>
+<tr><td>Fault tolerance</td><td>None — single point of failure</td><td>Built in — lose one node, keep serving</td></tr>
+<tr><td>Architectural precondition</td><td>None</td><td>Statelessness or externalized state</td></tr>
+<tr><td>Operational complexity</td><td>Low</td><td>Higher — needs a load balancer, service discovery, coordination</td></tr>
+</table>
+
+<p>In practice, real systems do both: you pick a "reasonably sized" instance type (not the cheapest, not the biggest — usually driven by what fits your process's memory footprint and GC behavior, see <a href="#/jvm-architecture">jvm-architecture</a>) and then scale that unit horizontally. Vertical scaling buys you headroom per node; horizontal scaling buys you the ability to grow without bound and to survive node failure.</p>
+
+<h2>2. What a Load Balancer Actually Does</h2>
+<p>Once you have more than one instance capable of serving a request, something has to decide, for each incoming request, which instance handles it. That's the entire job of a load balancer (LB): a component sitting in front of a pool of backend instances that (a) distributes traffic across them according to some algorithm, and (b) stops sending traffic to instances that are unhealthy.</p>
+<p>The critical distinction that determines what an LB can and can't do is <strong>which layer of the network stack it operates at</strong>.</p>
+
+<h3>L4 load balancing (transport layer)</h3>
+<p>An L4 load balancer operates at the TCP/UDP level. It looks at the IP address and port in a packet's header and forwards the packet to a backend — it does not open, parse, or understand the payload. It doesn't know if the payload is HTTP, gRPC, raw TCP, or anything else. This makes it extremely fast (often line-rate, implemented in the kernel or in hardware/ASICs on managed offerings) because there's no need to terminate the connection, parse text, or buffer bytes — it's largely just rewriting packet headers and forwarding.</p>
+<p>Because it can't see inside the payload, an L4 balancer typically makes one routing decision per TCP connection (or per flow, identified by the 5-tuple: source IP, source port, destination IP, destination port, protocol) and then keeps forwarding all packets on that connection to the same backend. A cloud Network Load Balancer (AWS NLB) is a canonical example.</p>
+
+<h3>L7 load balancing (application layer)</h3>
+<p>An L7 load balancer terminates the connection itself, actually parses the HTTP (or gRPC, WebSocket, etc.) request, and can therefore make routing decisions based on things like the URL path (<code>/api/checkout</code> vs <code>/api/search</code> going to different backend pools), the <code>Host</code> header (for multi-tenant routing), cookies, or custom headers. Because it understands HTTP, it can also do things an L4 balancer structurally cannot: retry a failed request against a different backend, rewrite headers, terminate TLS and re-encrypt (or not) to the backend, do content-based routing, and multiplex many logical HTTP requests from different clients over a smaller number of backend connections (connection pooling/keep-alive reuse). nginx, HAProxy (in HTTP mode), Envoy, and AWS's Application Load Balancer (ALB) are L7.</p>
+<p>The cost of that intelligence is CPU: parsing HTTP headers, running regex-based routing rules, and holding two separate TCP connections (client-to-LB and LB-to-backend) per request is materially more expensive per request than L4's header-rewrite-and-forward.</p>
+
+<table>
+<tr><th></th><th>L4 (Transport)</th><th>L7 (Application)</th></tr>
+<tr><td>Sees</td><td>IP + port, raw bytes</td><td>Full HTTP request: path, headers, cookies, body</td></tr>
+<tr><td>Can route on</td><td>Source/dest IP and port only</td><td>Path, header, cookie, method, content</td></tr>
+<tr><td>Connection model</td><td>Passes through / NATs the connection</td><td>Terminates client connection, opens a new one to backend</td></tr>
+<tr><td>Throughput</td><td>Very high, low CPU cost</td><td>Lower per-core throughput, higher CPU cost</td></tr>
+<tr><td>Can retry failed requests transparently</td><td>No — it doesn't know what a "request" is</td><td>Yes — it can resend the parsed request elsewhere</td></tr>
+<tr><td>Typical examples</td><td>AWS NLB, IPVS, raw TCP load balancers</td><td>nginx, HAProxy (HTTP mode), Envoy, AWS ALB</td></tr>
+</table>
+
+<div class="callout">
+<div class="callout-title">Why both layers still exist in the same stack</div>
+<p>Large systems commonly stack them: an L4 balancer (or anycast + ECMP routing) absorbs massive volumes of raw traffic and DDoS-style floods cheaply at the edge, then hands healthy, load-spread TCP connections to a layer of L7 balancers that do the smart, content-aware routing to specific services. Using only L7 everywhere is wasteful of CPU at the edge; using only L4 everywhere means you lose the ability to do path-based routing, retries, and TLS termination where you need it.</p>
+</div>
+
+<h2>3. Load Balancing Algorithms</h2>
+<p>Given a healthy pool of backends, how does the LB pick one for a given request? The algorithm matters because a bad choice under real traffic patterns (uneven request cost, uneven backend capacity, or a need for cache locality) directly causes hot-spotting — a handful of instances pegged at 100% CPU while the rest sit idle.</p>
+
+<h3>Round robin</h3>
+<p>Cycle through backends in fixed order: 1, 2, 3, 1, 2, 3, .... Simple, requires no state beyond a counter, and works well when requests are roughly uniform in cost and all backends have equal capacity. It falls apart when either assumption breaks — if backend 2 is handling a slow request while 1 and 3 are idle, round robin will still send the next request to 2 in its turn, regardless of its current load.</p>
+
+<h3>Weighted round robin</h3>
+<p>Same idea, but each backend gets a weight proportional to its capacity, so a bigger instance receives proportionally more requests (e.g., weights 3:1:1 sends 3 requests to backend A for every 1 to B and 1 to C). This fixes the "unequal hardware" problem but not the "unequal request cost" problem — the weights are static and don't react to what's actually happening on each node right now.</p>
+
+<h3>Least connections</h3>
+<p>Route to whichever backend currently has the fewest active (in-flight) connections. This is a real-time, reactive strategy: it naturally avoids sending more work to a backend that's already bogged down handling long-running requests, without needing to know anything about request cost in advance. It requires the LB to track connection state per backend, which is a small amount of overhead but a much better signal than a blind round-robin counter.</p>
+
+<h3>Least response time</h3>
+<p>An extension of least connections: pick the backend with the best combination of low active-connection count and low recent average response time. This reacts to backends that are technically accepting new connections but are slow to actually finish them (e.g., a node in GC pressure, or one whose downstream database connection pool is exhausted). It's more expensive to compute (the LB has to continuously measure and average latencies) but catches degradation that a pure connection-count metric misses.</p>
+
+<h3>Consistent hashing</h3>
+<p>All of the algorithms above answer "which backend should handle this request" without caring which backend handled a similar or identical request before. But there's an important class of systems where that history matters: caches, sharded databases, and sticky-session-like scenarios, where you want the same key (user ID, cache key, session ID) to consistently land on the same backend so that backend can build up warm, useful local state (a cache, an open connection, a session). Consistent hashing is the general technique for that.</p>
+
+<div class="callout warn">
+<div class="callout-title">Why naive modulo hashing fails</div>
+<p>The obvious first approach is <code>backend = hash(key) % N</code> where N is the number of backends. This works fine as long as N never changes. The instant you add or remove a single backend, N changes, and because it's a modulus, <strong>almost every key's target backend changes</strong> — not just the keys that "belong" to the added/removed node. If you have a 10-node cache cluster and add an 11th node, roughly 90% of keys now hash to a different node than before, meaning a near-total cache wipe and a stampede of requests to the origin/database while the cache refills. This is precisely the kind of failure that looks like "we added capacity and the database fell over" — the capacity addition itself is what caused the spike.</p>
+</div>
+
+<h3>The consistent hashing algorithm, in general</h3>
+<ol>
+<li>Take a hash function with a large, fixed output range (e.g., a 32-bit or 64-bit hash), and treat that output range as a circle ("the ring") — the maximum value wraps back around to zero.</li>
+<li>Hash each backend node's identifier (e.g., its IP:port) to get a position on the ring, and place the node there.</li>
+<li>To find the backend for a given key, hash the key to get its position on the ring, then walk clockwise from that position until you hit the first node. That node owns the key.</li>
+<li>When a node is added, it takes a position on the ring and becomes responsible only for the slice of keys between its position and the previous node's position (walking counter-clockwise) — every other key's ownership is untouched.</li>
+<li>When a node is removed, its keys simply fall through to the next node clockwise on the ring — again, no other node's ownership changes.</li>
+</ol>
+<p>This is the core property that fixes the modulo problem: adding or removing one node remaps only the keys that were adjacent to that node on the ring — on average <code>K/N</code> keys out of K total keys across N nodes — instead of remapping nearly everything.</p>
+
+<h3>Virtual nodes: fixing uneven distribution</h3>
+<p>Placing exactly one point per physical node on the ring has a practical problem: with only a handful of nodes, their hashed positions can land unevenly by chance, giving some nodes a much larger arc of the ring (and therefore much more traffic) than others. The fix is to give each physical node many positions on the ring — typically on the order of 100 to a few hundred "virtual nodes," each a differently-salted hash of the same physical node's identifier (e.g., <code>hash("node-A#0")</code>, <code>hash("node-A#1")</code>, ... <code>hash("node-A#149")</code>). With enough virtual nodes spread across the ring, the law of large numbers takes over and each physical node ends up owning a roughly equal total arc length, hence a roughly equal share of keys — while preserving the minimal-remapping property when nodes come and go.</p>
+
+<h3>Worked example: a 3-node cache ring growing to 4 nodes</h3>
+<p>Say we run a cache cluster with nodes A, B, C, and we use a hash space of 0–359 (thinking of it as degrees on a circle, for readability) with 3 virtual nodes per physical node. Suppose the virtual node hash positions land like this:</p>
+<pre><code>A0=10  A1=140 A2=260
+B0=50  B1=190 B2=300
+C0=90  C1=230 C2=340</code></pre>
+<p>Sorted around the ring: 10(A) 50(B) 90(C) 140(A) 190(B) 230(C) 260(A) 300(B) 340(C) — and it wraps back to 10(A).</p>
+<p>A request key that hashes to position 100 walks clockwise and lands on 140(A) — so key 100 belongs to node A, even though the nearest smaller position (90) belonged to C; ownership is always determined by the next node clockwise, not proximity in either direction. A key at position 350 walks clockwise, wraps past 359 back to 0, and lands on 10(A) — this wrap-around is exactly why it's modeled as a ring rather than a line.</p>
+<p>Now add node D, and say its 3 virtual nodes hash to 30, 170, 320. The ring becomes: 10(A) 30(D) 50(B) 90(C) 140(A) 170(D) 190(B) 230(C) 260(A) 300(B) 320(D) 340(C).</p>
+<p>Only the keys that fall between a newly inserted D-position and the node immediately counter-clockwise of it move — specifically: keys in (10,30] move from A to D; keys in (140,170] move from A to D; keys in (300,320] move from B to D. Every key outside those three narrow arcs — the vast majority of the keyspace — keeps exactly the same owner it had before D joined. That's the guarantee: adding the fourth node only reshuffled the slices adjacent to its own virtual node positions, roughly a quarter of the total keyspace (matching <code>1/N</code> for the new N=4), not a near-total remap the way <code>% N</code> would have caused.</p>
+<p>If instead node C were removed, its 3 arcs (90, 230, 340) would simply fall through to whichever node is next clockwise (140→A, 260→A, 10→A in the original 3-node ring) — again, only C's own keys move, everyone else's assignment is untouched.</p>
+
+<div class="callout tip">
+<div class="callout-title">Where this shows up beyond load balancers</div>
+<p>Consistent hashing isn't just an LB algorithm — it's the backbone of how distributed caches (Memcached client-side sharding), distributed databases (Cassandra, DynamoDB's partitioning), and CDNs assign keys/requests to nodes at scale. Anywhere you see "adding a node only moves a small fraction of the data," consistent hashing (or a close relative, like Cassandra's token ranges) is almost certainly the mechanism underneath. See <a href="#/database-architecture">database-architecture</a> for how this same idea drives horizontal partitioning of a data store, and <a href="#/caching-strategies">caching-strategies</a> for how it keeps a distributed cache's hit rate stable as the cluster resizes.</p>
+</div>
+
+<h2>4. Health Checks: Routing Around Failure</h2>
+<p>A load balancer's algorithm only matters for backends that are actually able to serve traffic. Every production LB continuously health-checks its backend pool and removes unhealthy ones from rotation — otherwise a crashed or hung instance keeps receiving its share of traffic and every one of those requests fails or times out.</p>
+<p>There are two common styles:</p>
+<ul>
+<li><strong>Active health checks</strong>: the LB itself periodically sends a synthetic request — commonly an HTTP GET to a dedicated endpoint like <code>/healthz</code> or <code>/actuator/health</code> — and expects a 200 within some timeout. Miss N consecutive checks (an "unhealthy threshold") and the backend is pulled from rotation; pass M consecutive checks after that (a "healthy threshold") before it's added back. The two different thresholds exist deliberately: you want to pull a bad node out fast, but you don't want to flap a recovering node back in the moment it shows one good response, only to pull it again on the next blip.</li>
+<li><strong>Passive health checks</strong>: rather than sending separate probe traffic, the LB observes real request outcomes — a backend that returns a run of 5xx errors or times out repeatedly on live traffic gets marked unhealthy without a dedicated probe endpoint. This reacts faster (no waiting for the next probe interval) but requires enough live traffic to generate a signal.</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">A shallow health check lies to the load balancer</div>
+<p>A health check endpoint that just returns <code>200 OK</code> unconditionally tells you the process is alive, not that it can actually do useful work. A well-designed check verifies the dependencies that request-handling actually needs — can it reach its database connection pool, is its downstream dependency reachable, is it still accepting new work rather than draining. Get this wrong in the other direction, though — a health check that transitively checks a shared downstream dependency (like a shared database) — and one degraded dependency will cause every instance across the entire fleet to report unhealthy simultaneously, taking down the whole service instead of just the fraction actually affected. The right check verifies "can I do my job," not "is everything upstream of me perfect."</p>
+</div>
+<p>Health checks are also what makes rolling deploys safe: a new instance is only added to rotation once it starts passing health checks, and an instance being terminated is first marked unhealthy (or explicitly deregistered) so the LB stops sending it new requests while it finishes in-flight ones — this "connection draining" window is what prevents deploys from causing a burst of dropped requests.</p>
+
+<h2>5. DNS-Based Load Balancing vs Dedicated LB Layers</h2>
+<p>Before a request ever reaches a dedicated load balancer, there's usually a coarser, cheaper layer of load distribution happening at DNS resolution. It's worth understanding both because they solve different problems and are often combined.</p>
+
+<h3>DNS-based load balancing</h3>
+<p>A DNS server can return multiple IP addresses for the same hostname, or return different answers to different clients (round robin DNS, or geo-based DNS routing that returns the IP of the nearest regional data center). This is extremely cheap and happens before any packet even reaches your infrastructure, which makes it excellent for coarse-grained decisions — like routing a European user to a European region and a US user to a US region.</p>
+<p>Its major limitation is that DNS answers are cached — by the client's OS, by intermediate resolvers, by ISPs — for however long the record's TTL says, and that caching is entirely outside your control. If a backend IP goes down, clients who cached that answer keep trying to connect to a dead IP until their TTL expires, regardless of how low you set the TTL, because plenty of resolvers ignore or clamp very low TTLs. DNS has no concept of "current load" or "current health" beyond whatever a DNS-integrated health-checking service (like Route 53 health checks) can enforce by pulling unhealthy IPs from the answer set — and even then, propagation is slow compared to a real LB's sub-second failover.</p>
+
+<h3>Dedicated load balancer layers</h3>
+<p>This is where nginx, HAProxy, Envoy, or a cloud provider's ALB/NLB come in — a long-lived piece of infrastructure that every request actually flows through, which means it can react in real time: sub-second health check failover, per-request algorithmic routing (least connections, consistent hashing), TLS termination, and observability (it sees every request, so it's a natural place to emit metrics and logs).</p>
+<p>The practical pattern almost every real system uses is both, layered: DNS routes a client to the nearest region or cluster (coarse, cheap, cacheable), and once traffic lands in that region, a dedicated L4/L7 balancer handles the fine-grained, real-time distribution and failover across the actual instance pool.</p>
+
+<table>
+<tr><th></th><th>DNS-based</th><th>Dedicated LB</th></tr>
+<tr><td>Granularity</td><td>Coarse (region/cluster selection)</td><td>Fine (per-request, per-instance)</td></tr>
+<tr><td>Failover speed</td><td>Slow — bounded by TTL and caching behavior outside your control</td><td>Fast — sub-second, LB owns the decision every request</td></tr>
+<tr><td>Cost/overhead</td><td>Very low — resolved once per TTL window</td><td>Higher — every request passes through it</td></tr>
+<tr><td>Typical use</td><td>Geo-routing, multi-region failover</td><td>Distributing load within a region/cluster</td></tr>
+</table>
+
+<h2>6. Sticky Sessions and Their Tension with Horizontal Scaling</h2>
+<p>A "sticky session" (session affinity) means the load balancer intentionally routes all requests from a given client to the same backend instance — usually implemented via a cookie the LB sets (e.g., an ALB's <code>AWSALB</code> cookie) or, at L4, by hashing the client's source IP to a backend.</p>
+<p>Teams reach for stickiness when a backend holds some in-memory state a request needs — most commonly HTTP session data, or a WebSocket connection which is inherently long-lived and pinned to whichever instance accepted it. And it does work for that narrow purpose. But it directly undermines several things horizontal scaling is supposed to give you:</p>
+<ul>
+<li><strong>Uneven load</strong>: if a disproportionate number of "sticky" clients happen to land on one instance (e.g., a client that generates unusually heavy traffic, or simple bad luck in the hash), that instance gets overloaded while others idle — and the LB can't rebalance without breaking affinity.</li>
+<li><strong>Fragile scale-down and deploys</strong>: removing an instance that many clients are stuck to forces all of those clients to lose their in-memory state at once, right when you most wanted a clean, low-impact rolling operation.</li>
+<li><strong>It reintroduces the exact coupling statelessness was meant to remove</strong>: correctness now depends on routing, so a load balancer configuration change or a failover event can surface as an application bug (users losing their cart, their session, their in-progress upload).</li>
+</ul>
+<div class="callout tip">
+<div class="callout-title">The usual resolution</div>
+<p>Rather than pinning a client to a specific instance to preserve state, externalize the state so any instance can serve any request: move session data to Redis or a database, or eliminate server-side session storage altogether with a signed, stateless token (a JWT) that the client carries and any instance can validate without a lookup. Stickiness then becomes an optimization reserved for genuinely connection-bound protocols (WebSockets, gRPC streams) rather than a crutch for session state that shouldn't have been in-process memory to begin with.</p>
+</div>
+
+<h2>7. The Incremental Scaling Path</h2>
+<p>Real systems don't jump straight to a globally sharded, multi-region architecture. They grow through a fairly consistent sequence of stages, each one solving the specific bottleneck the previous stage exposed. Understanding this progression matters because it tells you what problem you're actually solving at each point, rather than reaching for sharding when you really just need a cache, or a cache when you really just need a second app server.</p>
+<ol>
+<li><strong>Single server</strong>: one machine runs the application and the database. Simple, but every dimension — CPU, memory, disk I/O, and single-point-of-failure risk — is shared and contended, and there's no redundancy at all.</li>
+<li><strong>Load balancer + multiple app servers</strong>: the application tier is pulled onto its own machines, replicated, and put behind an LB (per sections 2–4 above). This solves application-tier CPU/throughput limits and removes the app tier as a single point of failure. It requires the statelessness precondition from section 1. The database is usually still a single instance at this stage — so this stage alone doesn't fix database bottlenecks.</li>
+<li><strong>Read replicas</strong>: the database is replicated to one or more read-only followers; the application sends writes to the primary and reads to the replicas. This solves read throughput (most systems are read-heavy) without touching the write path. It introduces replication lag — a replica can be milliseconds to seconds behind the primary — which means a client that writes and then immediately reads from a replica can see stale data, a correctness trade-off you now have to design around explicitly. See <a href="#/database-architecture">database-architecture</a> for how replication actually works underneath this.</li>
+<li><strong>Caching</strong>: a cache (in-process, or a shared layer like Redis/Memcached) sits in front of the database to absorb repeated reads of the same data, cutting both load on the database and response latency. This solves the case where the bottleneck isn't "not enough replicas" but "we keep recomputing/refetching the same thing." It introduces its own hard problem — cache invalidation and staleness — covered in <a href="#/caching-strategies">caching-strategies</a>.</li>
+<li><strong>Sharding (horizontal partitioning)</strong>: once a single database's write throughput or total data volume exceeds what one primary (even a big vertically-scaled one) can hold, the data itself is split across multiple database instances by some partition key (user ID range, hash of a key, geography), and each shard handles only its slice of the data. This is the stage that actually breaks the "single database" ceiling that replication and caching couldn't touch, at the cost of losing easy cross-shard transactions and joins.</li>
+</ol>
+<div class="callout">
+<div class="callout-title">Why the order matters</div>
+<p>Each stage targets a specific bottleneck: stage 2 fixes application compute, stage 3 fixes read throughput, stage 4 fixes redundant work against the database, and stage 5 fixes total data/write-volume ceiling. Sharding a database to fix what was actually an application-tier CPU problem, or adding read replicas to fix what was actually a hot single-key contention problem that only caching would solve, buys enormous operational complexity for no improvement in the metric that was actually the bottleneck. Identifying which resource is actually saturated — app CPU, DB reads, DB writes, or total data size — should always come before picking the next stage.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does horizontal scaling require statelessness, specifically — what breaks, mechanically, if it isn't stateless?</summary>
+<div class="qa-body">A load balancer's ability to freely choose any backend for any request is what gives horizontal scaling its benefits (even distribution, seamless failover, painless scale up/down). If a backend holds request-relevant state only in its own process memory, then which backend handled a client's previous request becomes load-bearing information that the LB doesn't have. The load balancer will happily route the client's next request to a different, equally healthy instance, because from its perspective all instances are interchangeable — that's the whole point of horizontal scaling. The result is that state the client's next request needed (their session, an in-progress computation, a lock) simply isn't there. The fix isn't to make the LB smarter about routing (that's sticky sessions, which just reintroduces the coupling); it's to move the state somewhere every instance can reach — a shared cache or database, or a token the client carries itself.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Concretely, why does adding one node to a modulo-hashed (hash % N) cluster remap almost every key, while consistent hashing remaps only a small fraction?</summary>
+<div class="qa-body">With hash % N, a key's owner is a function of N itself, not just the key. Changing N from, say, 10 to 11 changes the divisor for every single key's modulo operation, and there's no reason a key's remainder mod 10 would have any relationship to its remainder mod 11 — so ownership essentially randomizes across the whole keyspace. Consistent hashing avoids this because a key's owner is defined purely geometrically — "the first node clockwise of this key's position on the ring" — and adding a node only inserts one new point on the ring. That insertion only changes the answer for keys that fall in the arc between the new point and the previous node counter-clockwise of it; every key elsewhere on the ring still finds the same node first when walking clockwise, because nothing about their local neighborhood on the ring changed. The number of nodes N never appears as a divisor anywhere in the lookup, which is exactly what decouples "how many nodes exist" from "which keys move when that number changes."</div>
+</details>
+
+<details class="concept-qa">
+<summary>What specifically can an L7 load balancer do that an L4 load balancer structurally cannot, and why?</summary>
+<div class="qa-body">An L4 balancer only ever sees IP addresses, ports, and raw bytes — it doesn't parse the payload as HTTP or any application protocol, so it has no concept of a "request" as a distinct unit; it just forwards packets for a given connection/flow to the same backend. Because of that, it cannot route based on URL path, headers, or cookies (there's no parsed structure to inspect), and it cannot transparently retry a failed request against a different backend, because retrying requires understanding where one logical request ends and the next begins, which only a protocol-aware (L7) component can determine. An L7 balancer terminates the client's TCP connection itself, actually parses the HTTP request, and opens its own separate connection to a chosen backend — that termination is exactly what lets it inspect, route on, modify, or resend the request independently of the client's original connection.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why do health checks typically use separate "unhealthy threshold" and "healthy threshold" counts instead of reacting to a single failed or passed check?</summary>
+<div class="qa-body">A single check is a noisy signal — a backend might miss one probe due to a transient GC pause, a momentary network blip, or a slow but otherwise fine response, none of which mean the instance is actually broken. Requiring several consecutive failures before marking a node unhealthy filters out that noise so the LB doesn't yank a perfectly good instance out of rotation over one bad sample. Symmetrically, requiring several consecutive successes before adding a recovering instance back in prevents "flapping" — a node that's borderline (e.g., still warming up a cache, or intermittently timing out under residual load) getting added back, immediately failing again, getting removed, and repeating, which thrashes the pool and makes capacity unpredictable. The two independent thresholds let you tune "pull out fast" and "only bring back once genuinely stable" separately, since the cost of a false negative (serving traffic to a bad node) and a false positive (keeping capacity out of rotation unnecessarily) are different.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does DNS-based load balancing have such slow failover compared to a dedicated load balancer, even if you set the DNS TTL very low?</summary>
+<div class="qa-body">A DNS answer, once returned, is cached at multiple layers you don't control — the client's OS resolver cache, intermediate recursive resolvers run by ISPs or corporate networks, and sometimes the application itself if it caches resolved IPs internally. The TTL you set is only a request for how long those caches should hold the answer, not an enforceable guarantee; some resolvers clamp minimum TTLs upward regardless of what you specify, and some clients simply don't re-resolve until they hit a connection error. A dedicated load balancer has none of this indirection: every request physically flows through it, so when it marks a backend unhealthy, the very next request is routed elsewhere immediately, with no cached intermediate answer anywhere in the path that needs to expire first.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is "identify which resource is actually saturated" the right first step before picking read replicas, caching, or sharding?</summary>
+<div class="qa-body">Each stage of the scaling path targets a specific, different bottleneck: read replicas increase read throughput by adding more machines capable of answering read queries, but do nothing for write throughput or total data volume, since writes still funnel through one primary. Caching reduces redundant repeated reads/computation, but if your problem is that writes are overwhelming the primary, or that your total dataset no longer fits your storage tier, a cache in front of reads doesn't touch either problem. Sharding solves write-throughput and total-data-volume ceilings by splitting the data itself across multiple independent database instances, but adds real complexity (no easy cross-shard joins or transactions) that's wasted effort if your actual bottleneck was application-tier CPU that a second app server behind a load balancer would have fixed far more cheaply. Applying the wrong stage doesn't just fail to help — it adds durable architectural complexity (extra replicas, cache invalidation logic, shard-routing logic) that has to be maintained indefinitely without addressing the metric that was actually maxed out.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does adding virtual nodes to a consistent hashing ring improve load distribution without giving up the "minimal remapping" property?</summary>
+<div class="qa-body">The minimal-remapping property comes from the ring/clockwise-lookup structure itself — inserting or removing a point on the ring only affects the arc adjacent to that point, regardless of how many points total are on the ring or how they got there. That property holds whether a physical node has one point on the ring or a hundred. What virtual nodes fix is a separate issue: with very few points on the ring, their positions (determined by hashing node identifiers) can by chance cluster unevenly, giving some physical nodes a much larger arc — and therefore a much larger share of keys — than others purely due to randomness in where the hash function happened to place them. Giving each physical node many differently-salted virtual positions spreads that node's total "presence" thinly and evenly around the entire ring, so statistically each physical node ends up owning close to an equal total arc length. Because each virtual node is still just an independent point subject to the same insertion/removal rule, adding or removing a physical node (all its virtual points at once) still only disturbs the arcs immediately adjacent to each of its virtual points — the two properties, even distribution and minimal remapping, are achieved by two different aspects of the same structure and don't trade off against each other.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">Replication and sharding mechanics that back stages 3 and 5 of the scaling path</div></div>
+<div class="related-card" onclick="window.location.hash='/caching-strategies'"><div class="rc-title">Caching Strategies</div><div class="rc-sub">What consistent hashing enables and what invalidation problems it introduces</div></div>
+<div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">The coordination and consistency trade-offs behind externalizing state and replication</div></div>
+<div class="related-card" onclick="window.location.hash='/jvm-architecture'"><div class="rc-title">JVM Architecture</div><div class="rc-sub">Why per-instance memory and GC behavior shape how you size the unit you scale horizontally</div></div>
+</div>

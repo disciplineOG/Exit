@@ -1,0 +1,351 @@
+<p class="topic-breadcrumb">Phase 1 — Foundation &amp; Low-Level Mastery · Days 01–05 · Java / LLD</p>
+<h1>JVM Architecture, Memory Model &amp; Garbage Collection</h1>
+<div class="topic-tags">
+  <span class="tag">Classloading</span>
+  <span class="tag">Memory Model</span>
+  <span class="tag">Bytecode Execution</span>
+  <span class="tag">GC Algorithms</span>
+  <span class="tag">JVM Tuning</span>
+  <span class="tag">Profiling</span>
+</div>
+
+<div class="callout tip">
+  <div class="callout-title">Why this matters</div>
+  Everything a Java program does — every object, every thread, every field access — is mediated by the JVM. Understanding its internals turns "my service crashed with an OutOfMemoryError" from a mystery into a diagnosis, and turns "why did this static field print 0 instead of 42" from a surprise into an expected consequence of a well-defined lifecycle. This page builds the complete mental model from the ground up: how a class becomes runnable, where every piece of runtime state physically lives, how bytecode actually executes, and how memory gets reclaimed.
+</div>
+
+<h2>1. The Big Picture: What "JVM" Actually Means</h2>
+<p>The JVM specification defines three independent-but-connected subsystems. Every other topic on this page is a detail inside one of these three:</p>
+<ol>
+  <li><strong>Class Loader Subsystem</strong> — finds, reads, verifies, and prepares <code>.class</code> bytecode, and turns it into runtime <code>Class</code> objects.</li>
+  <li><strong>Runtime Data Areas (Memory)</strong> — where loaded classes, objects, threads, and execution state actually live: Heap, Stack, Metaspace, PC Registers, Native Method Stacks.</li>
+  <li><strong>Execution Engine</strong> — actually runs the bytecode: the Interpreter, the JIT Compilers (C1/C2), and the Garbage Collector that reclaims memory in the Heap.</li>
+</ol>
+<pre><code>┌─────────────────────────────────────────────────────────┐
+│                     CLASS LOADER SUBSYSTEM               │
+│   Loading → Linking (Verify/Prepare/Resolve) → Init       │
+└───────────────────────────┬────────────────────────────────┘
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│                      RUNTIME DATA AREAS                   │
+│  Method Area/Metaspace │ Heap │ Stacks │ PC Regs │ Native  │
+└───────────────────────────┬────────────────────────────────┘
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│                      EXECUTION ENGINE                      │
+│   Interpreter │ JIT (C1 Client / C2 Server / Graal) │ GC   │
+└─────────────────────────────────────────────────────────┘
+</code></pre>
+
+<h2>2. Class Loading — The Full Lifecycle</h2>
+<p>A class goes through <strong>five</strong> distinct phases before you can use it. This ordering is exactly what determines when static fields get their values and when static blocks run.</p>
+
+<h3>2.1 Loading</h3>
+<p>The classloader locates the <code>.class</code> file (from disk, JAR, or network) and reads its binary data into the Method Area, creating an in-memory representation. A <code>java.lang.Class</code> object representing this class is created and placed in the heap (the class's metadata lives in Metaspace, but the <code>Class</code> object itself is a heap object).</p>
+
+<h3>2.2 Linking</h3>
+<p>Linking has three sub-phases, always in this order:</p>
+<ul>
+  <li><strong>Verification</strong> — the bytecode verifier checks structural correctness: valid jump targets, correct operand stack types, no illegal type casts, access control rules honored. This is what stops corrupted or hand-crafted invalid bytecode from crashing or exploiting the JVM.</li>
+  <li><strong>Preparation</strong> — memory is allocated for <strong>static (class) variables</strong> and they are set to their <strong>default values</strong> (0, 0.0, false, null) — <em>not</em> their initializer values yet. A <code>static int count = 42;</code> is <code>0</code> at the end of Preparation, not 42. The initializer expression hasn't executed yet — that happens later, in Initialization (§2.3).</li>
+  <li><strong>Resolution</strong> — symbolic references in the constant pool (class names, field names, method signatures stored as strings/indices) are resolved to direct references or memory offsets. In modern JVMs this is largely <strong>lazy</strong> — resolved on first actual use rather than eagerly for every reference. That laziness is why a reference to a missing class can compile fine and even run fine, only failing with <code>NoClassDefFoundError</code> the first time that specific code path actually executes.</li>
+</ul>
+
+<h3>2.3 Initialization — where static blocks and static field initializers actually run</h3>
+<p>This is the phase that governs exactly when a static variable gets its real value and when a static block executes. The JVM specification guarantees:</p>
+<ul>
+  <li>Static variable initializers and static initializer blocks (<code>static { ... }</code>) execute <strong>in textual (top-to-bottom) source order</strong>, exactly as written, as if the compiler concatenated them into one implicit method called <code>&lt;clinit&gt;</code>.</li>
+  <li><strong>Initialization of the superclass always completes before the subclass's static initializers run.</strong> The JVM walks up to <code>Object</code> and initializes top-down (full mechanics and a worked trace in §2.4).</li>
+  <li>A class is initialized <strong>lazily, on first active use</strong> — not at load time, and not at link time. Active use includes: creating an instance (<code>new</code>), invoking a static method, reading or assigning a static field (except a compile-time constant — see below), or doing any of the above reflectively. Merely referencing another class's <code>static final</code> field does <strong>not always</strong> count as active use: if that field is a compile-time constant (a primitive or <code>String</code> literal the compiler can fully resolve at compile time), <code>javac</code> inlines the literal value directly into the caller's bytecode. The caller never actually touches the defining class at runtime, so its static block never fires from that access alone.</li>
+  <li>Initialization is thread-safe and happens <strong>exactly once</strong> per class per classloader, guarded by a lock the JVM manages internally on the class object. This guarantee — "exactly once, and every other thread blocks until it's done" — is the entire basis of the "initialization-on-demand holder" idiom for lazy, thread-safe singletons without explicit synchronization.</li>
+</ul>
+
+<h3>2.4 Inheritance Loading &amp; Initialization Order — a generic algorithm for any hierarchy</h3>
+<p>Rather than memorizing one example, internalize the <strong>algorithm</strong>. It works for any hierarchy of any depth. Given a chain <code>GrandParent → Parent → Child</code> and a statement <code>new Child()</code>, there are two completely separate passes that never interleave with each other:</p>
+
+<div class="callout tip">
+  <div class="callout-title">The algorithm</div>
+  <p><strong>PASS 1 — Static initialization (runs at most once per class, ever, per classloader, triggered by the first active use of that class):</strong></p>
+  <ol>
+    <li>Find the topmost not-yet-initialized class in the hierarchy (walk up via <code>extends</code> toward <code>Object</code>).</li>
+    <li>For each class from top to bottom, if it isn't already initialized: run its static field initializers and static blocks <strong>interleaved in textual source order</strong> (top-to-bottom exactly as written in that one class's source file).</li>
+    <li>Interfaces: a superinterface is initialized before the implementing class <strong>only if</strong> that interface declares at least one default (or static) method — a marker interface holding only constants is <em>not</em> initialized merely because a class implements it, since its constants are inlined at compile time wherever referenced. Interface fields are always implicitly <code>public static final</code>.</li>
+  </ol>
+  <p><strong>PASS 2 — Instance construction (runs every single time, for every <code>new</code>):</strong></p>
+  <ol>
+    <li>Allocate the object on the heap. Every field at every level of the hierarchy is zeroed to its type's default (0 / false / null) — this happens for the <em>entire object</em> before any constructor body runs anywhere.</li>
+    <li>Enter the <code>Child</code> constructor. The very <strong>first</strong> thing that happens — whether you wrote it explicitly or the compiler inserted it for you — is a call to <code>super(...)</code>. This recurses: <code>Parent</code>'s constructor itself first calls its own super, and so on, all the way up to <code>Object</code>.</li>
+    <li>Now the stack unwinds back down. At each level, <strong>immediately after</strong> that level's <code>super(...)</code> call returns, but <strong>before</strong> the rest of that level's constructor body executes, that level's instance field initializers and instance initializer blocks run, in textual source order.</li>
+    <li>Then the remainder of that level's constructor body executes.</li>
+    <li>Control returns one level down (e.g. from the finished <code>Parent()</code> body back into <code>Child()</code>, right after its <code>super()</code> line) and steps 3–4 repeat for that level, continuing until <code>Child</code>'s own body finishes.</li>
+  </ol>
+</div>
+
+<p>Two consequences fall directly out of this algorithm and resolve almost any ordering question you can construct:</p>
+<ul>
+  <li><strong>All of Pass 1, for every class in the chain, always finishes before Pass 2 even begins</strong> — but only for the very first object ever created from that hierarchy. On the second and any later <code>new</code> call, Pass 1 is skipped entirely (every class is already initialized) and only Pass 2 runs.</li>
+  <li>Within Pass 2, the two orders run in <strong>opposite directions</strong>: the dive (via chained <code>super()</code> calls) goes Child → Parent → GrandParent, but the actual initializer/constructor-body execution, as the stack unwinds, goes GrandParent → Parent → Child.</li>
+</ul>
+
+<h3>2.5 A fully worked trace: field hiding, dynamic dispatch, and overriding together</h3>
+<p>This example deliberately combines several interacting mechanics in one hierarchy so you can see how they compose — and so you can pattern-match any other hierarchy an example throws at you against the same shape.</p>
+<pre><code>class GrandParent {
+    static int sCounter = log("GP static field", 100);
+    static { log("GP static block", null); }
+
+    int id = log("GP instance field", 1);
+    { log("GP instance block", null); }
+
+    GrandParent() {
+        log("GP constructor start", null);
+        describe();              // virtual call on a not-yet-fully-constructed object
+        log("GP constructor end", null);
+    }
+
+    void describe() { log("GP.describe()", null); }
+
+    static int log(String tag, Integer val) {
+        System.out.println(tag + (val != null ? " = " + val : ""));
+        return val == null ? 0 : val;
+    }
+}
+
+class Parent extends GrandParent {
+    static { log("Parent static block", null); }
+
+    int id = log("Parent instance field", 2);   // hides GrandParent.id, does NOT override it
+    { log("Parent instance block", null); }
+
+    Parent() {
+        // implicit super(); inserted here by the compiler
+        log("Parent constructor start", null);
+        log("Parent constructor end", null);
+    }
+
+    @Override
+    void describe() { log("Parent.describe(), sees id=" + id, null); }
+}
+
+class Child extends Parent {
+    static { log("Child static block", null); }
+
+    int id = log("Child instance field", 3);
+    { log("Child instance block", null); }
+
+    Child() {
+        super();
+        log("Child constructor start", null);
+        log("Child constructor end", null);
+    }
+
+    @Override
+    void describe() { log("Child.describe(), sees id=" + id, null); }
+}
+
+new Child();</code></pre>
+
+<p><strong>Applying the algorithm step by step, instead of recalling a memorized order:</strong></p>
+<pre><code>PASS 1 (static, top -&gt; bottom, once):
+  GP static field  = 100
+  GP static block
+  Parent static block
+  Child static block
+
+PASS 2 (instance construction for `new Child()`):
+  [heap alloc: GrandParent.id=0, Parent.id=0, Child.id=0 -- all zeroed first]
+  Child()  -&gt; calls super() -&gt; Parent() -&gt; calls super() -&gt; GrandParent()
+    GrandParent field/block init runs first (top of the dive-unwind):
+      GP instance field = 1        (GrandParent.id is now 1)
+      GP instance block
+    GP constructor start
+      describe() is called virtually -&gt; the object's ACTUAL runtime class is
+      Child, so Child.describe() executes -- even though Parent and Child
+      haven't run THEIR field initializers yet!
+      Child.describe() reads Child.id, which is still 0 (not yet initialized)
+      =&gt; prints: "Child.describe(), sees id=0"
+    GP constructor end
+  (back in Parent's constructor, now past its super() call)
+    Parent instance field = 2      (Parent.id is now 2 -- a SEPARATE slot from GrandParent.id)
+    Parent instance block
+    Parent constructor start
+    Parent constructor end
+  (back in Child's constructor, now past its super() call)
+    Child instance field = 3       (Child.id is now 3)
+    Child instance block
+    Child constructor start
+    Child constructor end</code></pre>
+
+<div class="callout warn">
+  <div class="callout-title">What this example demonstrates</div>
+  <ul>
+    <li><strong>A virtual call made from a constructor dispatches to the most-derived override, even before that subclass has initialized its own fields.</strong> <code>GrandParent</code>'s constructor calls <code>describe()</code> expecting its own behavior, but Java's method dispatch is always based on the object's actual runtime type — so it runs <code>Child.describe()</code>, operating on a half-built object and reading <code>id=0</code> instead of the eventual 3. The general rule this teaches: <strong>calling an overridable (non-final, non-private, non-static) method from a constructor is dangerous</strong>, because the object graph below the currently-executing constructor is not yet built.</li>
+    <li><strong>Field hiding is resolved statically; method overriding is resolved dynamically.</strong> Each class in the chain that redeclares <code>int id</code> gets its <strong>own, separate memory slot</strong> — which slot a field access reads is decided at compile time, based on the <em>declared (static) type</em> of the reference expression, never the runtime type. A method call on the same object, in contrast, always resolves at runtime to the most-derived override via the class's method table (vtable). Concretely: <code>((GrandParent) childObj).id</code> reads GrandParent's own slot (1), while <code>((GrandParent) childObj).describe()</code> still runs <code>Child.describe()</code> — same object, two completely different resolution rules.</li>
+    <li><strong>Static initialization (Pass 1) always fully completes, top-to-bottom, exactly once</strong> — before any instance construction (Pass 2) work begins, and it is never repeated no matter how many times <code>new Child()</code> is subsequently called.</li>
+  </ul>
+</div>
+
+<div class="callout">
+  <div class="callout-title">One more consequence worth internalizing</div>
+  Instantiate <code>Child</code> a second time and none of the "static" lines print again — that class is already initialized. But the entire Pass 2 trace repeats identically every time, including <code>describe()</code> resolving to <code>Child.describe()</code> with <code>id=0</code> at that exact point in the dive, since the fields are re-zeroed for the new object and the same dive/unwind order applies again.
+</div>
+
+<h3>2.6 Classloader Delegation Model &amp; Subsystems</h3>
+<p>The JVM ships with a hierarchy of classloaders, each responsible for a different slice of code, following <strong>parent-first delegation</strong> by default:</p>
+<table>
+  <tr><th>Loader</th><th>Loads</th><th>Notes</th></tr>
+  <tr><td><strong>Bootstrap ClassLoader</strong></td><td><code>java.lang.*</code>, core <code>java.base</code> module classes from the JDK's own runtime libraries</td><td>Implemented in native code, not a Java object itself — calling <code>getClassLoader()</code> on a core class returns <code>null</code>.</td></tr>
+  <tr><td><strong>Platform ClassLoader</strong> (formerly "Extension" pre-Java 9)</td><td>JDK platform modules outside <code>java.base</code> (e.g. <code>java.sql</code>, crypto providers)</td><td>Replaced the old extension classloader once the JDK moved to a module system.</td></tr>
+  <tr><td><strong>Application/System ClassLoader</strong></td><td>The application classpath: your own JARs and classes</td><td>What <code>ClassLoader.getSystemClassLoader()</code> returns; the parent of any custom loaders an application defines.</td></tr>
+  <tr><td><strong>Custom ClassLoaders</strong></td><td>Whatever an application or container defines</td><td>Used by application servers and plugin systems to isolate independently-deployed units of code from one another, and by fat-jar launchers to load nested JARs.</td></tr>
+</table>
+<p><strong>The delegation algorithm</strong>, run on every <code>loadClass</code> call: a loader first asks its parent to load the requested class; only if the parent fails (throws <code>ClassNotFoundException</code>) does the loader attempt to load it itself. This guarantees core classes like <code>java.lang.String</code> can never be shadowed by application-supplied code with the same name, and it produces the <strong>runtime class identity rule</strong>: two classes are the "same class" to the JVM only if they share the same fully-qualified name <em>and</em> were loaded by the same classloader instance. This is the root cause of a confusing <code>ClassCastException</code> between two classes with an identical name and identical bytecode — it happens whenever the same class gets loaded twice by two different classloader instances (common in app-server and plugin-isolation environments).</p>
+<div class="callout warn">
+  <div class="callout-title">Where delegation is deliberately inverted</div>
+  JDBC needs the bootstrap-loaded <code>DriverManager</code> to load driver classes that live on the application classpath — code the bootstrap loader can't normally see, since delegation only looks upward toward parents. It solves this with a <strong>context classloader</strong>: each thread carries a reference to an application-level classloader (<code>Thread.currentThread().getContextClassLoader()</code>), which framework and library code can consult to reach "down" into application code despite running in a more privileged loader. The same mechanism underlies JNDI lookups and executable-jar launchers that need to load nested application JARs.
+</div>
+
+<h2>3. Runtime Memory Areas</h2>
+<table>
+  <tr><th>Area</th><th>Scope</th><th>Holds</th></tr>
+  <tr><td><strong>Heap</strong></td><td>Shared across all threads</td><td>All objects and arrays; divided into generations for GC (see §5)</td></tr>
+  <tr><td><strong>Metaspace</strong> (Java 8+; replaced PermGen)</td><td>Shared</td><td>Class metadata, method bytecode, the runtime constant pool, and the storage location for static variables (the variable slots themselves — the values they hold may of course reference heap objects) — allocated from <strong>native (off-heap) memory</strong>, not the Java heap</td></tr>
+  <tr><td><strong>JVM Stack</strong></td><td>Per-thread</td><td>Stack frames — one per active method call, each holding that method's local variables, its operand stack, and a reference to the runtime constant pool of its defining class</td></tr>
+  <tr><td><strong>PC (Program Counter) Register</strong></td><td>Per-thread</td><td>Address of the currently executing bytecode instruction (undefined while executing a native method)</td></tr>
+  <tr><td><strong>Native Method Stack</strong></td><td>Per-thread</td><td>State for native (JNI) method calls</td></tr>
+</table>
+
+<h3>3.1 Metaspace vs. PermGen — why the change (Java 8)</h3>
+<p>Before Java 8, class metadata lived in <strong>PermGen</strong>, a fixed-size region inside the heap's own contiguous address space. Applications that dynamically generated or reloaded many classes at runtime (heavy use of reflection, dynamic proxies, or repeated redeployment inside a long-running process) routinely exhausted this fixed region and hit <code>OutOfMemoryError: PermGen space</code>, forcing awkward manual tuning of a size limit that had no natural relationship to the rest of heap sizing. Java 8 replaced it with <strong>Metaspace</strong>, allocated out of native (off-heap) memory and, by default, bounded only by total available system memory (a cap can still be set with a sizing flag). This removed most PermGen-related failures, but introduced a different failure mode: because Metaspace draws from the same native memory pool the operating system and other processes share, an unbounded leak there (most commonly a classloader that never becomes garbage because something external still references it, along with every class it loaded) can now destabilize the entire host rather than staying contained inside one process's fixed heap.</p>
+
+<h3>3.2 Heap Generational Layout</h3>
+<pre><code>┌───────────────────────────── HEAP ─────────────────────────────┐
+│                     Young Generation                            │
+│  ┌───────────┐   ┌──────────┐   ┌──────────┐                    │
+│  │   Eden     │   │ Survivor │   │ Survivor │                    │
+│  │  (largest) │   │  S0      │   │  S1      │                    │
+│  └───────────┘   └──────────┘   └──────────┘                    │
+│                                                                   │
+│                     Old (Tenured) Generation                     │
+│              (long-lived / promoted objects)                     │
+└───────────────────────────────────────────────────────────────┘
+  (G1/ZGC/Shenandoah use region-based layouts instead — see §5)</code></pre>
+<p>This layout exists because of one empirical observation about how real programs allocate memory, known as the <strong>generational hypothesis</strong>: most objects die young (loop-local variables, intermediate calculation results, short-lived request/response objects), while a small minority live for a very long time (caches, connection pools, singletons). Splitting the heap by expected lifetime lets the collector spend most of its effort scanning a small, cheap region full of likely-garbage, instead of repeatedly re-scanning the entire heap.</p>
+<ul>
+  <li><strong>Eden</strong> — where nearly all objects are allocated first. Allocation here is extremely cheap: each thread is handed its own private slice of Eden called a Thread-Local Allocation Buffer (TLAB), inside which allocating an object is just bumping a pointer forward — no locking, no coordination with other threads, in the common case.</li>
+  <li><strong>Survivor spaces (S0/S1)</strong> — objects still reachable when Eden fills up are copied here during a Young (Minor) GC. The two survivor spaces alternate roles on every collection: one is always the current destination, the other is always empty going in, which avoids fragmentation entirely for this part of the heap since copying naturally compacts.</li>
+  <li><strong>Tenuring</strong> — every time an object survives a collection, an age counter in its object header increments. Once that age crosses a configured threshold (or a survivor space fills up before all ages get there, triggering "dynamic tenuring"), the object is <strong>promoted</strong> into the Old generation instead of copied to the other survivor space again.</li>
+  <li><strong>Old (Tenured) Generation</strong> — holds objects expected to live a long time. It's collected far less frequently, but because it's typically much larger than the young generation, a collection here (a Major or Full GC) takes proportionally much longer.</li>
+</ul>
+
+<h2>4. Execution Engine: Interpreter, JIT &amp; Bytecode</h2>
+<p>The JVM begins by <strong>interpreting</strong> bytecode directly, instruction by instruction — slow per-instruction, but with zero delay before execution starts. While interpreting, it simultaneously profiles which methods and loops are "hot" (invoked, or iterated, frequently). Once a method crosses an invocation or loop-back-edge count threshold, the <strong>JIT compiler</strong> compiles that method down to native machine code and swaps it in for the interpreted version — this compile-then-swap delay is exactly what "warm-up time" refers to in JVM performance discussions.</p>
+<ul>
+  <li><strong>C1 (Client compiler)</strong> — compiles quickly and applies lighter optimizations, favoring low compilation latency over peak output quality.</li>
+  <li><strong>C2 (Server compiler)</strong> — compiles more slowly but applies much more aggressive optimizations: method inlining, loop unrolling, and <strong>escape analysis</strong>, which can prove an object never "escapes" the method it's created in and eliminate its heap allocation entirely, turning what looks like an object allocation into cheap stack or register values instead. C2 also makes speculative optimizations based on the profiling data gathered so far (for example, assuming a call site only ever sees one concrete implementing type); if a later call breaks that assumption, the JVM <strong>deoptimizes</strong> — discards the compiled code and falls back to the interpreter for that method until it can safely recompile.</li>
+  <li><strong>Tiered Compilation</strong> (the default mode) — a method progresses through several C1 profiling levels before being promoted to full C2 compilation once it's proven hot enough to be worth the heavier optimization cost. This gets the fast startup of C1 and the eventual peak throughput of C2 in the same run.</li>
+  <li><strong>Alternative JIT backends</strong> exist (most notably Graal, written in Java itself) that apply more aggressive optimizations than the default C2, and the same technology underlies ahead-of-time native-image compilation that skips the interpret-then-JIT pipeline entirely in exchange for near-instant startup.</li>
+</ul>
+
+<h2>5. Garbage Collection — Algorithms Compared</h2>
+<p>Every modern collector uses the same underlying liveness rule: an object is reachable — and therefore not garbage — if it can be traced from a <strong>GC Root</strong> (a local variable on any thread's stack, an active static field, or a JNI reference held by native code). Anything not reachable from some GC root is garbage and eligible for reclamation.</p>
+
+<h3>5.1 Phases common to most collectors</h3>
+<ol>
+  <li><strong>Mark</strong> — traverse the live object graph starting from GC roots, marking every object reached along the way.</li>
+  <li><strong>Sweep</strong> — reclaim the memory occupied by everything left unmarked.</li>
+  <li><strong>Compact</strong> (used by most, but not all, collectors) — slide the surviving objects together to eliminate the gaps left behind, so future allocation can keep using a cheap bump-the-pointer scheme instead of searching a free list for a big-enough hole.</li>
+</ol>
+
+<h3>5.2 Collector-by-collector</h3>
+<table>
+  <tr><th>Collector</th><th>Algorithm</th><th>Best suited to</th></tr>
+  <tr><td><strong>Serial GC</strong></td><td>Single-threaded mark-sweep-compact, stop-the-world for the entire collection</td><td>Small heaps and single-core environments, where the overhead of coordinating multiple GC threads isn't worth paying</td></tr>
+  <tr><td><strong>Parallel GC</strong> (the throughput collector)</td><td>The same mark-sweep-compact approach as Serial, but performed by multiple threads simultaneously during the stop-the-world pause</td><td>Workloads where total throughput matters far more than the length of any individual pause — batch and offline processing</td></tr>
+  <tr><td><strong>CMS</strong> (removed from modern JDK releases, superseded by G1)</td><td>Concurrent mark-sweep — most of the marking work happens concurrently with the running application, but without compaction, which made it prone to fragmentation over time</td><td>Historically the option for lower pause times before G1 existed</td></tr>
+  <tr><td><strong>G1 (Garbage First)</strong> — today's general-purpose default</td><td>The heap is divided into many equal-sized regions rather than fixed contiguous Eden/Old blocks; each region is independently labeled Eden, Survivor, or Old, and G1 always collects the regions containing the most garbage first (hence the name); marking runs mostly concurrently, and compaction happens by copying (evacuating) live objects out of a region rather than sliding them in place</td><td>General-purpose use where you want a configurable balance between throughput and pause time</td></tr>
+  <tr><td><strong>ZGC</strong></td><td>Region-based like G1, but almost all work — including marking, relocation, and even reference updates — happens concurrently with the running application, using colored pointers and load barriers to make this safe</td><td>Very large heaps that need consistently very short pauses (single-digit milliseconds) regardless of heap size</td></tr>
+  <tr><td><strong>Shenandoah</strong></td><td>Similar goals to ZGC — pause time independent of heap size — achieved via concurrent compaction using forwarding pointers stored alongside each object</td><td>Same use case as ZGC; an alternative implementation with different internal tradeoffs</td></tr>
+  <tr><td><strong>Epsilon</strong></td><td>A genuinely no-op collector — it allocates memory but never reclaims any of it</td><td>Measuring pure allocation overhead, or extremely short-lived processes that will exit before ever needing a collection</td></tr>
+</table>
+
+<h3>5.3 G1 in depth</h3>
+<ul>
+  <li>The heap is split into many equal-sized regions (sized as a power of two, chosen automatically based on heap size); each region is independently labeled Eden, Survivor, Old, or <strong>Humongous</strong> — a special label for any object at least half the size of a region, which gets allocated directly into one or more contiguous Old regions rather than going through Eden.</li>
+  <li><strong>Young GC</strong>: a stop-the-world pause that evacuates every live object out of the current Eden and Survivor regions into new Survivor or Old regions, using multiple threads in parallel.</li>
+  <li><strong>Concurrent Marking Cycle</strong>: runs mostly alongside the running application to identify which Old regions are the most garbage-heavy. It proceeds through an initial mark (piggybacked onto a Young GC pause), a concurrent scan of "root regions," concurrent marking of the rest of the heap, a short stop-the-world remark to finalize results, and a cleanup step.</li>
+  <li><strong>Mixed GC</strong>: once marking identifies garbage-dense Old regions, the next few collections handle the current Young regions <em>together with</em> a bounded subset of those Old regions — this is precisely what lets G1 reclaim Old-generation garbage incrementally instead of needing one pause that scans the entire Old generation at once.</li>
+  <li>A <strong>Remembered Set (RSet)</strong> attached to each region tracks which other regions hold references into it, so collecting one region never requires scanning the whole heap just to find its incoming pointers.</li>
+</ul>
+
+<h3>5.4 Weak, Soft, and Phantom references</h3>
+<p>Beyond ordinary (strong) references, Java exposes finer-grained levels of reachability for building caches and cleanup hooks without fighting the collector: a <strong>SoftReference</strong> is only cleared when the JVM is genuinely under memory pressure, making it suitable for memory-sensitive caches that should shrink under load rather than cause an OutOfMemoryError; a <strong>WeakReference</strong> is cleared as soon as no strong references to the object remain, regardless of memory pressure (the basis of structures like a weak-keyed map that shouldn't be the thing keeping its keys alive); and a <strong>PhantomReference</strong> refers to an object that has already been finalized and is used together with a <code>ReferenceQueue</code> purely to run cleanup logic after an object is confirmed gone — the modern, more predictable replacement for the old finalizer mechanism.</p>
+
+<h2>6. JVM Tuning &amp; Profiling</h2>
+<h3>6.1 What the common tuning flags actually control</h3>
+<p>A few categories cover most day-to-day tuning: setting the heap's minimum and maximum size (often to the same value, so the JVM never pays the cost of growing the heap mid-run), sizing Metaspace explicitly (both an initial size, to avoid early resize pauses, and a cap, so a classloader leak fails loudly with an <code>OutOfMemoryError</code> instead of silently consuming all native memory), choosing a garbage collector explicitly, giving G1 a target maximum pause time (a goal it tries to meet, not a hard guarantee), and enabling automatic heap-dump capture and structured GC logging so a production incident leaves behind the evidence needed to diagnose it after the fact rather than requiring a live reproduction.</p>
+
+<h3>6.2 How to diagnose a memory leak</h3>
+<ol>
+  <li>Capture a heap dump automatically at the moment of failure (rather than trying to reproduce the issue under a debugger) so the exact state that caused the failure is preserved.</li>
+  <li>Load the dump into a heap-analysis tool and look at its dominator tree / leak-suspect report — this surfaces which single object graph is retaining a disproportionate share of memory. Classic culprits: an ever-growing static collection, a cache with no eviction policy, listeners or callbacks that get registered but never unregistered, or a <code>ThreadLocal</code> value that never gets cleared in a thread that gets reused from a pool.</li>
+  <li>Cross-check against GC logs: a genuine leak shows Old-generation occupancy that keeps climbing after every Full GC — the "floor" after each collection never comes back down. A pure sizing problem looks different: GC runs frequently, but each collection still reclaims a healthy amount of memory, meaning the working set is simply larger than the heap allows, not that something is being retained forever.</li>
+  <li>For ongoing, low-overhead investigation without needing a full heap dump, sampling profilers can capture CPU or allocation flame graphs directly against a live production process with minimal overhead, since they read stack samples via lightweight OS-level mechanisms rather than instrumenting every method call.</li>
+</ol>
+
+<div class="callout">
+  <div class="callout-title">How to choose a collector</div>
+  Frame the decision around the tradeoff between <strong>latency and throughput</strong>, combined with heap size: G1 is the safe general-purpose default for most services; ZGC or Shenandoah when there's a hard requirement for very short, consistent pauses on a large heap; Parallel GC when a workload is offline/batch and total throughput matters far more than any individual pause.
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+  <summary>Given a static block written above a static variable, and another below it, what does each one see?</summary>
+  <div class="qa-body">Both run in strict textual order as part of the implicit <code>&lt;clinit&gt;</code> method, exactly as the compiler concatenates all static field initializers and static blocks in source order. A static block placed <em>above</em> a given static variable's declaration observes that variable still at its Preparation-phase default (0 / false / null), since its own initializer expression hasn't executed yet. A static block placed <em>below</em> the declaration observes the assigned value.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Why doesn't referencing another class's static final field always trigger that class's static initializer?</summary>
+  <div class="qa-body">If the field is a compile-time constant — a primitive or String literal fully resolvable by the compiler — javac inlines the literal value directly into the referencing class's own bytecode. The referencing class never actually needs to load or resolve the defining class to use that value, so this specific kind of access is explicitly excluded from what the JVM spec calls "active use," and initialization never fires from it alone.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>A constructor calls an overridable method that a subclass overrides. What actually executes, and why is this a known hazard?</summary>
+  <div class="qa-body">The subclass's override executes, because instance method dispatch is always based on the object's actual runtime type, never the type of the code currently running. The hazard is that this happens at a point where the subclass's own field initializers haven't run yet — the dive down the constructor chain hasn't unwound that far — so the override ends up reading its own fields at their zeroed defaults instead of their intended values. The general takeaway: avoid calling any non-final, non-private, non-static method from a constructor, since the object below the currently-executing constructor level isn't fully built yet.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Two classes redeclare a field with the same name, and the subclass overrides a method that reads it. Why do the field access and the method call resolve so differently?</summary>
+  <div class="qa-body">Fields are resolved statically: each class in a hierarchy that redeclares a field gets its own independent memory slot, and which slot a given expression reads is decided at compile time based on the declared (static) type of the reference — this is called hiding, and it is not polymorphic. Methods are resolved dynamically through the object's method table based on its actual runtime type — this is overriding, and it is the only one of the two that is polymorphic. As a result, casting a reference to a supertype changes which field slot you read, but never changes which method override actually runs.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Two classes share the exact same fully-qualified name and bytecode, yet a cast between them throws ClassCastException. Why?</summary>
+  <div class="qa-body">The JVM's notion of runtime type identity is the pair (fully-qualified name, defining classloader instance) — not just the name. If the same class gets loaded twice by two different classloader instances (common in application-server or plugin-isolation setups), the JVM treats the two results as entirely unrelated types even though their bytecode is identical, so a cast between an instance of one and a reference typed as the other fails. The fix is ensuring any class that needs to be shared across those boundaries is loaded from a common ancestor classloader instead of being loaded independently by each one.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>A G1-managed process occasionally experiences a multi-second stop-the-world pause. What happened, and what would you check?</summary>
+  <div class="qa-body">A G1 Full GC is a fallback path, not part of its normal operation — it means the concurrent/mixed collection cycle couldn't keep up with the rate of new garbage (for example, allocation outpacing concurrent marking, or a Humongous allocation failing to find enough contiguous free regions), so G1 degraded to a single-threaded, full-heap stop-the-world compaction as a last resort. The response is to give the heap more headroom, start concurrent marking earlier (lowering the occupancy threshold that triggers it), reconsider region sizing if Humongous allocations are frequent, and use an allocation profiler to understand what's actually driving the allocation rate.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Beyond one being off-heap, what's the practical consequence of the PermGen-to-Metaspace change?</summary>
+  <div class="qa-body">Because Metaspace draws from native memory shared with the rest of the operating system rather than a fixed region carved out of the heap, an unbounded leak there (most often a classloader that never becomes unreachable, keeping every class it loaded alive too) can now degrade or crash the entire host rather than staying contained as a clean, isolated OutOfMemoryError inside one process's heap. This is why production configurations should always cap Metaspace explicitly rather than relying on its unbounded default.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+  <div class="related-card" onclick="window.location.hash='/collections-internals'">
+    <div class="rc-title">Java Collections Framework Internals</div>
+    <div class="rc-sub">Days 06–10 · How HashMap buckets live on the heap you just learned about</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/concurrency-multithreading'">
+    <div class="rc-title">Multithreading &amp; Concurrency</div>
+    <div class="rc-sub">Days 16–20 · Per-thread stacks, safepoints, and GC pause coordination</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/modern-java-features'">
+    <div class="rc-title">Modern Java Features</div>
+    <div class="rc-sub">Days 46–50 · Records, sealed classes, and how they interact with classloading</div>
+  </div>
+</div>

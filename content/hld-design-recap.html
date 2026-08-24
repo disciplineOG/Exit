@@ -1,0 +1,167 @@
+<p class="topic-breadcrumb">Phase 3 — Advanced Systems, Security &amp; LLD Machine Coding · Days 56–60 · HLD</p>
+<h1>System Design Synthesis: Putting Scaling, Consistency &amp; Resilience Together</h1>
+
+<div class="topic-tags">
+<span class="tag">Requirements Framework</span>
+<span class="tag">Back-of-Envelope Estimation</span>
+<span class="tag">Decision Tree</span>
+<span class="tag">CAP / PACELC</span>
+<span class="tag">Bottleneck Analysis</span>
+<span class="tag">Case Study Retrospective</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Every individual mechanic — caching, sharding, queuing, circuit breaking — is easy to understand in isolation and easy to misapply in combination. The actual skill in system design is sequencing: knowing which fact to establish first so that it correctly eliminates most of the design space before you touch a whiteboard. Without this sequencing, it's common to end up with a design that adds a message queue to a system that never needed asynchronous decoupling, or one that shards a database that a single read replica would have handled for years. This page is the connective tissue that turns a pile of separately-learned patterns into one repeatable procedure you can run on any new problem.</p>
+</div>
+
+<h2>1. A General Framework for Approaching Any Design Problem</h2>
+<p>Almost every design conversation goes wrong the same way: it jumps straight to "we'll use Kafka and shard by user ID" before establishing the two facts that should have driven those choices. The fix is a fixed order of operations. Skipping steps, or doing them out of order, is exactly why designs end up over-engineered (a queue for 50 requests a second) or under-engineered (a single primary database for a system with a 200:1 read/write ratio and no cache at all).</p>
+
+<h3>1.1 Functional requirements — scope the actual problem</h3>
+<p>List the three to five core operations the system must support and explicitly state what's out of scope. A URL shortener needs: shorten, redirect, and optionally expire and report analytics. Everything else — custom aliases, spam detection, QR generation — is a scope decision, not a default. This has to happen first because non-functional requirements are meaningless without a concrete operation to attach them to: "needs to be fast" means something different for the redirect path than for the analytics dashboard of the same product.</p>
+
+<h3>1.2 Non-functional requirements — read/write ratio and consistency come first</h3>
+<p>Of all the non-functional requirements you could gather, two dominate every downstream decision more than the rest combined:</p>
+<ul>
+<li><strong>Read/write ratio.</strong> A system that is 1000:1 read-heavy (a URL redirect, a product catalog page) wants aggressive caching, and can usually tolerate briefly stale reads. A system that is closer to 1:1, or that spikes to write-heavy under load (flash-sale checkout, seat booking), cares far more about write contention — caching barely helps there, because the bottleneck is contended writes to a single row or counter, not repeated reads of unchanging data.</li>
+<li><strong>Consistency requirement.</strong> Does correctness require that two concurrent operations on the same entity be serialized (an inventory decrement, a funds transfer), or can a reader tolerate briefly stale data (a view counter, a "last seen" timestamp, a shortened URL's click count)? This single answer determines whether a cache-aside pattern is even safe to use, whether a distributed lock or a database constraint is required, and whether asynchronous replication is acceptable at all.</li>
+</ul>
+<p>Ask about read/write ratio and consistency requirement within the first few minutes of thinking through a design — they eliminate entire branches of the decision tree in section 3 before any effort is spent walking down the wrong one.</p>
+
+<div class="callout warn">
+<div class="callout-title">A common mismatch worth noticing</div>
+<p>Treating "high availability" and "strong consistency" as two independent boxes to both check is a category error. <a href="#/distributed-systems-core">CAP</a> says that under a network partition you cannot have both; PACELC extends this further to say that even absent a partition, you are still trading latency against consistency on every replicated write. Stating "we want five nines of availability" without also stating what happens to correctness during a partition is an incomplete requirement, not a complete one — see section 4.</p>
+</div>
+
+<h2>2. Estimating Scale With Back-of-Envelope Numbers</h2>
+<p>Before picking a database, a caching strategy, or a partitioning scheme, translate the functional requirements into rough numbers: requests per second (average and peak), data size per record, storage growth per year, and the read/write split in absolute terms. These numbers don't need to be precise — they need to be right within an order of magnitude, because the point is to rule out entire categories of solution early, not to produce a capacity plan.</p>
+
+<h3>2.1 Why this step prevents both over- and under-engineering</h3>
+<p>Consider a URL shortener creating 100 new links per second with a 100:1 read/write ratio — roughly 10,000 redirects per second. Ten thousand key-value lookups a second, each a few hundred bytes, is comfortably within what one well-provisioned relational database with a cache in front of it can serve; it is very likely not a problem that requires sharding the primary on day one. Doing this arithmetic first is what stops "we'll shard from the start" over-engineering. Conversely, a notification system fanning out to fifty million users per campaign, at even a modest 5,000 sends per second, will visibly overwhelm a naive "loop and call the provider synchronously" implementation — the numbers make the case for a queue-backed worker pool before a line of code is written.</p>
+
+<h3>2.2 The estimation checklist</h3>
+<table>
+<tr><th>Quantity</th><th>Why it matters</th><th>Rough method</th></tr>
+<tr><td>Requests/sec (avg &amp; peak)</td><td>Determines if one instance, a load-balanced fleet, or a queue-buffered fleet is needed</td><td>(daily active users × actions per user) / 86,400, scaled by a peak factor, often 3–10x average</td></tr>
+<tr><td>Read/write ratio</td><td>Drives cache viability and replication topology</td><td>Count distinct read and write operations triggered per user action</td></tr>
+<tr><td>Payload size</td><td>Drives storage growth and network bandwidth</td><td>Sum realistic field sizes for one record</td></tr>
+<tr><td>Storage growth/year</td><td>Determines if a single disk suffices for the project's realistic lifetime</td><td>writes/sec × payload size × seconds/year</td></tr>
+<tr><td>Fan-out factor</td><td>Determines if synchronous handling is even physically possible</td><td>recipients per triggering event — 1 for a redirect, millions for a broadcast notification</td></tr>
+</table>
+
+<div class="callout">
+<div class="callout-title">Order of magnitude, not precision</div>
+<p>The goal here is a decision — "a single node is fine" versus "we need horizontal scale from the outset" — not a spreadsheet. Being off by 2x rarely changes the decision; being off by 1000x means it's the wrong estimate and worth redoing. Spending more than a few minutes on this step is usually a sign of solving the wrong problem.</p>
+</div>
+
+<h2>3. Data Model and Access Patterns Before Database Choice</h2>
+<p>The database is a consequence of the access pattern, not a starting assumption. Before naming a specific storage technology, write down what the primary lookup key is, what secondary lookups exist, whether records are updated in place or only ever appended, and whether queries need to join across entities or can be satisfied by a single key lookup.</p>
+<ul>
+<li>If every read is "fetch by a single known key" (short code to long URL, user ID to profile), a key-value store or a simply indexed table is enough, and a cache in front of it will have a very high hit rate.</li>
+<li>If reads require filtering or sorting across many records (a feed, a leaderboard, search results), a database with strong secondary-index support, or a separate read-optimized store fed asynchronously from the writes, is needed instead.</li>
+<li>If writes are append-only and reads are largely sequential (an event log, an audit trail, notification history), a log-structured or time-partitioned table beats a general-purpose relational table.</li>
+<li>If the entity has strong relational-integrity requirements (an order that references inventory that references a payment), transactional guarantees local to one database are usually required, which argues against splitting that entity's writes across independently-scaled services without also solving distributed-transaction semantics — see the flash-sale retrospective in section 6.</li>
+</ul>
+<p>Access pattern first, storage engine second, is exactly the reasoning behind the deeper trade-offs in <a href="#/database-architecture">database-architecture</a>: replication topology, index design, and partition-key choice are all answers to "how is this data actually read and written," not defaults applied universally.</p>
+
+<h2>4. Where Will the System Actually Bottleneck?</h2>
+<p>A system rarely fails uniformly; it fails at one specific resource first, and every subsequent scaling decision is really a decision about relieving that one bottleneck without creating a worse one elsewhere. The usual candidates, roughly in the order they tend to appear as load grows:</p>
+<ol>
+<li><strong>CPU or connection limits on a single application instance</strong> — relieved by horizontal scaling behind a load balancer (<a href="#/hld-basics-scaling">hld-basics-scaling</a>).</li>
+<li><strong>Database read capacity</strong> — relieved by a cache in front of the database, or by read replicas, before reaching for sharding.</li>
+<li><strong>Database write capacity or lock contention</strong> — the one bottleneck a cache cannot help with, since every write must still hit the source of truth. Relieved by sharding, by shrinking the critical section (the flash-sale case in section 6), or by queuing writes so a burst is smoothed into a sustained rate the database can absorb.</li>
+<li><strong>Downstream or third-party service latency and rate limits</strong> — relieved by asynchronous decoupling so throughput isn't hostage to a slower dependency, and by circuit breakers so a slow dependency doesn't exhaust the calling service's own thread pool.</li>
+<li><strong>Network or cross-region latency</strong> — relieved by data locality (regional deployments, edge caching) rather than by any change to application logic.</li>
+</ol>
+<p>Identifying which of these is the real bottleneck for the problem at hand is what separates "add a cache" from "shard the database" as the correct next move — they solve different bottlenecks and are not interchangeable.</p>
+
+<h2>5. The Decision Tree: Composing the Primitives in Order</h2>
+<p>With requirements, scale estimates, and the likely bottleneck in hand, the actual design decisions follow a fairly mechanical sequence. This is the tree worth internalizing, because it's the same tree regardless of the specific product being designed.</p>
+
+<h3>5.1 Single server to load-balanced fleet</h3>
+<p>Start every design, mentally, from a single application instance talking to a single database. Introduce a load balancer the moment CPU, memory, or connection count on that one instance is projected (from section 2's numbers) to exceed safe headroom — commonly framed as keeping sustained utilization under 60–70% so bursts don't immediately cause saturation. This is almost always the first scaling move, because it's cheap, it's stateless-application-friendly, and it doesn't change the data model at all. See <a href="#/hld-basics-scaling">hld-basics-scaling</a> for load balancing algorithms and health-check mechanics.</p>
+
+<h3>5.2 When to introduce a cache, and which pattern</h3>
+<p>Introduce a cache once the read/write ratio from section 1.2 confirms the workload is read-heavy and the data model from section 3 confirms reads are dominated by key-based lookups of data that doesn't change on every request. The pattern follows from the consistency requirement:</p>
+<table>
+<tr><th>Pattern</th><th>Use when</th><th>Failure mode to understand</th></tr>
+<tr><td>Cache-aside</td><td>Reads dominate, occasional staleness is tolerable, cache and database are separate systems</td><td>Thundering herd on a cold cache or a popular key expiring; needs jittered TTLs or request coalescing</td></tr>
+<tr><td>Write-through</td><td>Reads immediately after writes must reflect the write, and write latency can absorb an extra hop</td><td>Every write pays two round trips; a cache outage blocks writes too unless designed carefully</td></tr>
+<tr><td>Write-behind</td><td>Write throughput matters more than immediate durability of the write to the source of truth</td><td>A cache crash before flush loses acknowledged writes — rarely acceptable for financial or inventory data</td></tr>
+</table>
+<p>See <a href="#/caching-strategies">caching-strategies</a> for eviction policy and invalidation mechanics in depth. The key judgment call is this: a cache is a read-side optimization; it does nothing for write contention, so introducing one for a write-heavy, consistency-sensitive workload (flash sale inventory) is not just unhelpful, it can actively mask a correctness bug if writers start trusting cached reads for decisions that require the true current count.</p>
+
+<h3>5.3 Read replicas versus sharding</h3>
+<p>When the database itself becomes the bottleneck, the next question is which side is saturated. If it's read capacity, add read replicas — asynchronously replicated copies that serve read traffic while all writes still go to the single primary. This works because reads and writes are handled by different physical machines without changing the data model or requiring the application to know how data is partitioned. Reach for sharding only when write capacity itself, or total data volume, exceeds what a single primary can hold or absorb — because sharding requires picking a partition key, and a poorly chosen partition key (e.g., one that creates a hot shard for a viral piece of content, or that scatters a single entity's related rows across shards and breaks local transactions) is difficult to undo later. See <a href="#/database-architecture">database-architecture</a> for partitioning key selection and resharding mechanics.</p>
+
+<div class="callout tip">
+<div class="callout-title">A rule of thumb worth internalizing</div>
+<p>Read replicas are close to a free scaling lever — they add capacity without changing anything the application code has to know about, aside from tolerating replication lag. Sharding is not free — it is a structural change to the data model that the application must be aware of for the rest of the system's life. This asymmetry in cost is exactly why the decision tree puts replicas before sharding, not the reverse.</p>
+</div>
+
+<h3>5.4 Synchronous REST versus asynchronous messaging between services</h3>
+<p>A synchronous REST call between two services is appropriate when the caller genuinely needs the callee's result before it can respond to its own caller — for example, a checkout service that must know whether payment authorization succeeded before confirming an order. It becomes the wrong choice, and a queue becomes the right one, in three overlapping situations: the caller does not need the result immediately (sending a confirmation email after checkout), the callee is slower or less available than the caller can tolerate blocking for (a downstream analytics pipeline), or the fan-out factor from section 2 makes synchronous calls physically incapable of keeping up (one order triggering fifty million notification sends is never going to be a loop of synchronous HTTP calls). See <a href="#/async-messaging">async-messaging</a> for delivery guarantees and ordering trade-offs. The general principle: synchronous calls couple the caller's availability and latency to the callee's; asynchronous messaging trades immediate consistency for that decoupling, and is worth it exactly when the coupling is a liability rather than a genuine requirement.</p>
+
+<h3>5.5 Circuit breakers and other resilience patterns: necessary versus premature</h3>
+<p>A circuit breaker exists to stop a struggling downstream dependency from also taking down the caller, by failing fast once a failure-rate threshold is crossed instead of letting every caller thread block waiting on a timeout. It earns its place once a service has synchronous dependencies whose failure or slowness is plausible in production and whose blocking behavior could exhaust the caller's own thread or connection pool. It is premature when applied to a call to a database the service fully owns and controls the availability of (the failure mode there is usually better handled by connection pooling and timeouts, not a breaker), or when introduced before the system has any synchronous cross-service calls at all. See <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a> for the half-open state mechanics and threshold tuning. The general test: does this dependency have an independent failure mode from the caller, and would that failure otherwise cascade? If yes, a circuit breaker (paired with a timeout and, often, a bulkhead limiting concurrent calls) is warranted. If the dependency is essentially as available as the caller itself, a breaker adds operational complexity without a corresponding benefit.</p>
+
+<h2>6. CAP/PACELC as the Explicit Lens for a Consistency Decision</h2>
+<p>Every design eventually reaches a point where a replicated or partitioned piece of state must choose, during a network partition, between returning a possibly-stale answer (favoring availability) or refusing to answer until it can guarantee correctness (favoring consistency). <a href="#/distributed-systems-core">CAP</a> is not a checklist to satisfy — it is a forced choice that a partition makes for you, and the only real design decision is which side of that choice matches the requirement gathered in section 1.2.</p>
+<p>PACELC extends this reasoning to the much more common case where there is no partition at all: even during normal operation, a system replicating data across nodes must choose between waiting for a quorum of replicas to acknowledge a write (higher latency, stronger consistency) or acknowledging as soon as one node has it (lower latency, a window where a read from a different replica can be stale). This is why, for instance, a system might use synchronous quorum writes for financial balances but asynchronous single-node writes with eventual consistency for view counters within the very same application — the correct trade-off is decided per piece of state, not once for the whole system.</p>
+<p>The discipline this section argues for is explicitness: state, for each piece of state in the design, "under a partition (or under replication lag), this data will do X," rather than discovering the actual behavior for the first time during an incident. A design that says "we chose eventual consistency for click counts because a delay of a few seconds is invisible to users, and strong consistency for the inventory decrement because overselling has a real cost" has done the CAP/PACELC analysis correctly, even without ever naming the theorem explicitly.</p>
+
+<h2>7. Retrospective: Three Case Studies, One Small Set of Primitives</h2>
+<p>The site's three worked case studies are not three different toolkits — they are the same five or six primitives (caching, read replicas or sharding, queuing, idempotency, circuit breaking) recombined in different proportions depending on which non-functional requirement from section 1.2 dominates. Laying them side by side makes the recombination visible.</p>
+<table>
+<tr><th>Case study</th><th>Dominant requirement</th><th>Primitives that matter most</th><th>Primitives that barely matter</th></tr>
+<tr><td><a href="#/hld-url-shortener">URL Shortener</a></td><td>Extreme read/write ratio (read-heavy)</td><td>Cache-aside in front of the redirect lookup; read replicas if the cache misses at scale; a simple counter or hash-based ID generator that avoids write contention on ID allocation</td><td>Queuing (writes are low-volume and independent); circuit breakers (few synchronous cross-service dependencies on the hot path)</td></tr>
+<tr><td><a href="#/hld-ecommerce-flash-sale">Flash Sale</a></td><td>Extreme write contention under a strict consistency requirement</td><td>Sharding or partitioning inventory to spread contention; short, well-defined critical sections (atomic decrement instead of read-modify-write); queuing to absorb the request burst and apply backpressure before it reaches the database; idempotency keys so retried requests under load don't double-decrement</td><td>Caching (a cached inventory count is actively dangerous here, since decisions require the true current value)</td></tr>
+<tr><td>Notification Engine</td><td>Massive fan-out with at-least-once delivery semantics</td><td>Queuing to decouple the triggering event from the (much slower, rate-limited) delivery step; idempotency keys or dedup so retries and at-least-once delivery don't cause duplicate sends; circuit breakers around each third-party provider so one slow provider doesn't stall the whole worker pool</td><td>Sharding the primary database (the bottleneck is fan-out and delivery throughput, not storage volume or query contention)</td></tr>
+</table>
+<p>Two of the same primitives — idempotency and queuing — show up in both the flash sale and the notification engine, but for different reasons: the flash sale needs idempotency because a retried request under contention must not double-decrement a scarce resource, while the notification engine needs it because at-least-once delivery semantics make duplicate delivery attempts a certainty rather than an edge case. Recognizing that the same mechanic is being reused for a different underlying reason is what makes it possible to reach for it correctly in a fourth, unseen problem rather than only recognizing it in the three it was first taught with.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why should read/write ratio and consistency requirement be established before any other non-functional requirement?</summary>
+<div class="qa-body">Because they constrain which architectural patterns are even legal choices before latency or availability targets are considered. If the workload is write-heavy with a strict consistency requirement, caching is off the table as a primary scaling lever regardless of what latency target is later specified, because a cache cannot make contended writes to a single row happen faster or more safely — it can only speed up reads. Conversely, if reads dominate and staleness is tolerable, a large fraction of the system's scaling problem can be solved by a cache before a single line of database-tuning work is done. Establishing these two facts first means every subsequent conversation about latency, availability, or specific technology choices happens inside the right subset of the design space instead of across the whole space.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is estimating requests-per-second and storage growth worth doing before choosing a database, even roughly?</summary>
+<div class="qa-body">Because the entire value of the exercise is comparative: it tells you whether the numbers involved are "one machine can do this" scale, "needs a fleet behind a load balancer" scale, or "needs partitioned storage" scale. A design that jumps to a distributed, sharded architecture for a workload that a single modern database instance could serve for years is adding operational complexity — more failure modes, harder debugging, cross-shard query limitations — for no corresponding benefit. The estimate doesn't need to be exact because its only job is to place the workload in the right bucket, and the buckets are usually separated by more than an order of magnitude.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does the decision tree place read replicas before sharding, rather than treating them as equally valid options for the same problem?</summary>
+<div class="qa-body">Read replicas and sharding solve different bottlenecks. A read replica is an asynchronously-updated copy of the entire dataset that offloads read traffic from the primary; it requires no change to the data model and the application only needs to tolerate replication lag on reads that go to a replica. Sharding splits the dataset itself across multiple databases by a partition key, which is a structural change: queries that need data from multiple shards, transactions that span more than one shard, and resharding when a partition key choice turns out to be wrong all become materially harder problems. Because sharding's cost is much higher and much harder to reverse, it should only be reached for when the actual bottleneck is write capacity or total data volume that a single primary genuinely cannot hold — problems a read replica cannot solve, since replicas don't add write capacity or reduce the primary's storage burden.</div>
+</details>
+
+<details class="concept-qa">
+<summary>How does PACELC change the CAP conversation, and why does that distinction matter in practice?</summary>
+<div class="qa-body">CAP only makes a statement about behavior during a network partition: pick availability or consistency, you cannot have both. But partitions are relatively rare events, while replication happens on every single write in a distributed system. PACELC points out that even with no partition present, a system replicating data must still decide whether to wait for enough replicas to confirm a write before acknowledging it (favoring consistency at the cost of latency) or acknowledge immediately and replicate in the background (favoring latency at the cost of a window of possible staleness). This matters in practice because most production incidents involving stale reads are not caused by rare partitions — they're caused by the everyday latency/consistency trade-off made on every write, which is a decision made constantly, not occasionally, and therefore worth being deliberate about for every piece of replicated state rather than assuming a single system-wide answer.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is a cache actively dangerous for the flash-sale inventory count, rather than merely unhelpful?</summary>
+<div class="qa-body">A cache that isn't strictly kept in lockstep with the source of truth introduces a window where a decision (allow this purchase) is made against a value that is no longer accurate. For a view counter, a stale read for a few seconds has no real consequence. For an inventory count that many concurrent buyers are decrementing against, a stale cached read can tell two buyers there is one unit left when there are actually zero, both proceed, and the system oversells — a correctness failure with a real-world cost, not just a display glitch. The fix is not "don't cache anything" but "don't let the cache be the value that gates a write decision" — reads for display can be cached and slightly stale, but the actual decrement must go through an atomic operation against the source of truth, often with the cache only reflecting the outcome afterward.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why do both the flash-sale and notification-engine case studies rely on idempotency, given how different the two systems are?</summary>
+<div class="qa-body">Idempotency solves the general problem of "the same logical operation might be attempted more than once, and repeating it must not change the outcome beyond the first successful attempt" — but that problem arises for different underlying reasons in each case. In the flash sale, retries happen because clients or the network layer resend a request after a timeout, and if the retry is treated as a brand new purchase it double-decrements a scarce resource; an idempotency key tied to the original request ensures the retry returns the original result instead of re-executing the decrement. In the notification engine, duplicates arise because at-least-once delivery is a deliberate design choice — the queue would rather redeliver a message the consumer already processed than risk losing one — so the consumer itself must deduplicate by a message or notification ID to avoid sending the same alert twice. The mechanic is the same; the trigger for needing it is different, which is why it's worth understanding as a general pattern rather than as something specific to either case.</div>
+</details>
+
+<details class="concept-qa">
+<summary>When is introducing a circuit breaker premature, and what should be in place before reaching for one?</summary>
+<div class="qa-body">A circuit breaker is a response to a specific failure mode: a synchronous dependency becomes slow or unavailable, and callers pile up waiting on it, eventually exhausting their own thread pool or connection pool and failing even for requests that don't need that dependency at all. If a system has no synchronous cross-service calls yet, or if its only dependency is a database it directly controls and whose availability is deployed and monitored as part of the same unit, a circuit breaker is solving a problem that doesn't exist yet. What should exist first are sensible timeouts on every synchronous call (without a timeout, a breaker has nothing to react to) and, ideally, bulkhead isolation so that one dependency's thread pool exhaustion can't spill into calls destined for a different, healthy dependency. The breaker is the mechanism that opens once those timeouts start failing above a threshold rate — it's a layer on top of timeouts, not a replacement for having them.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/hld-basics-scaling'"><div class="rc-title">Scaling Fundamentals</div><div class="rc-sub">Days 01–05 · load balancing and horizontal scaling as the first lever in the decision tree</div></div>
+<div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Days 16–20 · CAP/PACELC as the explicit lens for every consistency choice</div></div>
+<div class="related-card" onclick="window.location.hash='/hld-url-shortener'"><div class="rc-title">URL Shortener Case Study</div><div class="rc-sub">Days 36–40 · the read-heavy, cache-driven end of the primitive spectrum</div></div>
+<div class="related-card" onclick="window.location.hash='/hld-ecommerce-flash-sale'"><div class="rc-title">Flash Sale Case Study</div><div class="rc-sub">Days 41–45 · the write-contention, consistency-critical end of the spectrum</div></div>
+</div>

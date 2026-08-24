@@ -1,0 +1,182 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Bonus · Bonus</p>
+<h1>Cloud Fundamentals for Backend Engineers (AWS core services)</h1>
+
+<div class="topic-tags">
+  <span class="tag">EC2 / ECS / EKS / Lambda</span>
+  <span class="tag">VPC Networking</span>
+  <span class="tag">S3 / EBS / EFS</span>
+  <span class="tag">RDS / DynamoDB</span>
+  <span class="tag">IAM</span>
+  <span class="tag">Auto Scaling &amp; ELB</span>
+</div>
+
+<div class="callout tip">
+  <div class="callout-title">Why this matters</div>
+  <p>Every distributed-systems concept you've studied — sharding, load balancing, health checks, replication — exists inside AWS as an actual named product with actual defaults, quotas, and failure modes, and those defaults quietly become part of your system's behavior whether you chose them deliberately or not. Not knowing that a default Lambda timeout is 3 seconds, or that a DynamoDB table without a well-distributed partition key will silently throttle, or that a database sitting in a public subnet is one misconfigured security group away from being internet-facing, is exactly the kind of gap that turns into a 2am incident. This page builds the mental model of "which building block for which job" so that reading a production architecture diagram — or drawing one — becomes an exercise in recognizing trade-offs you already understand.</p>
+</div>
+
+<h2>1. The Compute Spectrum: EC2, Containers, and Lambda</h2>
+<p>Every cloud provider offers compute along a spectrum defined by one variable: how much of the stack you manage versus how much the provider manages. Moving up the spectrum trades control for reduced operational burden, and the "right" tier for a workload is almost always determined by how predictable its traffic and runtime characteristics are.</p>
+
+<h3>EC2 — virtual machines, maximum control</h3>
+<p>An EC2 instance is a virtual machine running on physical hardware in an AWS availability zone. You choose the instance family (compute-optimized <code>c-series</code>, memory-optimized <code>r-series</code>, general purpose <code>m-series</code>, burstable <code>t-series</code>), the operating system, and you are responsible for everything above the hypervisor: OS patching, runtime installation, process supervision, log rotation, security hardening. This is the same responsibility model as running your own physical server, minus the physical server. You get full control over the process lifecycle — useful when you need a specific kernel version, a licensed piece of software, or fine-grained control over resource isolation — but you also own every 2am page caused by disk filling up or a kernel CVE.</p>
+
+<h3>ECS / EKS — container orchestration, the middle ground</h3>
+<p>Elastic Container Service (ECS) and Elastic Kubernetes Service (EKS) sit in the middle: you package your application as a container image, and the orchestrator handles placement, restart-on-crash, and rolling deployment across a fleet of underlying compute. This is the same problem <a href="#/docker-kubernetes">docker-kubernetes</a> covers in provider-neutral terms — pods, replica sets, service discovery — and EKS is literally upstream Kubernetes, so everything you know about deployments, liveness probes, and horizontal pod autoscaling transfers directly. ECS is AWS's own simpler orchestrator with a smaller conceptual surface (tasks and services instead of pods and deployments) at the cost of being AWS-specific.</p>
+<p>Within both, you additionally choose a launch type: <strong>EC2 launch type</strong> means you still manage the underlying instances the containers run on (you own capacity planning and patching of the host), while <strong>Fargate</strong> removes the host entirely — you specify CPU and memory for the task and AWS runs it on infrastructure you never see. Fargate is effectively "serverless containers," trading some cost efficiency and startup latency for eliminating host management altogether.</p>
+
+<h3>Lambda — serverless functions, minimum operational overhead</h3>
+<p>Lambda runs a single function in response to an event (an HTTP request via API Gateway, an S3 object creation, an SQS message, a scheduled cron) and you are billed per invocation and per millisecond of execution time. There is no server to patch, no fleet to size — AWS provisions an execution environment on demand. This is the extreme end of "least operational overhead," but it comes with two structural constraints worth internalizing rather than memorizing:</p>
+<ul>
+  <li><strong>Cold starts.</strong> When no warm execution environment exists for your function, AWS must provision one: download your deployment package, initialize the runtime, run your static initializers. For a JVM-based Lambda this can add hundreds of milliseconds to several seconds before your handler code even runs, because JVM class loading and JIT warm-up are exactly as slow here as they are in any other JVM process — Lambda doesn't make the JVM start faster, it just controls how often you pay that cost. Provisioned Concurrency exists specifically to pre-warm a pool of environments and eliminate this for latency-sensitive paths, at the cost of paying for idle capacity, which partially defeats the "pay only for what you use" premise.</li>
+  <li><strong>Execution time limits.</strong> A Lambda invocation is capped at 15 minutes. This isn't an arbitrary quota — it reflects the model's assumption that a function is a short-lived reaction to an event, not a long-running process. Anything that needs to hold state across a long computation, maintain a persistent connection (a database connection pool, a WebSocket), or run indefinitely (a queue consumer polling continuously) is structurally the wrong shape for Lambda and belongs on ECS/EKS or EC2 instead.</li>
+</ul>
+
+<div class="callout">
+  <div class="callout-title">Choosing a tier: ask about variance, not just scale</div>
+  <p>The deciding question is rarely "how much traffic" — it's "how predictable and how bursty is the traffic, and how long does one unit of work take?" A steady, high-volume workload with well-understood peak load is usually cheaper and more predictable on EC2 or ECS, because you can right-size capacity and amortize the cost of a warm process across many requests. A spiky, unpredictable, or infrequent workload (a webhook handler invoked a few times an hour, a nightly batch job, an image-resize triggered by uploads) is a natural fit for Lambda, because you pay nothing between invocations and don't need to provision for a peak that rarely arrives. Long-running or stateful processes — anything holding open connections, in-memory caches, or requiring more than 15 minutes — rule Lambda out regardless of traffic shape.</p>
+</div>
+
+<table>
+  <tr><th>Tier</th><th>Unit of deployment</th><th>You manage</th><th>Provider manages</th><th>Natural fit</th></tr>
+  <tr><td>EC2</td><td>Virtual machine</td><td>OS, runtime, process supervision, scaling policy</td><td>Hypervisor, physical hardware</td><td>Custom runtimes, licensed software, full control needs</td></tr>
+  <tr><td>ECS / EKS (EC2 launch type)</td><td>Container on managed host fleet</td><td>Host patching, container image, orchestration config</td><td>Scheduling, restart, service discovery</td><td>Microservices needing K8s primitives, portable workloads</td></tr>
+  <tr><td>ECS / EKS on Fargate</td><td>Container, no visible host</td><td>Container image, resource sizing</td><td>Host entirely, scheduling, orchestration</td><td>Same as above, minus host operations</td></tr>
+  <tr><td>Lambda</td><td>Function code</td><td>Function logic, memory/timeout config</td><td>Everything else: scaling, host, runtime provisioning</td><td>Event-driven, bursty, short-lived (&lt;15 min) work</td></tr>
+</table>
+
+<h2>2. Core Networking: VPC, Subnets, and Firewalls</h2>
+<h3>VPC — your isolated network</h3>
+<p>A Virtual Private Cloud (VPC) is a logically isolated slice of the AWS network, defined by a CIDR block (for example <code>10.0.0.0/16</code>), inside which you place every resource you launch. Nothing inside your VPC is reachable from outside it, and nothing outside is reachable from inside, unless you explicitly wire up a path — an internet gateway, a NAT gateway, a peering connection, a VPN. This "deny by default at the network boundary" posture is the cloud equivalent of putting your servers behind a firewall at a physical data center: isolation is the starting state, and every route in or out is a deliberate decision you can audit.</p>
+
+<h3>Public vs. private subnets</h3>
+<p>A VPC is subdivided into subnets, each pinned to a single availability zone. A subnet is "public" if its route table sends <code>0.0.0.0/0</code> traffic to an internet gateway — meaning resources in it can have a public IP and be reached directly from the internet. A subnet is "private" if it has no such route; its resources can only be reached from within the VPC (or reach the internet outward through a NAT gateway sitting in a public subnet, for things like downloading OS patches, without being reachable inbound).</p>
+<p>Databases, application servers holding sensitive state, and internal caches belong in private subnets as a default posture, not an afterthought. The reasoning is the same principle behind least-privilege access generally: a resource that has no route to or from the public internet cannot be the entry point of an internet-originated attack, no matter what software bug or misconfigured credential might otherwise expose it. The public-facing layer — a load balancer, a bastion host, an API Gateway endpoint — is the only thing that needs a direct internet route, and it acts as the sole choke point you have to harden and monitor.</p>
+
+<h3>Security groups vs. NACLs</h3>
+<p>AWS gives you two layers of firewall, and conflating them is a common source of "why can't this connection get through" debugging sessions.</p>
+<table>
+  <tr><th></th><th>Security Group</th><th>Network ACL</th></tr>
+  <tr><td>Applies at</td><td>Instance / ENI level</td><td>Subnet level</td></tr>
+  <tr><td>Statefulness</td><td>Stateful — a reply to an allowed inbound request is automatically allowed out, no matching outbound rule needed</td><td>Stateless — inbound and outbound rules are evaluated independently; a reply must be explicitly allowed by an outbound rule</td></tr>
+  <tr><td>Rule type</td><td>Allow rules only</td><td>Allow and explicit deny rules</td></tr>
+  <tr><td>Evaluation</td><td>All rules evaluated; most permissive wins</td><td>Rules evaluated in numeric order until a match</td></tr>
+  <tr><td>Typical use</td><td>"This EC2 instance accepts traffic on 443 from the load balancer's security group"</td><td>"Block this specific known-bad CIDR block at the subnet boundary regardless of instance-level rules"</td></tr>
+</table>
+<div class="callout warn">
+  <div class="callout-title">Statefulness is the detail that bites people</div>
+  <p>Because security groups are stateful, you typically only write inbound rules and never think about outbound rules for response traffic — which is correct, but it means people forget NACLs don't work that way. If you add a NACL rule allowing inbound traffic on a port but forget the corresponding outbound rule for ephemeral ports (typically 1024–65535, where the client side of a TCP connection lives), responses get silently dropped at the subnet boundary even though the security group looks completely correct. This is a classic case where the connection is allowed in but the reply can't get out, and nothing about the security group configuration will tell you that — you have to know NACLs are a second, independent, stateless layer to think to check them.</p>
+</div>
+
+<h2>3. Storage: Choosing by Access Pattern, Not by Habit</h2>
+<p>The right storage service is determined by one question: does this data need to be block-level (mounted as a raw device to one machine), shared across many machines as files, or addressed as opaque objects over HTTP? These are genuinely different access patterns, not just marketing tiers of the same thing.</p>
+
+<h3>EBS — block storage, one instance at a time</h3>
+<p>An EBS volume is a virtual hard drive: a block device that attaches to exactly one EC2 instance (with rare multi-attach exceptions for specific clustered filesystems) and persists independently of the instance's lifecycle — you can stop the instance, and the volume's data survives, then reattach it or attach it to a different instance later. This is the right choice for anything that needs low-latency, POSIX-filesystem-backed storage local to a single compute node: a database's data directory, a local write-ahead log, application scratch space. It is not shareable across instances simultaneously in the general case, which is precisely the constraint that motivates EFS.</p>
+
+<h3>EFS — shared network file storage</h3>
+<p>EFS is a managed NFS filesystem that multiple EC2 instances (or containers) can mount concurrently and see the same consistent view of files. Reach for it when several compute nodes genuinely need to read and write the same files — a fleet of web servers sharing uploaded user content, a batch of worker nodes sharing intermediate output, a content-management system's shared media library. The trade-off versus EBS is latency (network-attached, not local block device) and cost per GB, in exchange for the sharing property EBS structurally cannot provide.</p>
+
+<h3>S3 — object storage and its consistency history</h3>
+<p>S3 stores unstructured blobs — images, backups, logs, static assets, data-lake files — addressed by key within a bucket, accessed over HTTP(S), with no filesystem semantics (no partial-file edits, no directory locking) and effectively unlimited scale. It is not a filesystem and not a database; it is closer to a distributed, replicated key-value store for large binary values, which is also why it's the substrate underneath many managed services (EBS snapshots, RDS backups, and Lambda deployment packages all ultimately live on S3-like storage).</p>
+<p>A detail worth understanding precisely rather than glossing over: S3 originally offered <em>eventual consistency</em> for read-after-write on overwrite (PUT to an existing key) and delete operations — you could write a new version of an object and, for a brief window, still read the old version or a 404 from some replicas, because the write had to propagate across S3's internal replication before every read path reflected it. In December 2020, AWS changed this so that S3 provides <strong>strong read-after-write consistency</strong> for all operations, on all objects, in all regions, at no extra cost. This matters historically because a great deal of production code and cautionary folklore ("never immediately read a key you just wrote to S3, retry with backoff") was written against the old model, and that workaround is now unnecessary — but the underlying lesson generalizes far beyond S3: any system with replication has to make an explicit choice about the consistency window between a write landing on one replica and being visible on all of them, and that choice is a design decision with real cost, not an implementation detail you can ignore.</p>
+
+<table>
+  <tr><th>Service</th><th>Storage model</th><th>Shareable across instances</th><th>Access pattern</th><th>Typical use</th></tr>
+  <tr><td>EBS</td><td>Block device</td><td>No (single attach, generally)</td><td>Raw block I/O, filesystem on top</td><td>Database data directory, boot volume</td></tr>
+  <tr><td>EFS</td><td>Network filesystem (NFS)</td><td>Yes, concurrently</td><td>POSIX file operations</td><td>Shared uploads, shared config, worker fleets</td></tr>
+  <tr><td>S3</td><td>Object store</td><td>Yes, via HTTP API</td><td>PUT/GET/DELETE whole objects by key</td><td>Static assets, backups, logs, data lake</td></tr>
+</table>
+
+<h2>4. Managed Databases: RDS and DynamoDB</h2>
+<h3>RDS — what "managed relational database" actually removes from your plate</h3>
+<p>RDS runs a standard relational engine (PostgreSQL, MySQL, MariaDB, or others) but takes over the operational layer that traditionally consumes real engineering time: automated backups and point-in-time recovery, minor-version patching, storage auto-scaling, and — critically — Multi-AZ failover, where a synchronously replicated standby in a second availability zone can be promoted automatically if the primary fails, with the connection endpoint staying the same so applications don't need reconfiguration. None of this changes the relational data model or query semantics you already understand; it changes who gets paged when a disk fills up or a patch needs applying. Self-hosting the same engine on EC2 is entirely possible and sometimes justified (specific extensions, exact version pinning, cost at very large scale) but means you own writing and testing that failover logic yourself.</p>
+
+<h3>DynamoDB — partition keys and the scaling model</h3>
+<p>DynamoDB is a managed NoSQL key-value/document store where every item lives in a partition determined by hashing the item's partition key, and DynamoDB distributes partitions across many physical nodes to scale throughput horizontally. This is the exact same idea covered in <a href="#/database-architecture">database-architecture</a> as sharding — DynamoDB simply performs it for you, transparently, instead of you sharding a relational database by hand across multiple hosts.</p>
+<p>The practical consequence is that your partition key choice determines your scaling ceiling. If a partition key has low cardinality or highly skewed access (an <code>orderStatus</code> field with only a few values, or a single "hot" tenant ID responsible for most traffic), most requests land on the same one or few physical partitions, and you hit that partition's throughput limit long before you hit any table-wide limit — the classic symptom is <code>ProvisionedThroughputExceededException</code> or throttling on a table that looks, in aggregate, nowhere near capacity. Choosing a high-cardinality, access-pattern-uniform partition key (a user ID, a UUID, a composite key) is the DynamoDB equivalent of choosing a good shard key in a hand-rolled sharded relational system, and it's a decision made at table-design time that's expensive to change later, exactly like a sharding key decision.</p>
+
+<div class="callout tip">
+  <div class="callout-title">The general question: what does "managed" buy you?</div>
+  <p>Across RDS, DynamoDB, and every other managed service, the pattern is identical: the provider takes ownership of the operational tasks that don't differentiate your product — failover orchestration, patch management, replication topology, hardware replacement — while you keep ownership of the tasks that do: data modeling, schema/key design, query patterns, capacity planning inputs. Self-hosting is not "wrong," but it means explicitly signing up to own the operational half as well, and that trade-off should be a deliberate choice weighed against your team's actual operational capacity, not a default.</p>
+</div>
+
+<h2>5. IAM: Identity, Roles, and Least Privilege</h2>
+<p>Identity and Access Management (IAM) answers two separate questions that are easy to conflate: <em>who or what is making this request</em> (authentication) and <em>what are they allowed to do</em> (authorization). IAM has three core building blocks:</p>
+<ul>
+  <li><strong>Users</strong> represent a long-lived human or application identity with its own credentials (password, access keys).</li>
+  <li><strong>Roles</strong> represent a set of permissions that can be temporarily <em>assumed</em> by a trusted principal — a human, an application, or (critically) an AWS compute resource itself — producing short-lived credentials that expire automatically.</li>
+  <li><strong>Policies</strong> are JSON documents attached to users, roles, or resources that explicitly enumerate allowed (or denied) actions on specific resources, e.g. <code>s3:GetObject</code> on <code>arn:aws:s3:::my-bucket/*</code>.</li>
+</ul>
+<p>The <strong>principle of least privilege</strong> means granting exactly the permissions a principal needs to do its job and nothing more — not "read/write access to everything" because it's convenient, but "read access to this one bucket prefix" because that's what the code actually does. The value of this isn't abstract hygiene: it bounds the blast radius when something goes wrong. If an application's credentials leak — through a logged stack trace, a misconfigured public repository, a compromised dependency — the damage is limited to whatever that narrow policy permits, rather than to your entire account.</p>
+
+<div class="callout warn">
+  <div class="callout-title">Why an instance role beats an embedded access key</div>
+  <p>Attaching an IAM role to an EC2 instance, ECS task, or Lambda function is preferred over embedding a long-lived access key/secret pair in configuration or environment variables for a specific mechanical reason: a role's credentials are issued automatically to the resource by AWS's metadata service, rotated automatically behind the scenes, and never exist as a static string anyone could accidentally commit to a repository, print in a log line, or leave in a config file that outlives the employee who wrote it. A long-lived access key, by contrast, is a durable secret with no expiry by default — once it leaks, it's valid until someone notices and manually revokes it, which in practice can be months. This is the same "credentials as short-lived, narrowly-scoped tokens rather than durable shared secrets" pattern that shows up in OAuth access tokens and Kubernetes service account tokens — it's a general security pattern, not an AWS-specific quirk.</p>
+</div>
+
+<h2>6. Auto Scaling Groups and Load Balancers</h2>
+<p>Horizontal scaling — adding more instances rather than making one instance bigger — is the concept covered generically in <a href="#/hld-basics-scaling">hld-basics-scaling</a>; AWS's concrete implementation of it is the pairing of an Auto Scaling Group (ASG) with an Elastic Load Balancer (ELB).</p>
+<p>An ASG maintains a fleet of EC2 instances (or, indirectly, ECS tasks via Service Auto Scaling) between a minimum and maximum count, launching new instances from a template when a scaling policy's trigger fires — commonly average CPU utilization crossing a threshold, a custom CloudWatch metric like queue depth, or a scheduled action anticipating a known traffic pattern. Crucially, the ASG also performs the inverse: it terminates instances when demand drops, which is the mechanism that actually realizes the cost benefit of elastic infrastructure — capacity that shrinks back down instead of a fleet sized permanently for peak load.</p>
+<p>A Load Balancer (an Application Load Balancer for HTTP/HTTPS traffic, or a Network Load Balancer for raw TCP/UDP at very high throughput or when a static IP is required) sits in front of the ASG's instances and distributes incoming requests across whichever instances are currently healthy. The load balancer performs periodic health checks — an HTTP request to a configured path expecting a specific status code — and stops routing traffic to any instance that fails enough consecutive checks, which is what lets an ASG replace a crashed or degraded instance without that instance ever receiving traffic it can't serve. This pairing — dynamic fleet sizing plus health-aware traffic distribution — is what makes horizontal scaling operationally real rather than theoretical: it's not enough to be able to add capacity, the system also has to detect which capacity is currently healthy and route only to that.</p>
+
+<h2>7. Closing the Loop: Managed Services and Resilience/Observability</h2>
+<p>A theme runs through every service covered above: a meaningful fraction of what would otherwise be custom-built resilience and observability tooling comes bundled into the managed service by default. RDS Multi-AZ gives you cross-availability-zone failover without writing failover orchestration yourself. An ALB's health checks give you the failure-detection half of a circuit breaker pattern at the infrastructure layer, before a single line of application-level resilience code runs. CloudWatch automatically collects CPU, memory (with the agent installed), request counts, and latency metrics for most of these services without instrumenting your own code. ASGs replacing unhealthy instances is a form of automatic self-healing that, self-hosted, you'd have to build with your own supervisor process and health-check loop.</p>
+<p>This doesn't eliminate the need for the practices in <a href="#/observability-production">observability-production</a> — you still need application-level tracing, structured logs, and business-level metrics that no infrastructure service can infer on your behalf — but it does mean part of the resilience and observability burden is already handled at the platform layer, and recognizing which part is the difference between duplicating effort and correctly layering your own instrumentation on top of what the platform already gives you for free.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does Lambda have both a cold-start problem and a maximum execution time, and are these related?</summary>
+<div class="qa-body">They stem from the same underlying model but are independent mechanics. Cold start exists because Lambda has no dedicated server sitting idle waiting for your traffic — an execution environment (essentially a lightweight container plus your runtime and code) is provisioned on demand the first time it's needed, or whenever concurrency needs to increase beyond currently-warm environments, and that provisioning takes real time, especially for runtimes like the JVM that do meaningful work at class-load and JIT-warm-up time. The 15-minute execution cap is a separate, deliberate constraint reflecting Lambda's design as a reaction to discrete events rather than a long-running process host; it exists so AWS can reclaim and reuse execution environments predictably and so the billing/scheduling model stays simple. You can have a cold start with a fast function (cold start dominates total latency) or a warm function that still can't run past 15 minutes (a long batch job that needs Fargate or EC2 instead) — the two constraints solve different problems and you can hit either independently of the other.</div>
+</details>
+
+<details class="concept-qa">
+<summary>A DynamoDB table is well within its overall provisioned/on-demand capacity but requests are still being throttled. What's the likely cause and why does aggregate capacity not protect against it?</summary>
+<div class="qa-body">The likely cause is a poorly chosen partition key causing a "hot partition" — DynamoDB physically splits a table's data and throughput across multiple partitions based on hashing the partition key, and each individual partition has its own throughput ceiling regardless of how much headroom exists table-wide. If one partition key value (or a small set of them) receives a disproportionate share of reads or writes, that specific partition can be throttled while the table's aggregate consumed capacity looks moderate. This mirrors sharding in a hand-rolled relational system: a shard key with skewed cardinality creates a hot shard even if the cluster overall has spare capacity, because load isn't actually distributed the way the aggregate number implies. The fix is the same in both cases — choose a key with high cardinality and access patterns spread roughly evenly across values, not just a key that's technically unique.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is it considered a mistake to place a database directly in a public subnet, even if its security group only allows connections from the application servers?</summary>
+<div class="qa-body">Defense in depth: a security group is a single layer of control, and relying on it alone means a database's actual protection depends entirely on that one configuration never being loosely set — a wildcard rule added temporarily for debugging and forgotten, an overly broad CIDR range, or a future engineer widening the rule without realizing the implication. Placing the database in a private subnet with no route to an internet gateway removes the network path entirely, so even a misconfigured security group cannot expose the database to the public internet, because there is no way to reach it from outside the VPC in the first place. This is the same reasoning behind least-privilege IAM policies: don't rely on a single access-control layer being perfectly maintained forever when a structural constraint can make an entire class of mistake impossible.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What's the actual difference between a security group and a network ACL, beyond "one is stateful and one isn't" — why does that distinction matter mechanically?</summary>
+<div class="qa-body">Statefulness determines whether the return leg of a connection needs its own explicit rule. A security group tracks the state of a connection: if you allow an inbound request on port 443, the corresponding outbound response is automatically permitted without any outbound rule at all, because the security group recognizes it as part of an already-permitted flow. A NACL has no such memory — it evaluates every packet against its inbound and outbound rule lists independently, so allowing inbound traffic on 443 does nothing for the response traffic; you also need an outbound rule allowing traffic on the client's ephemeral port range. This means the two layers are not redundant copies of the same idea — they operate on genuinely different semantics — and debugging a "connection refused" or a silently dropped connection sometimes requires checking both, because a NACL misconfiguration can break a data flow that looks entirely correct at the security-group layer.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Given a workload description, how would you reason through which compute tier (EC2, ECS/EKS, Lambda) fits?</summary>
+<div class="qa-body">Start with three questions rather than jumping to a default. First, how long does a single unit of work take, and is there a hard ceiling — anything approaching or exceeding 15 minutes, or requiring a persistent connection/in-memory state across invocations, rules out Lambda structurally. Second, how variable is the load — steady, well-understood traffic favors EC2 or ECS because you can right-size capacity and amortize a warm process's startup cost across many requests, while bursty, infrequent, or unpredictable traffic favors Lambda because you avoid paying for idle capacity between events. Third, how much do you need control over the runtime itself — a specific kernel module, licensed software, or unusual resource isolation needs pushes toward EC2, while a standard containerized service with no such requirement is a good fit for ECS/EKS (particularly on Fargate, to avoid host management even in the container tier). None of these tiers is strictly "better" — they represent different points on the same control-versus-overhead trade-off, and the right answer depends on the shape of the specific workload's traffic and runtime needs.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why did S3's move to strong read-after-write consistency matter, and what does it teach about consistency in replicated systems generally?</summary>
+<div class="qa-body">Before this change, S3 replicated objects across multiple internal storage nodes for durability, and a read immediately following a write to an existing key could be served by a replica that hadn't yet received the update — producing a stale read or even a transient 404. Applications had to work around this with patterns like retrying reads with backoff or avoiding immediate read-after-overwrite entirely. AWS's engineering change made every read reflect the latest completed write across all replicas immediately, eliminating that workaround's necessity. The broader lesson is that consistency is never free in a replicated system — someone has to pay for it, either as write latency (waiting for replication to complete before acknowledging the write) or as engineering complexity in the client (handling staleness explicitly). S3's history is a concrete instance of a system moving that cost from "every client must handle staleness" to "the write path absorbs slightly more coordination cost," which is the same trade-off that shows up whenever you choose between synchronous and asynchronous replication in any database.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is an EBS volume the wrong choice for data that needs to be accessed by multiple EC2 instances at once, and what would actually break if you tried?</summary>
+<div class="qa-body">EBS presents a raw block device to a single instance, and the filesystem built on top of it (ext4, XFS, etc.) assumes it has exclusive ownership of that device's metadata — inode tables, free-space bitmaps, journal state. If two instances mounted the same volume as a normal filesystem simultaneously, each would maintain its own in-memory view of that metadata and write changes without knowledge of the other's changes, leading to filesystem corruption: overwritten inodes, files that appear in one instance's directory listing but not the other's, or a corrupted journal after a crash. This is a locking and cache-coherency problem, not a permissions problem — allowing the attachment doesn't solve it. EFS is built to solve exactly this by implementing NFS locking and coherency protocols so multiple clients can safely see a consistent view of the same files concurrently, which is the actual capability multi-instance access requires.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+  <div class="related-card" onclick="window.location.hash='/hld-basics-scaling'">
+    <div class="rc-title">HLD Basics: Scaling</div>
+    <div class="rc-sub">Bonus · Auto Scaling Groups and ELBs are the concrete AWS implementation of horizontal scaling</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/docker-kubernetes'">
+    <div class="rc-title">Docker &amp; Kubernetes</div>
+    <div class="rc-sub">Bonus · EKS is managed Kubernetes; ECS mirrors the same orchestration concepts with its own primitives</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/database-architecture'">
+    <div class="rc-title">Database Architecture</div>
+    <div class="rc-sub">Bonus · DynamoDB's partition-key model is managed sharding; RDS externalizes replication and failover</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/observability-production'">
+    <div class="rc-title">Observability in Production</div>
+    <div class="rc-sub">Bonus · Managed services provide built-in health checks and metrics that reduce, but don't replace, your own instrumentation</div>
+  </div>
+</div>

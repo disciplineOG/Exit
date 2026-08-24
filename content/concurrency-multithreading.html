@@ -1,0 +1,226 @@
+<p class="topic-breadcrumb">Phase 1 — Foundation & Low-Level Mastery · Days 16–20 · Java / LLD</p>
+<h1>Multithreading, Concurrency & Virtual Threads</h1>
+<div class="topic-tags">
+<span class="tag">Thread Lifecycle</span>
+<span class="tag">Java Memory Model</span>
+<span class="tag">synchronized / volatile</span>
+<span class="tag">Locks & Executors</span>
+<span class="tag">CompletableFuture</span>
+<span class="tag">Deadlock & Races</span>
+<span class="tag">Virtual Threads</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>A production service that "randomly" corrupts a counter under load, or that deadlocks once a week under specific traffic patterns, is almost never a logic bug — it's a missing happens-before edge or a lock-ordering mistake that only surfaces under real concurrency. You cannot reason about whether code is thread-safe by reading it top to bottom the way you read sequential code; you have to reason about which memory effects are guaranteed visible across threads and in what order. That reasoning is what the Java Memory Model gives you, and it's also the model you need to correctly judge when virtual threads actually help versus when they silently reproduce the same bottleneck with a different name.</p>
+</div>
+
+<h2>1. Thread Lifecycle</h2>
+<p>A <code>java.lang.Thread</code> moves through a small state machine, exposed directly via <code>Thread.getState()</code> as the enum <code>Thread.State</code>. Understanding the exact transitions matters because tools like thread dumps, profilers, and deadlock detectors report exactly these states, and misreading them leads to wrong diagnoses (e.g., confusing "waiting on a lock" with "waiting on a condition").</p>
+<table>
+<tr><th>State</th><th>Meaning</th><th>How you enter it</th><th>How you leave it</th></tr>
+<tr><td>NEW</td><td>Thread object created, not yet started</td><td><code>new Thread(...)</code></td><td><code>start()</code> is called → RUNNABLE</td></tr>
+<tr><td>RUNNABLE</td><td>Eligible to run; may actually be running or waiting for CPU</td><td><code>start()</code>, or returning from a blocking/waiting state</td><td>Blocks on a monitor, calls a wait/sleep/join, or finishes</td></tr>
+<tr><td>BLOCKED</td><td>Waiting to acquire an object's intrinsic (monitor) lock</td><td>Entering a <code>synchronized</code> block/method held by another thread</td><td>Lock becomes available and this thread acquires it</td></tr>
+<tr><td>WAITING</td><td>Waiting indefinitely for another thread's explicit action</td><td><code>Object.wait()</code> (no timeout), <code>Thread.join()</code> (no timeout), <code>LockSupport.park()</code></td><td>Another thread calls <code>notify()</code>/<code>notifyAll()</code>, the joined thread finishes, or <code>unpark()</code></td></tr>
+<tr><td>TIMED_WAITING</td><td>Waiting for another thread's action, or for a fixed duration</td><td><code>Thread.sleep(ms)</code>, <code>wait(ms)</code>, <code>join(ms)</code>, <code>LockSupport.parkNanos</code></td><td>Timeout elapses, or notified/interrupted early</td></tr>
+<tr><td>TERMINATED</td><td>Run method has completed or thrown</td><td><code>run()</code> returns or an uncaught exception propagates out</td><td>Terminal — cannot be restarted</td></tr>
+</table>
+
+<div class="callout warn">
+<div class="callout-title">BLOCKED vs WAITING is a common misdiagnosis</div>
+<p>BLOCKED specifically means "contending for a monitor lock on a <code>synchronized</code> entry" — the JVM itself is arbitrating. WAITING/TIMED_WAITING means the thread voluntarily parked itself and is depending on <em>another thread</em> to wake it up (a missed <code>notify()</code> here causes a permanent hang, not a lock contention issue). When you read a thread dump and see many threads BLOCKED on the same monitor, that's raw contention — reduce critical section size or lock granularity. When you see many threads WAITING on the same object, look for whether something is actually going to call <code>notifyAll()</code> — a common bug is calling <code>notify()</code> (wakes one arbitrary waiter) when multiple distinct conditions are being waited on, causing spurious permanent stalls of the "wrong" waiter.</p>
+</div>
+
+<h2>2. The Java Memory Model (JMM)</h2>
+<h3>Why it has to exist</h3>
+<p>Without a memory model, "thread A writes a field, thread B reads it" would have no defined outcome. Two independent forces make naive shared-memory reasoning wrong on real hardware:</p>
+<ul>
+<li><strong>Compiler/JIT reordering:</strong> the compiler is free to reorder, hoist, or eliminate memory operations that have no observable effect on the single thread executing them — it has no idea another thread might observe the intermediate state.</li>
+<li><strong>CPU and cache reordering:</strong> each core has its own L1/L2 cache and store buffers; a write by core 0 does not become visible to core 1 the instant it happens. Store buffers let a CPU continue past a write it hasn't yet flushed to shared cache/memory, and CPUs execute out of order and speculatively.</li>
+</ul>
+<p>The JMM (JSR-133, formalized for Java 5+) is a contract: it defines which reorderings are legal and, crucially, defines <strong>happens-before</strong> — a partial ordering across actions (possibly on different threads) such that if action X happens-before action Y, X's effects (including all writes made before it, not just the specific variable) are guaranteed visible to Y. Without an explicit happens-before edge between a write and a read, the JVM and hardware are free to let the reader never observe the write, observe it late, or observe writes out of the order they were issued — this is not a hypothetical, it happens routinely under JIT optimization and multi-socket cache coherency delays.</p>
+
+<h3>Sources of happens-before</h3>
+<table>
+<tr><th>Rule</th><th>Guarantee</th></tr>
+<tr><td>Program order</td><td>Within a single thread, each action happens-before every subsequent action in that thread (as observed by that thread)</td></tr>
+<tr><td>Monitor lock</td><td>An <code>unlock</code> on a monitor happens-before every subsequent <code>lock</code> on that <em>same</em> monitor by any thread</td></tr>
+<tr><td>volatile</td><td>A write to a volatile field happens-before every subsequent read of that same field</td></tr>
+<tr><td>Thread.start()</td><td>Happens-before any action in the started thread</td></tr>
+<tr><td>Thread termination</td><td>Every action in a thread happens-before another thread successfully returns from <code>join()</code> on it</td></tr>
+<tr><td>final fields</td><td>Correctly constructed final fields are visible to all threads after the constructor completes, without synchronization, <em>provided the reference doesn't escape during construction</em></td></tr>
+<tr><td>Transitivity</td><td>If A happens-before B and B happens-before C, then A happens-before C</td></tr>
+</table>
+
+<div class="callout">
+<div class="callout-title">Reordering is legal in the absence of these edges</div>
+<p>If thread A writes plain fields <code>x = 1; y = 2;</code> and thread B reads <code>y</code> then <code>x</code> with no synchronization between them, the JMM permits B to see <code>y == 2, x == 0</code> — the write to <code>x</code> reordered past the write to <code>y</code> from B's perspective, or B's cache simply hasn't received the update to <code>x</code> yet. This is exactly why "it worked in my manual testing" tells you nothing about correctness under the JMM; reordering bugs are timing- and hardware-dependent and can lie dormant for a long time before a different JIT compilation or CPU triggers them.</p>
+</div>
+
+<h2>3. synchronized — Intrinsic Locking</h2>
+<p>Every Java object has an associated monitor (intrinsic lock). <code>synchronized(obj) { ... }</code> or a <code>synchronized</code> instance method (locks on <code>this</code>) or static method (locks on the <code>Class</code> object) does two things atomically as a pair: it acquires the monitor before entering, and — critically — establishes the happens-before edge described above, and it releases the monitor on exit, including via exception, which is what makes it exception-safe compared to manual lock/unlock without try/finally.</p>
+<h3>Reentrancy</h3>
+<p>Intrinsic locks are reentrant: if a thread already holds the monitor for object <code>o</code>, it can enter another <code>synchronized(o)</code> block without blocking on itself. The JVM tracks a per-thread hold count on the monitor; each entry increments it, each exit decrements it, and the lock is only actually released at count zero. This is what makes it safe for a synchronized method to call another synchronized method on the same object (directly, or indirectly through overriding) without self-deadlocking.</p>
+<h3>Locking escalation (historical JVM internals)</h3>
+<p>HotSpot historically optimized intrinsic locks through three tiers, escalating only under contention, because most locks in real programs are never actually contended:</p>
+<ul>
+<li><strong>Biased locking:</strong> if a lock is only ever acquired by one thread, the JVM "biases" the object's mark word toward that thread so re-acquisition is just a cheap check, no CAS. Biased locking was disabled by default and then removed in JDK 15+ (JEP 374) because modern JIT escape analysis and lock elision made it deliver little benefit while adding complexity to the safepoint machinery needed to revoke a bias.</li>
+<li><strong>Lightweight (thin) locking:</strong> under light, non-overlapping contention, acquisition is done via a compare-and-swap on the object header — no OS-level mutex, no thread suspension.</li>
+<li><strong>Heavyweight locking:</strong> under real contention (a thread finds the lock already CAS'd by another), the lock "inflates" to an OS-level monitor, and losing threads are actually suspended by the OS scheduler and placed on a wait queue, which is far more expensive (a syscall, a context switch) than the CAS path.</li>
+</ul>
+<p>The practical takeaway is not the tier names but the shape of the cost curve: uncontended synchronized is nearly free on modern JVMs; contended synchronized gets expensive fast because of OS-level suspension/wakeup, which is exactly the cost profile that motivates minimizing critical-section size and, later, motivates virtual threads' different scheduling model.</p>
+
+<h2>4. volatile — Visibility Without Atomicity</h2>
+<p>A <code>volatile</code> field gives you the happens-before guarantee from the table above (every read sees the latest write) and prevents the compiler/CPU from reordering accesses to it relative to surrounding code (it acts as a memory barrier). What it does <strong>not</strong> give you is atomicity for compound operations. <code>counter++</code> on a volatile <code>int</code> is read-modify-write — three separate steps — and two threads can each read the same value before either writes back, losing an increment. Visibility of the latest value doesn't help if the very act of computing the next value isn't atomic.</p>
+<div class="callout warn">
+<div class="callout-title">The double-checked-locking bug without volatile</div>
+<p>The classic broken singleton:</p>
+<pre><code>class Singleton {
+    private static Singleton instance;
+    static Singleton getInstance() {
+        if (instance == null) {                 // 1st check, no lock
+            synchronized (Singleton.class) {
+                if (instance == null) {          // 2nd check, locked
+                    instance = new Singleton();  // BUG if field isn't volatile
+                }
+            }
+        }
+        return instance;
+    }
+}</code></pre>
+<p>The bug: <code>new Singleton()</code> is not one atomic step. It decomposes into (a) allocate memory, (b) run the constructor to initialize fields, (c) assign the reference into <code>instance</code>. Without <code>volatile</code>, the JIT/CPU may reorder (b) and (c) — a second thread reading <code>instance</code> outside the lock (the first, unlocked check) can observe a non-null reference whose constructor hasn't finished running, and dereference a half-initialized object. Declaring the field <code>private static volatile Singleton instance;</code> forbids that reordering and publishes the fully-constructed object safely. This is precisely why the JMM's rules about reordering aren't academic — this bug produced real, hard-to-reproduce <code>NullPointerException</code>s and corrupted state in JVMs before JSR-133 (Java 5) even for developers who used volatile, because the pre-2004 memory model didn't guarantee this case was fixed by volatile at all.</p>
+</div>
+
+<h2>5. Explicit Locks and ReadWriteLock</h2>
+<p><code>java.util.concurrent.locks.ReentrantLock</code> gives you everything <code>synchronized</code> gives (reentrancy, mutual exclusion, and the same happens-before guarantee on lock/unlock) plus capabilities the language keyword structurally cannot offer, because <code>synchronized</code> is block-scoped and unconditional:</p>
+<table>
+<tr><th>Capability</th><th>synchronized</th><th>ReentrantLock</th></tr>
+<tr><td>Try to acquire without blocking</td><td>No</td><td><code>tryLock()</code>, or with a timeout <code>tryLock(time, unit)</code></td></tr>
+<tr><td>Interruptible acquisition</td><td>No — a thread blocked on a monitor ignores interrupts</td><td><code>lockInterruptibly()</code> — throws <code>InterruptedException</code> if interrupted while waiting</td></tr>
+<tr><td>Fairness policy</td><td>No — JVM decides who gets the lock, can starve waiters</td><td><code>new ReentrantLock(true)</code> approximates FIFO ordering, at a throughput cost</td></tr>
+<tr><td>Multiple wait-sets per lock</td><td>No — one implicit condition per monitor</td><td><code>newCondition()</code> — separate <code>await()</code>/<code>signal()</code> queues for distinct wait conditions</td></tr>
+<tr><td>Must release in <code>finally</code></td><td>Automatic on block exit</td><td>Manual — forgetting <code>finally { lock.unlock(); }</code> leaks the lock permanently</td></tr>
+</table>
+<p><code>ReadWriteLock</code> (typically <code>ReentrantReadWriteLock</code>) splits a lock into a shared read lock and an exclusive write lock: any number of readers can hold the read lock concurrently as long as no writer holds the write lock, and a writer excludes all readers and other writers. This is a meaningful win specifically for read-heavy, write-rare workloads (a cache, a configuration snapshot) — under `synchronized`, every read serializes behind every other read even though reads don't conflict with each other; under a read-write lock, only reads-vs-writes and writes-vs-writes serialize.</p>
+
+<h2>6. The Executors Framework</h2>
+<p>Manually managing <code>Thread</code> objects doesn't scale: thread creation is expensive (each platform thread reserves a stack, typically 512KB–1MB, and maps to an OS thread), so unbounded thread creation under load exhausts memory and OS scheduling capacity long before it exhausts CPU. The executor framework decouples "submitting a task" from "how and when it runs" via <code>ExecutorService</code>.</p>
+<table>
+<tr><th>Factory</th><th>Backing pool</th><th>Behavior</th></tr>
+<tr><td><code>newFixedThreadPool(n)</code></td><td>Fixed core/max size <code>n</code></td><td>Unbounded <code>LinkedBlockingQueue</code> by default — tasks queue indefinitely if all <code>n</code> threads are busy</td></tr>
+<tr><td><code>newCachedThreadPool()</code></td><td>0 core, effectively unbounded max, 60s idle keep-alive</td><td>Creates a new thread per task if none idle; can spawn unbounded threads under a burst</td></tr>
+<tr><td><code>newSingleThreadExecutor()</code></td><td>1 thread</td><td>Strict sequential execution, unbounded queue in front of it</td></tr>
+<tr><td><code>newScheduledThreadPool(n)</code></td><td>Fixed size</td><td>Supports <code>schedule</code>, <code>scheduleAtFixedRate</code>, <code>scheduleWithFixedDelay</code></td></tr>
+</table>
+<div class="callout warn">
+<div class="callout-title">Fixed pool + unbounded queue is a slow-motion outage</div>
+<p><code>Executors.newFixedThreadPool(n)</code> uses an unbounded <code>LinkedBlockingQueue</code>. If the arrival rate of tasks exceeds the rate the <code>n</code> threads can drain them — even briefly, during a downstream slowdown — tasks queue up rather than being rejected. The pool never grows beyond <code>n</code> threads (there's no backpressure signal), memory grows unbounded holding queued task objects and whatever they closed over, and latency for queued tasks grows without limit even after the surge passes, because the queue has to drain in FIFO order. The fix is to construct the pool manually with <code>ThreadPoolExecutor</code>, use a <em>bounded</em> queue (e.g., <code>ArrayBlockingQueue</code>), and supply a <code>RejectedExecutionHandler</code> (such as <code>CallerRunsPolicy</code> to apply backpressure onto the submitting thread, or a custom handler that fails fast) so that overload becomes a visible, bounded failure instead of an invisible, unbounded memory and latency leak. This composes directly with <a href="#/resilience-fault-tolerance">bulkheading</a> — sizing and isolating pools per dependency is exactly how you stop one slow downstream call from exhausting a shared thread pool.</p>
+</div>
+
+<h2>7. CompletableFuture — Composable Asynchronous Pipelines</h2>
+<p><code>CompletableFuture&lt;T&gt;</code> represents a value that will exist in the future and lets you chain transformations without blocking the calling thread to wait for each step. The combinator you pick determines both the shape of composition and, less obviously, which thread runs the callback.</p>
+<table>
+<tr><th>Method</th><th>Signature shape</th><th>Use when</th></tr>
+<tr><td><code>thenApply(fn)</code></td><td><code>T -> U</code>, synchronous transform</td><td>You have a plain value-to-value transformation, no further async call</td></tr>
+<tr><td><code>thenCompose(fn)</code></td><td><code>T -> CompletableFuture&lt;U&gt;</code></td><td>The next step is itself another async operation — this flattens nested futures instead of producing a <code>CompletableFuture&lt;CompletableFuture&lt;U&gt;&gt;</code>. This is the async analog of <code>flatMap</code>, and <code>thenApply</code> is the analog of <code>map</code>.</td></tr>
+<tr><td><code>thenCombine(other, fn)</code></td><td><code>(T, U) -> V</code> across two independent futures</td><td>You need to fan out two independent async calls and merge their results once both complete</td></tr>
+<tr><td><code>exceptionally(fn)</code></td><td><code>Throwable -> T</code></td><td>Recover from a failure by supplying a fallback value; does not run if the pipeline succeeded</td></tr>
+<tr><td><code>handle(fn)</code></td><td><code>(T, Throwable) -> U</code></td><td>Runs unconditionally, on both success and failure — the only combinator that always sees both branches, useful for logging or converting to a result-wrapper type regardless of outcome</td></tr>
+</table>
+<p>Thread affinity is the part that trips people up. A callback attached with the plain (no-<code>Async</code>) variant — <code>thenApply</code>, <code>thenCompose</code>, <code>thenCombine</code> — runs on whichever thread completed the preceding stage: if the future was already complete when you attached the callback, it runs on the calling thread synchronously; if it completes later, it runs on the thread that called <code>complete()</code>/finished the async task, which for futures built from <code>supplyAsync</code> is a thread from the common <code>ForkJoinPool</code> by default. Appending <code>Async</code> to any of these (<code>thenApplyAsync</code>, etc.) submits the callback as a new task to the common pool (or to an explicit <code>Executor</code> you pass as the last argument), guaranteeing it doesn't run inline on the completing thread. This matters when the completing thread is one you don't want blocked or reused for unrelated work — for example, never do blocking I/O inside a plain <code>thenApply</code> chained off a Netty event-loop-backed future, because you'd be blocking the very thread responsible for driving I/O completion for other requests.</p>
+
+<h2>8. Classic Concurrency Hazards</h2>
+<h3>Race condition</h3>
+<p>Any situation where the correctness of a result depends on the relative timing of threads. Example: two threads both execute <code>if (map.get(key) == null) map.put(key, compute());</code> — both can see <code>null</code>, both compute, and one overwrites the other's work (or worse, two different instances end up live if the value is stateful). Fix: use an atomic check-and-set primitive — <code>ConcurrentHashMap.computeIfAbsent(key, k -> compute())</code> — which performs the check and insert atomically under the map's internal per-bucket locking, rather than composing two separate calls in application code.</p>
+<h3>Deadlock and the Coffman conditions</h3>
+<p>Deadlock requires all four of these simultaneously; breaking any one prevents it:</p>
+<ol>
+<li><strong>Mutual exclusion:</strong> a resource can only be held by one thread at a time.</li>
+<li><strong>Hold and wait:</strong> a thread holds one resource while blocked waiting for another.</li>
+<li><strong>No preemption:</strong> a held resource can't be forcibly taken away; it's only released voluntarily.</li>
+<li><strong>Circular wait:</strong> a cycle of threads exists, each waiting for a resource held by the next.</li>
+</ol>
+<pre><code>// Thread A                          // Thread B
+synchronized (accountA) {            synchronized (accountB) {
+    synchronized (accountB) {            synchronized (accountA) {
+        transfer(accountA, accountB);        transfer(accountB, accountA);
+    }                                     }
+}                                     }
+// A holds accountA, waits for accountB.
+// B holds accountB, waits for accountA. Circular wait -> deadlock.</code></pre>
+<p>The standard prevention technique is <strong>lock ordering</strong>: define a total order over lock acquisition (e.g., always lock the account with the smaller <code>accountId</code> first, regardless of which side of the transfer it's on) so that circular wait becomes structurally impossible — every thread acquires locks in the same global sequence, so no cycle can form. <code>tryLock</code> with a timeout is a complementary defense: if a thread can't acquire a second lock within a bound, it releases what it holds and retries, which breaks "no preemption" at the cost of needing retry logic.</p>
+<h3>Livelock</h3>
+<p>Threads are not blocked — they're actively running — but they keep changing state in response to each other without making progress. Classic analogy: two people in a hallway both stepping aside in the same direction repeatedly. In code, this happens when a deadlock-avoidance retry policy is too symmetric: both threads detect potential contention, both back off, both retry at the same moment, indefinitely. Fix: introduce randomized backoff (jitter) so retries desynchronize.</p>
+<h3>Starvation</h3>
+<p>A thread is perpetually denied access to a resource because other threads are repeatedly favored — for example, a non-fair lock or a naive priority scheduler that always favors higher-priority threads can leave a low-priority thread waiting indefinitely even though it's never technically deadlocked. Fix: fairness policies (<code>new ReentrantLock(true)</code>), or bounding how long any single thread can hold a heavily-contended resource.</p>
+
+<h2>9. Java 21 Virtual Threads and Structured Concurrency</h2>
+<h3>The problem platform threads have</h3>
+<p>A platform thread is a thin wrapper around an OS thread: 1:1 mapping, an OS-allocated stack (hundreds of KB to a few MB), and OS-level context switches. This caps realistic concurrency at a few thousand live threads before scheduling overhead and memory dominate. For I/O-bound workloads — a typical web service thread that spends most of its time waiting on a database or downstream HTTP call — the platform thread sits idle, fully allocated, for the entire wait, so the practical throughput ceiling of a thread-per-request server becomes "thread pool size," not actual CPU capacity.</p>
+<h3>How virtual threads solve it</h3>
+<p>A virtual thread (JEP 444, finalized in Java 21) is a <code>Thread</code> instance scheduled by the JVM rather than the OS. It is <strong>mounted</strong> onto a small pool of <strong>carrier</strong> platform threads (by default sized to the number of CPU cores, backed by a <code>ForkJoinPool</code> in FIFO mode) only while it has actual CPU work to do. When a virtual thread performs a blocking operation that the JDK has been updated to recognize — socket I/O, <code>Thread.sleep</code>, <code>java.util.concurrent</code> lock acquisition, JDBC calls in drivers that support it — the JVM <strong>unmounts</strong> it from its carrier: it parks the virtual thread's continuation (its captured stack state) as a heap object, frees the carrier thread to mount and run a different virtual thread, and later remounts the original virtual thread (possibly onto a different carrier) once the blocking operation completes. The stack of a virtual thread lives largely on the heap in small growable chunks rather than as a fixed OS stack reservation, which is what makes millions of them viable in memory where thousands of platform threads would exhaust it.</p>
+<div class="callout tip">
+<div class="callout-title">The mental model: cheap, not fast</div>
+<p>Virtual threads don't make any individual piece of code run faster — a CPU-bound loop takes exactly as long on a virtual thread as a platform thread, because while it's running it's mounted on a real carrier consuming a real core. What they change is the cost of <em>waiting</em>: instead of one blocked OS thread per in-flight request, you get near-zero-cost parking, so you can have hundreds of thousands of requests concurrently "waiting" on I/O for the cost of a heap object each, while a small fixed number of carrier threads keeps the CPU busy running whichever virtual threads currently have work to do.</p>
+</div>
+<h3>When they help and when they don't</h3>
+<table>
+<tr><th>Workload</th><th>Virtual threads</th><th>Why</th></tr>
+<tr><td>High-concurrency, I/O-bound (many requests each mostly waiting on network/disk)</td><td>Large win</td><td>Removes the thread-count ceiling; write simple synchronous, thread-per-request code and get the concurrency of a reactive system without the callback-based programming model</td></tr>
+<tr><td>CPU-bound (parsing, hashing, in-memory computation, ML inference)</td><td>No benefit</td><td>There's no idle waiting to eliminate — you're still bounded by the number of physical cores; virtual threads add scheduling overhead for zero gain</td></tr>
+<tr><td>Code with <code>synchronized</code> blocks around blocking calls</td><td>Can be actively worse</td><td>See pinning below</td></tr>
+</table>
+<h3>Carrier pinning — the trap</h3>
+<p>If a virtual thread blocks <em>while holding a monitor acquired via <code>synchronized</code></em> (not <code>ReentrantLock</code>), the JVM cannot safely unmount it — the continuation-capture mechanism doesn't (pre-JDK 24) know how to suspend a thread mid-monitor-hold and resume it possibly on a different OS thread while preserving native monitor semantics. The virtual thread stays <strong>pinned</strong> to its carrier for the duration of the blocking call. If enough virtual threads pin their carriers simultaneously (e.g., a hot code path wraps a JDBC call in a legacy <code>synchronized</code> method), you can exhaust the small, fixed carrier pool and effectively serialize everything behind it — which is worse than not adopting virtual threads at all, because the failure mode looks like a mysterious throughput cliff rather than an obvious thread-pool-exhaustion error. The practical fix is replacing <code>synchronized</code> around any blocking operation with <code>ReentrantLock</code>, which is compose-friendly with virtual thread unmounting. You can detect pinning with <code>-Djdk.tracePinnedThreads=full</code>, which logs a stack trace every time a virtual thread pins its carrier.</p>
+<h3>Structured concurrency</h3>
+<p>Plain <code>ExecutorService.submit</code> calls for a group of related subtasks have no structural relationship — if one fails, the others keep running unless you write explicit cancellation plumbing, and error handling means manually collecting exceptions from each future. Structured concurrency (incubating via <code>StructuredTaskScope</code>) treats a set of forked subtasks as a single unit of work with a defined lifetime: they're forked within a scope, the scope's <code>join()</code> waits for completion according to a policy, and exiting the scope (including via exception) guarantees every subtask forked within it has either completed or been cancelled — no subtask can outlive the block that spawned it. This eliminates a specific class of bug where a cancelled or failed parent operation leaves orphaned child tasks still running and consuming resources.</p>
+<pre><code>try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    Supplier&lt;User&gt; userTask = scope.fork(() -> fetchUser(id));
+    Supplier&lt;Orders&gt; orderTask = scope.fork(() -> fetchOrders(id));
+
+    scope.join();           // waits for both, or returns early on first failure
+    scope.throwIfFailed();  // propagates the failure if either task failed
+
+    // Both succeeded — safe to use both results.
+    return render(userTask.get(), orderTask.get());
+} // scope close cancels any still-running fork automatically on the way out</code></pre>
+<p><code>ShutdownOnFailure</code> cancels sibling subtasks as soon as one fails, propagating a single well-defined exception instead of leaving the failure to surface later, disconnected from its cause, when something eventually calls <code>.get()</code> on an orphaned future. This is the same instinct as fail-fast error propagation in <a href="#/resilience-fault-tolerance">resilience patterns</a> — don't let a failed dependency's siblings keep doing wasted or inconsistent work.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+<details class="concept-qa">
+<summary>Why does a volatile field prevent the double-checked-locking bug, when volatile doesn't make the constructor itself atomic?</summary>
+<div class="qa-body">Volatile doesn't need to make construction atomic — it needs to prevent the <em>publication</em> of a partially-constructed object from being reordered ahead of the constructor finishing. Without volatile, the JIT/CPU can reorder "assign the reference into the field" ahead of "finish running the constructor," because those are two independent memory operations from the optimizer's point of view and nothing forbids the reorder. Volatile establishes a happens-before edge on writes and reads of that specific field: a write to it can't be reordered with earlier writes in program order (so the constructor's writes must complete first), and any thread that reads a non-null value from that volatile field is guaranteed to see all writes that happened-before the write it observed — including every field the constructor set. It doesn't make the multi-step construction one atomic unit; it makes sure that by the time any other thread can observe the published reference, all of construction has already happened-before that observation.</div>
+</details>
+<details class="concept-qa">
+<summary>If ReentrantLock offers strictly more capability than synchronized, why does synchronized still get used at all?</summary>
+<div class="qa-body">Simplicity and safety by construction. Synchronized cannot be forgotten to be released — the JVM releases it automatically on block exit including exceptional exit, whereas ReentrantLock requires disciplined try/finally and a forgotten unlock() leaks the lock permanently with no compiler warning. Synchronized also has no allocation overhead (it uses the object's existing header) and historically had the fastest uncontended path on HotSpot. You reach for ReentrantLock specifically when you need something synchronized structurally cannot express: tryLock with a timeout, interruptible waiting, fairness, or multiple independent condition queues on one lock. In code where none of that is needed, synchronized is simpler to prove correct because there's no unlock call to omit.</div>
+</details>
+<details class="concept-qa">
+<summary>Why is a fixed thread pool with an unbounded queue a worse production failure mode than a cached thread pool that spawns unlimited threads?</summary>
+<div class="qa-body">They fail differently but both are forms of missing backpressure. A cached pool spawning unlimited threads fails loudly and relatively fast — you exhaust memory or hit OS thread limits and get an explicit error (OutOfMemoryError or thread-creation failure) that points at the actual problem. A fixed pool with an unbounded queue fails quietly: the pool never grows past its configured size, so there's no obvious resource exhaustion signal; instead, tasks silently accumulate in the queue, memory grows in proportion to queued task objects and their captured state, and end-to-end latency for any given task grows without bound because it has to wait behind everything queued ahead of it. By the time this is noticed, it usually looks like "the service got slow" rather than a clear crash, and recovery requires the queue to drain, which can take a long time even after the traffic spike ends. The fix in both cases is the same principle: use a bounded queue and an explicit rejection policy so overload is visible and handled deliberately.</div>
+</details>
+<details class="concept-qa">
+<summary>What's the actual difference between thenApply and thenCompose, and why can't thenApply be used for both cases?</summary>
+<div class="qa-body">thenApply takes a function T -> U: a plain, synchronous transformation of the already-available result. If you use thenApply with a function that itself returns a CompletableFuture&lt;U&gt;, you don't get a flattened CompletableFuture&lt;U&gt; — you get a CompletableFuture&lt;CompletableFuture&lt;U&gt;&gt;, a future of a future, because thenApply doesn't know to unwrap it; it just applies your function and wraps whatever it returns. thenCompose exists specifically for functions of shape T -> CompletableFuture&lt;U&gt; and flattens the result by subscribing to the inner future and forwarding its eventual completion to the outer one. This is exactly the map/flatMap distinction from functional composition applied to asynchronous values: reach for thenApply when transforming a value, thenCompose when the next step is itself asynchronous and you want one flat pipeline instead of nested futures.</div>
+</details>
+<details class="concept-qa">
+<summary>Why can virtual threads support millions of concurrent instances when platform threads cap out around a few thousand?</summary>
+<div class="qa-body">The cost that limits platform thread count is mostly about what's reserved per thread whether or not it's doing anything: a fixed OS stack allocation (often 512KB-1MB) and an entry in the OS scheduler's run queue that participates in real OS-level context switching. A platform thread blocked on I/O still holds all of that. A virtual thread's stack lives as a small, growable structure on the Java heap, and when it blocks on a recognized operation, the JVM unmounts it entirely from any OS thread — its state becomes an inert heap object with no OS resource attached until it has actual work to resume. The only OS threads actually in play at any moment are the small, fixed set of carrier threads, sized around core count, that are running whichever virtual threads currently have runnable work. So the ceiling shifts from "how many OS threads can the kernel schedule" to "how much heap memory can hold parked continuations," which is a vastly higher number for typical I/O-wait-shaped workloads.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does wrapping a blocking call in a synchronized block specifically break the benefit of virtual threads, when a ReentrantLock around the same call doesn't?</summary>
+<div class="qa-body">The unmounting mechanism needs to capture the virtual thread's execution state as a continuation and later resume it, potentially on a different carrier thread. Native monitor locks acquired via synchronized are tied to the OS thread that acquired them in the JVM's internal locking implementation (at least prior to the JDK 24 changes that relaxed this) — the JVM has no safe way to suspend a thread mid-monitor-hold and later resume the equivalent logical thread on a different OS thread while preserving the monitor's semantics. So instead of unmounting, the JVM leaves the virtual thread pinned to its current carrier for the entire blocking operation, which reintroduces the exact one-OS-thread-per-blocked-task cost virtual threads exist to eliminate. ReentrantLock is implemented in ordinary Java code using AbstractQueuedSynchronizer and parking primitives that the virtual thread scheduler already understands how to suspend and resume, so it doesn't cause pinning.</div>
+</details>
+<details class="concept-qa">
+<summary>What specific problem does structured concurrency solve that a plain ExecutorService with a manual list of Futures does not?</summary>
+<div class="qa-body">With a plain ExecutorService, forking several subtasks and collecting their Futures gives you no enforced relationship between them: if you decide to abandon the operation, or one subtask fails, the others keep executing unless you write explicit code to cancel each one, and that cancellation code is easy to get wrong or forget, especially across exception paths. Errors from parallel subtasks also arrive disconnected from each other — you find out about a failure only when you call get() on that specific future, potentially long after other siblings have already done wasted work. Structured concurrency ties the lifetime of every forked subtask to a lexical scope: leaving the scope, for any reason including an exception, guarantees no forked subtask escapes it in a still-running state. Policies like ShutdownOnFailure additionally propagate the first failure immediately and cancel siblings, so a group of related concurrent operations behaves like a single call that either fully succeeds or fails as a unit, with no orphaned work left behind.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/jvm-architecture'"><div class="rc-title">JVM Architecture</div><div class="rc-sub">Days 11–15 · The memory layout, monitors, and safepoint machinery that make synchronized and virtual thread mounting possible</div></div>
+<div class="related-card" onclick="window.location.hash='/collections-internals'"><div class="rc-title">Collections Internals</div><div class="rc-sub">Days 6–10 · ConcurrentHashMap's internal locking is the atomic check-and-set primitive that avoids the classic race condition</div></div>
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience & Fault Tolerance</div><div class="rc-sub">Bulkheads and fail-fast propagation apply the same backpressure and isolation principles at the distributed-system level</div></div>
+<div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Happens-before within one JVM is the single-node analog of the ordering and consistency guarantees distributed systems must provide across nodes</div></div>
+</div>

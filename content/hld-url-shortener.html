@@ -1,0 +1,198 @@
+<p class="topic-breadcrumb">Phase 2 — Framework Core &amp; Mid-Scale Architecture · Days 36–40 · HLD Problem</p>
+<h1>HLD #1: URL Shortener</h1>
+<div class="topic-tags">
+<span class="tag">Base62 Encoding</span>
+<span class="tag">Key Generation</span>
+<span class="tag">Collision Handling</span>
+<span class="tag">Read-Heavy Caching</span>
+<span class="tag">Rate Limiting</span>
+<span class="tag">Horizontal Scaling</span>
+<span class="tag">Async Analytics</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>A URL shortener looks trivial — it's "just a key-value mapping" — which is exactly why it's a useful design study: almost every interesting decision comes not from the feature itself but from one non-functional constraint, the redirect-to-creation ratio being wildly skewed. Get that one fact wrong in your mental model and you'll centralize a counter that becomes a bottleneck nobody needed, or cache the write path instead of the read path. Working through this system properly builds the habit of asking "what is the actual traffic shape" before reaching for a design pattern, which is the same habit that prevents over-engineering a low-traffic internal tool or under-provisioning a genuinely hot one.</p>
+</div>
+
+<h2>1. Functional and Non-Functional Requirements</h2>
+<p>Before any component gets drawn, it's worth being precise about what the system must do, because every subsequent trade-off is a trade-off <em>against</em> one of these requirements — vague requirements produce vague, unjustifiable designs.</p>
+<h3>Functional requirements</h3>
+<ul>
+<li><strong>Shorten a URL</strong>: given a long URL, return a short code/URL that maps to it (e.g., <code>https://sho.rt/aZ9kLm</code> for some arbitrarily long original URL).</li>
+<li><strong>Redirect</strong>: given a short code, look up the original URL and issue an HTTP redirect to it.</li>
+<li><strong>Custom aliases (optional)</strong>: let a user request a specific short code (<code>sho.rt/my-launch</code>) instead of a system-generated one, which means the system needs a uniqueness check on user-supplied input, not just on generated output.</li>
+<li><strong>Expiration (optional)</strong>: a shortened link can have a time-to-live after which it stops resolving, which means the read path needs an expiry check, not just a lookup.</li>
+</ul>
+<h3>Non-functional requirements</h3>
+<ul>
+<li><strong>Extremely read-heavy</strong>: real-world measurements of URL shorteners consistently show redirect traffic outnumbering creation traffic by ratios on the order of 100:1 to 1000:1 — a link is created once and clicked many times, often over a long tail of time. This single fact is the one that should drive nearly every architectural choice downstream.</li>
+<li><strong>Low redirect latency</strong>: a redirect is on the critical path of someone's browsing experience (a link in a text message, a QR code, a social post); adding hundreds of milliseconds here is directly user-visible in a way that a slightly slower link-creation form is not.</li>
+<li><strong>High availability</strong>: the redirect path in particular should tolerate individual component failures — a broken shortener is a broken link everywhere it was ever shared, including places (printed materials, old messages) that can't be updated.</li>
+<li><strong>Uniqueness of generated codes</strong>: two different long URLs must never resolve to the same short code (unless deliberately deduplicated), and the same short code must always resolve to the same long URL for as long as it's active.</li>
+</ul>
+<div class="callout tip">
+<div class="callout-title">The read/write skew is the actual design problem</div>
+<p>If creations and redirects happened at roughly the same rate, this system would genuinely be "just a key-value store with an HTTP layer on top" and there wouldn't be much to design. The 100:1-or-worse skew is what justifies a caching layer sized and evicted around read locality (Section 5), what makes a slow, careful, uniqueness-checked write path acceptable (Section 2), and what makes a rate limiter on the write path proportionate rather than paranoid (Section 6). Keep coming back to this ratio whenever a design choice needs justifying.</p>
+</div>
+
+<h2>2. Core Decision: How to Generate the Short Code</h2>
+<p>The heart of the system is turning a long URL into a short, unique identifier. There are three broad strategies, and they differ in where they push the hard part of the "uniqueness" problem: onto a central sequence, onto a hash function's odds, or onto pre-allocated batches.</p>
+
+<h3>Approach A: Auto-increment ID + Base62 encoding</h3>
+<p>Maintain a single, globally increasing integer counter (e.g., a database sequence or an auto-increment primary key). Every new URL gets the next integer, and that integer is encoded into a short, URL-safe string using base62 — the alphabet <code>[0-9a-zA-Z]</code>, 62 symbols, chosen specifically because it's safe to put directly into a URL path with no escaping needed (unlike base64, which includes <code>+</code>, <code>/</code>, and padding <code>=</code> that all have special meaning in a URL).</p>
+<p>Base62 encoding is just a change of base, the same algorithm as converting decimal to hexadecimal by hand:</p>
+<pre><code>encode(n):
+    if n == 0: return "0"
+    digits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    result = []
+    while n > 0:
+        result.append(digits[n % 62])
+        n = n // 62
+    return reverse(result)
+
+decode(s):
+    n = 0
+    for ch in s:
+        n = n * 62 + indexOf(ch, digits)
+    return n</code></pre>
+<p>With 62 symbols, a 6-character code space holds <code>62^6</code> ≈ 56.8 billion distinct values, and a 7-character code holds <code>62^7</code> ≈ 3.5 trillion — comfortably enough that codes only grow longer over years of sustained creation at high volume, which is why 6-7 characters is the typical target length.</p>
+<p><strong>Why it's attractive</strong>: uniqueness is trivially guaranteed by construction — a strictly increasing counter can never repeat a value, so there is no possibility of collision and therefore no collision-handling logic anywhere in the system.</p>
+<p><strong>Why it's a problem at scale</strong>: the counter is a single logical source of truth that every write must consult and increment atomically. A database sequence or auto-increment column serializes all writes through one row (or one sequence object), which becomes a throughput ceiling and a single point of contention exactly as creation volume grows — the one part of this system that's supposed to be the <em>less</em> important path (Section 1) is the part this approach makes hardest to scale. It also leaks information: encoding a monotonic counter means the short codes themselves reveal creation order and, indirectly, creation volume (a competitor watching sequential codes <code>...1M9Z</code> then <code>...1MA0</code> can infer roughly how many links you're creating between two points in time) — an information leak that has nothing to do with functionality but is a real property some products can't accept.</p>
+
+<h3>Approach B: Hash the URL (MD5/SHA + truncate + base62)</h3>
+<p>Run the long URL through a cryptographic hash function (MD5 produces 128 bits, SHA-256 produces 256 bits), then take a prefix of the resulting bits and base62-encode them into a short code. This removes the centralized counter entirely — any server can compute a hash locally with no coordination.</p>
+<p>The problem this introduces is the <strong>birthday paradox</strong>: truncating a hash to, say, 43 bits (roughly what 7 base62 characters can represent, since <code>62^7</code> ≈ 2^42.7) means the collision probability isn't governed by "1 in 2^43 chance two specific URLs collide" — it's governed by how many pairs exist among N stored URLs, which grows as <code>N(N-1)/2</code>. The birthday-paradox approximation says a 50% chance of at least one collision occurs once <code>N</code> is roughly <code>sqrt(2^43)</code> ≈ 9.3 million URLs — far sooner than intuition suggests, because you're not asking "does URL X collide with a fixed target," you're asking "does any pair among all stored URLs collide," and the number of pairs grows quadratically.</p>
+<div class="callout warn">
+<div class="callout-title">A truncated hash is not a free uniqueness guarantee</div>
+<p>It's tempting to reach for a hash and assume "cryptographic hash functions don't collide" — true for the full 128/256-bit output, false the moment you truncate to fit a short code. Truncation is exactly what makes the code short, and it's exactly what reintroduces a real collision probability that has to be handled, not assumed away. This is the trade the whole approach is built on: shortness versus collision-freedom, and you cannot get both without external bookkeeping.</p>
+</div>
+<p>Handling collisions requires an explicit strategy: after generating a candidate code, check whether it already maps to a <em>different</em> URL. If so, don't just fail — append a counter, a salt, or a fragment of the requesting user's ID to the input and rehash (e.g., <code>hash(url + "1")</code>, then <code>hash(url + "2")</code>, ...) until an unused code is found. This turns collision handling into a small retry loop on the write path, which is acceptable specifically because writes are the rare, latency-tolerant side of this system's traffic (Section 1) — a few extra milliseconds and a couple of database round trips on link creation are invisible to the product, whereas the same overhead on every redirect would not be.</p>
+
+<h3>Approach C: Pre-generated unique key pools</h3>
+<p>A dedicated key-generation service pre-computes a large batch of guaranteed-unique short codes offline (e.g., by running the counter-based approach centrally, but ahead of demand rather than per-request) and stores them in a "available keys" table or queue. Each application server, on startup or when it runs low, claims a batch — say, 1,000 keys — from that pool in a single atomic operation and hands them out locally for subsequent creation requests without touching any shared resource per request.</p>
+<pre><code>Key Generation Service (offline/background)
+   generates batches of guaranteed-unique keys
+   writes them to a "key pool" table, marked unused
+
+App Server A                        App Server B
+  on startup: claim batch             on startup: claim batch
+  [k1001..k2000] (marked "used")      [k2001..k3000] (marked "used")
+  serve creation requests locally     serve creation requests locally
+  from its own in-memory batch        from its own in-memory batch
+  (no shared counter touched          (no shared counter touched
+   per request)                        per request)</code></pre>
+<p>This is the approach that actually removes the centralized-counter bottleneck <em>without</em> introducing collision probability: uniqueness is still guaranteed by construction (the key generation service is the only writer of new keys, so it can use a counter or a reserved range internally), but the expensive coordination — claiming a batch — happens once per thousand creations instead of once per creation. The cost is operational: you now run and monitor a key-generation service, you need to handle a server crashing mid-batch (the unused remainder of its claimed batch is simply wasted, which is an acceptable, bounded loss, not a correctness problem), and you need the pool replenished faster than it's consumed.</p>
+
+<table>
+<tr><th>Approach</th><th>Coordination needed per write</th><th>Collision risk</th><th>Leaks creation info</th><th>Operational cost</th></tr>
+<tr><td>Auto-increment + base62</td><td>Every write hits the shared counter</td><td>None</td><td>Yes — sequential codes reveal order/volume</td><td>Low, but the counter becomes the bottleneck</td></tr>
+<tr><td>Hash + truncate + base62</td><td>None (local computation)</td><td>Real, grows quadratically with stored URLs (birthday paradox) — needs a retry/rehash loop</td><td>No — codes look random</td><td>Low, but requires a collision-check-and-retry path</td></tr>
+<tr><td>Pre-generated key pools</td><td>Rare — one batch claim per N writes</td><td>None</td><td>No, if batches are handed out non-sequentially</td><td>Higher — a key generation service to run and monitor</td></tr>
+</table>
+
+<h2>3. Database Schema and Access Patterns</h2>
+<p>Underneath any of the three generation strategies, the actual stored data is close to the simplest possible schema:</p>
+<pre><code>CREATE TABLE url_mapping (
+    short_code   VARCHAR(10)  PRIMARY KEY,
+    long_url     TEXT         NOT NULL,
+    created_at   TIMESTAMP    NOT NULL,
+    expires_at   TIMESTAMP    NULL,
+    created_by   BIGINT       NULL,
+    is_custom    BOOLEAN      NOT NULL DEFAULT FALSE
+);</code></pre>
+<p>The schema itself is not the interesting part of this design — it's a lookup table with a primary-key index on <code>short_code</code>, which is exactly what both the read and write paths need: redirect does a point lookup by <code>short_code</code>, and creation (for custom aliases) does an existence check on the same key before insert. What <em>is</em> interesting is that this table's access pattern is almost entirely single-row point reads by primary key, at a volume that (per Section 1) vastly exceeds writes — which is precisely the access pattern a cache is built for, and precisely why a relational database with a single primary-key index, sitting behind a cache, is sufficient here without needing sharding or a specialized data store for a very long time. This is the schema, but it's the traffic shape — not the schema — that determines everything that follows, echoed in how <a href="#/database-architecture">database-architecture</a> frames read replicas and indexing around access patterns generally.</p>
+
+<h2>4. Redirect Semantics: 301 vs 302</h2>
+<p>An easy detail to get backwards: whether the redirect response is HTTP 301 (Moved Permanently) or 302 (Found / temporary redirect) has real, opposite consequences for this specific system's load.</p>
+<ul>
+<li><strong>301</strong> tells the browser (and any intermediate cache) that the mapping is permanent, so the browser is permitted to cache it locally and, on subsequent clicks of the same short link, skip contacting your server entirely — sending the user straight to the long URL from its own cache. This <em>reduces</em> load on the shortener service, but it also means you lose visibility into every click served from a browser cache, which directly conflicts with wanting click analytics (Section 8).</li>
+<li><strong>302</strong> tells the browser the redirect might change later, so it must hit your server every time, guaranteeing every click is observable — at the cost of every single redirect actually reaching your infrastructure.</li>
+</ul>
+<p>Most production shorteners default to 302 specifically to preserve click tracking and the ability to change or expire a mapping later, accepting the higher server-side traffic as the deliberate trade for observability and mutability.</p>
+
+<h2>5. Caching the Redirect Path</h2>
+<p>Given the read/write skew from Section 1, the single highest-leverage addition to this system is a cache sitting in front of the database on the redirect path, so that the overwhelming majority of clicks never touch the database at all.</p>
+<pre><code>GET /aZ9kLm
+   -> check Redis for key "aZ9kLm"
+        HIT:  return cached long_url, issue redirect  (sub-millisecond)
+        MISS: query url_mapping table by short_code
+              write result into Redis (with TTL)
+              issue redirect</code></pre>
+<p>This is a direct application of cache-aside as covered in <a href="#/caching-strategies">caching-strategies</a>: the cache is passive, the application populates it on miss, and it's only ever invalidated (not updated in place) on the rare write path — deleting a short code from the cache on deletion or expiration, and simply letting a natural TTL handle staleness otherwise, since a URL mapping essentially never changes once created (there's no update path to race against, which is precisely what makes this a clean, low-risk cache-aside application compared to systems with frequent updates).</p>
+<p>The eviction policy matters here for a specific structural reason: link popularity follows a power-law (Zipfian) distribution — a small number of links (something that went viral, a marketing campaign's primary link) receive a disproportionate share of total clicks, while a long tail of links receive only a handful of clicks ever, if any. An <strong>LRU</strong> eviction policy is a good fit precisely because it matches this distribution: hot links get accessed repeatedly and continually get re-promoted to the front of the recency ordering, so they naturally stay resident, while cold, one-off links age out and get evicted without needing any special-casing — the eviction policy doesn't need to know which links are "important," recency of access already encodes that.</p>
+<div class="callout tip">
+<div class="callout-title">Why this is not just "add a cache because caches are fast"</div>
+<p>A cache is justified here by a specific, quantifiable argument: creations are rare and latency-tolerant, redirects are frequent and latency-sensitive, and their popularity is skewed enough that a modestly sized cache can absorb the overwhelming majority of redirect traffic without needing to hold the entire dataset in memory. If redirect traffic were instead uniformly distributed across all links (no hot links, no long tail), a cache sized smaller than the full dataset would have a much lower hit rate and the same investment would buy far less — the power-law shape of access is what makes a bounded-size LRU cache disproportionately effective here.</p>
+</div>
+
+<h2>6. Rate Limiting the Creation Endpoint</h2>
+<p>The creation endpoint is the one part of this system that does meaningful work per request — generating or validating a code, writing a row — and is also the part exposed to abuse: a scripted client can hammer it to exhaust the short-code keyspace, flood the database with writes, or use the service as a URL-obfuscation layer for spam and phishing links (hiding a malicious destination behind an innocuous-looking short link is a well-known abuse pattern for this exact kind of service). Rate limiting the creation endpoint — by client IP, API key, or authenticated user ID — bounds this without affecting the redirect path at all, since the two are logically and often physically separate endpoints.</p>
+<p>The choice of algorithm here follows the general trade-offs of rate limiting rather than anything specific to URL shortening: a token bucket is a natural fit because it allows a legitimate burst (a user pasting in and shortening ten links from a spreadsheet at once) while still enforcing a steady-state average rate, whereas a strict fixed window would either reject that entire legitimate burst or, at a window boundary, let through nearly double the intended rate. The redirect endpoint is deliberately <em>not</em> rate limited the same way (or is limited far more permissively) — throttling redirects would directly contradict the availability requirement from Section 1, since a redirect is usually not an action initiated by the same client repeatedly in a way that indicates abuse, but rather many different end users clicking a link that was shared once.</p>
+
+<h2>7. Scaling the Redirect Service Horizontally</h2>
+<p>The redirect path — read the code, check the cache, fall through to the database on miss, respond with a redirect — has no reason to hold any request-specific state in a server's process memory, which means it composes directly with the standard horizontal scaling pattern: many identical, stateless application server instances behind a load balancer, as covered generally in <a href="#/hld-basics-scaling">hld-basics-scaling</a>. Because every instance can serve any redirect request (the cache is shared, e.g., Redis, not local to one instance — sharing it is what makes cache hit rate consistent regardless of which instance a request lands on), the load balancer is free to distribute traffic with a simple algorithm like round robin or least connections, without needing session affinity of any kind.</p>
+<p>This is also where the read/write skew pays off architecturally a second time: because the redirect path so rarely needs the database, the app tier can be scaled out aggressively (many cheap, stateless instances) without a proportional need to scale the database tier at the same rate — the cache absorbs the multiplier. If the system were write-heavy instead, scaling app servers would just shift the bottleneck downstream to the database faster, since every instance would still need to coordinate on writes.</p>
+
+<h2>8. Analytics and Click Tracking as an Asynchronous Extension</h2>
+<p>A natural extension is tracking clicks per link — count, referrer, timestamp, rough geography — for dashboards. The critical design decision is <em>where</em> that tracking happens relative to the redirect response, and the answer should always be: after the redirect is issued, never before or blocking it.</p>
+<pre><code>GET /aZ9kLm
+   -> cache/db lookup for long_url
+   -> issue 302 redirect to client               (response sent, latency-critical, done)
+   -> publish {short_code, timestamp, referrer,
+               ip_hash, user_agent} to a queue    (fire-and-forget from the request's perspective)
+
+                     |
+                     v
+        Message queue (Kafka / SQS / similar)
+                     |
+                     v
+        Analytics consumer service
+           - aggregates counts
+           - writes to an analytics store
+             (separate from url_mapping)</code></pre>
+<p>The reasoning mirrors the general argument for asynchronous processing anywhere on a hot path: the user does not need click tracking to complete before they get redirected, and click tracking can tolerate being delayed by seconds, retried, or even occasionally lost in a rare failure, none of which are acceptable properties for the redirect itself. Publishing an event to a queue and returning immediately keeps the write cost off the request's critical path — the producer call is a cheap, non-blocking append (or can even be done truly fire-and-forget) rather than a synchronous write to an analytics database that would add latency and a new failure dependency to every single redirect. A downstream consumer processes the queue at its own pace, aggregates into whatever shape a dashboard needs, and can fail, restart, or fall behind without ever affecting a user waiting on a redirect. This also naturally isolates blast radius: the analytics store could be a completely different kind of database (a column store or time-series store optimized for aggregation) from the transactional <code>url_mapping</code> table, or it could go down entirely, and users would simply get link redirects with no click counted, not a broken product.</p>
+<div class="callout warn">
+<div class="callout-title">Why synchronous analytics writes are a recurring production mistake</div>
+<p>It's a common shortcut to add "just one more" database write inline in the redirect handler — <code>UPDATE url_mapping SET click_count = click_count + 1 WHERE short_code = ?</code> — because it's the smallest possible diff. But this reintroduces a write, and therefore write-level contention, onto what was supposed to be a read-dominated hot path: every redirect now takes a row lock (or at minimum incurs replication and durability overhead) on a table that most of the design has been organized around <em>not</em> writing to per request. Under a viral spike — exactly when analytics matter most and exactly when the system is under the most load — this is precisely the moment that inline counter update becomes the slowest, most contended part of the request. Decoupling it through a queue is what keeps a traffic spike a scaling problem instead of a correctness or latency incident, connecting to the broader resilience patterns in <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a> around isolating non-critical work from a critical path.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does the read/write ratio matter more to this design than the choice of key-generation algorithm itself?</summary>
+<div class="qa-body">The key-generation algorithm only affects the write path — and the write path, per the stated non-functional requirements, is the rare, latency-tolerant side of traffic. Whether generation takes an extra few milliseconds for a collision retry loop, or requires claiming a batch from a pool occasionally, is invisible to the product because creations happen orders of magnitude less often than redirects. Nearly every consequential decision in this design — putting a cache in front of the database, choosing an eviction policy that matches access skew, being willing to scale app servers aggressively without scaling the database proportionally, keeping the rate limiter asymmetric between the two endpoints — flows from the read path being the dominant, latency-sensitive one. A design that spent its effort optimizing key generation microseconds while leaving the redirect path uncached would be optimizing the wrong 1% of the traffic.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does truncating a hash to fit a short code reintroduce a collision problem that a full-length hash doesn't have, and why does the birthday paradox make it worse than intuition suggests?</summary>
+<div class="qa-body">A full 128-bit or 256-bit hash has an astronomically large output space, so the odds of any two different inputs producing the same output are negligible for practical purposes. Truncating to, say, 43 bits to fit a 7-character base62 code shrinks that output space down to about 2^43 possible values — still large in absolute terms, but the relevant question isn't "what's the chance of a specific collision," it's "what's the chance that any pair among all currently stored URLs collides." The number of pairs among N items grows as N(N-1)/2, roughly N-squared, not N — so the probability of at least one collision crosses 50% once N reaches roughly the square root of the output space, not some fraction close to the space's full size. For a 2^43 output space, that's around 9.3 million stored URLs, a number reachable well within the life of an active product, which is why truncated-hash approaches must include an explicit collision-check-and-retry step rather than assuming collisions are rare enough to ignore.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What specific bottleneck does an auto-increment-counter approach create, and how does a pre-generated key pool remove it without introducing collisions?</summary>
+<div class="qa-body">An auto-increment counter (a database sequence or auto-increment column) requires every single write to atomically read-and-increment one shared piece of state, which serializes writes through that one resource — as write volume grows, that shared counter becomes a point of contention no amount of adding more application servers can relieve, since they'd all still be fighting over the same counter. A pre-generated key pool breaks this by moving the coordination from "once per write" to "once per batch of writes": a key-generation service still uses a similar counter internally to produce guaranteed-unique keys, but it does so in large batches ahead of demand, and each application server claims an entire batch (say, a thousand keys) in one atomic operation, then serves many creation requests from that batch locally with zero further coordination. Uniqueness is still guaranteed by construction, exactly as with the plain counter, because there is still only one component minting new keys — the difference is how often any given request has to synchronize with it.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is LRU specifically a good eviction policy fit for this system, rather than an arbitrary choice among available policies?</summary>
+<div class="qa-body">LRU's core assumption is that recent access predicts near-future access, and link click patterns are a strong match for that assumption: click volume per link follows a power-law distribution, where a small number of links receive a large share of all clicks over an extended period, while most links are clicked rarely or not at all after creation. Because a genuinely popular link keeps being accessed, it keeps getting promoted to the most-recently-used position and is essentially never evicted under normal load, while the long tail of one-off or rarely clicked links naturally drifts to the least-recently-used end and gets evicted to make room, without the system ever needing to explicitly classify which links are "important." If click patterns were instead uniformly random across all links, LRU would offer little advantage over a simpler policy like FIFO, since recency wouldn't predict future access any better than insertion order would.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why should analytics/click-tracking never be written synchronously inside the redirect request handler?</summary>
+<div class="qa-body">The redirect handler exists to do exactly one latency-critical thing: resolve a short code and send the client on its way, and the whole design (caching, stateless horizontal scaling, an asymmetric rate limiter) is built around keeping that path fast and reliable under high read volume. Adding a synchronous write for click tracking — even something as small as an incrementing counter update — reintroduces a database write, and the contention, locking, and durability cost that comes with it, onto a path that was deliberately architected to avoid touching the database on the common case. It also couples the redirect's success to the analytics store's availability: if that store is slow or down, redirects start failing or stalling for a feature that was supposed to be a side effect, not a dependency. Publishing an event to a queue and returning immediately keeps the redirect's latency and availability independent of whatever happens to analytics downstream, and lets an asynchronous consumer absorb bursts, retry failures, or fall behind without any of that being visible to a user clicking a link.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does choosing 302 over 301 for the redirect response matter for a URL shortener specifically, given that both send the browser to the same destination?</summary>
+<div class="qa-body">The HTTP status code doesn't change where the user ends up, but it changes whether the browser is allowed to cache that redirect decision itself. A 301 (permanent) tells the browser it can remember the mapping and, on the next click of the same short link, go straight to the long URL without asking the shortener's server again — which reduces server load but also means that click never reaches your infrastructure, so it can't be counted, and if the underlying mapping needed to change or the link needed to be disabled, browsers that cached the old 301 would keep bypassing the server entirely. A 302 (temporary) forces the browser to check with the server on every single click, which costs more server-side traffic but guarantees every click is observable and that a mapping can be changed, expired, or removed and have that decision take effect immediately for every future click, which is why most production shorteners choose 302 despite the extra load it implies.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/caching-strategies'"><div class="rc-title">Caching Strategies &amp; Redis Architecture</div><div class="rc-sub">Days 06–10 · Cache-aside mechanics and LRU internals underlying the redirect cache</div></div>
+<div class="related-card" onclick="window.location.hash='/hld-basics-scaling'"><div class="rc-title">HLD Basics &amp; Scaling</div><div class="rc-sub">Days 01–05 · Statelessness and load balancing behind horizontally scaling the redirect tier</div></div>
+<div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">Days 06–10 · How access patterns, not schema complexity, drive indexing and read-scaling decisions</div></div>
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience &amp; Fault Tolerance</div><div class="rc-sub">Isolating non-critical work like analytics from a latency-sensitive critical path</div></div>
+</div>

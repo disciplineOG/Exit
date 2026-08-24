@@ -1,0 +1,187 @@
+<p class="topic-breadcrumb">Phase 3 — Advanced Systems, Security &amp; LLD Machine Coding · Days 41–45 · HLD Problem</p>
+<h1>HLD #2: E-Commerce / Flash Sale System</h1>
+<div class="topic-tags">
+<span class="tag">Inventory Locking</span>
+<span class="tag">Optimistic vs Pessimistic Concurrency</span>
+<span class="tag">Redis Atomic Counters</span>
+<span class="tag">Async Order Queueing</span>
+<span class="tag">Cache Pre-Warming</span>
+<span class="tag">Saga Pattern</span>
+<span class="tag">Rate Limiting &amp; Bot Mitigation</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>A flash sale is the one scenario in ordinary e-commerce where "eventually consistent, mostly available" stops being an acceptable default, because the thing being protected — a fixed count of physical or limited inventory — has a correctness property (never sell more than exists) that no amount of horizontal scaling can relax away. Understanding this system deeply means understanding exactly where a distributed system is forced to trade throughput for a hard invariant, and where it can cheat that trade-off by moving work off the critical path instead. Get this wrong and you get the two failure modes that make headlines: oversold inventory that has to be apologetically refunded, or a storefront that falls over the instant the sale opens because every request tried to do a synchronous, lock-contending write at the same moment.</p>
+</div>
+
+<h2>1. Why a Flash Sale Is a Different Design Problem</h2>
+<p>Steady-state e-commerce traffic is comparatively gentle: requests arrive smoothly, diurnal patterns are predictable, and autoscaling groups have minutes to react to load trends. A flash sale inverts every one of these assumptions. Traffic that was near-zero a second before the sale opens can jump 100-1000x baseline within the same second, because the demand isn't organically arriving — it's a crowd that has been refreshing a page or holding a countdown timer, all converging on the same endpoint at the same instant. This is a thundering-herd problem by design, not by accident.</p>
+<p>Two properties compound to make this hard, and it's worth separating them clearly because they pull in opposite directions:</p>
+<ul>
+<li><strong>A hard consistency requirement</strong>: inventory is finite and specific. If 500 units of a product exist, exactly 500 (or fewer, never more) can be sold. This is not a case where showing a slightly stale follower-count or like-count is harmless — overselling means real orders that cannot be fulfilled, refunds, and reputational cost that is disproportionate to the technical shortcut that caused it.</li>
+<li><strong>An extreme availability/throughput requirement</strong>: the system must absorb a spike orders of magnitude larger than normal without falling over, and it must do so within a window that might be minutes, because the whole point of a flash sale is scarcity-driven urgency.</li>
+</ul>
+<p>The tension is direct: the straightforward way to guarantee "never oversell" is to serialize access to the inventory count (one write at a time, strictly ordered), but serialization is exactly what caps throughput under extreme concurrency. Every technique in this design is, in one way or another, a way to preserve the correctness guarantee while pushing the serialization point somewhere narrower, faster, and further from the part of the system taking the brunt of the traffic.</p>
+<div class="callout">
+<div class="callout-title">This is a scaled-up version of a familiar problem</div>
+<p>The inventory-decrement race is the same class of problem covered in <a href="#/distributed-systems-core">distributed-systems-core</a> under concurrent state mutation — but a flash sale is the extreme case where the naive fix (a database lock) is guaranteed to become the bottleneck, because concurrency isn't occasional, it's the entire premise of the event.</p>
+</div>
+
+<h2>2. The Inventory-Locking Problem</h2>
+<h3>The race condition in the naive approach</h3>
+<p>The obviously-wrong-but-instructive implementation is "check, then act":</p>
+<pre><code>// NOT safe under concurrency
+SELECT quantity FROM inventory WHERE product_id = 42;
+// application code checks: quantity > 0 ?
+UPDATE inventory SET quantity = quantity - 1 WHERE product_id = 42;</code></pre>
+<p>This looks correct read top-to-bottom in isolation, but correctness under concurrency is not a property of one thread's code path — it's a property of every possible interleaving of many threads' code paths. With 10,000 concurrent requests for a product with 1 unit left, all 10,000 can execute the <code>SELECT</code> at nearly the same moment, all read <code>quantity = 1</code>, all conclude "available," and all proceed to decrement. The database will happily execute 10,000 <code>UPDATE</code> statements (possibly driving the count negative, or requiring an application-side floor check that still doesn't prevent multiple successful "purchases" being recorded before anyone notices the count is wrong). The bug isn't in either statement individually — it's in the gap between them, during which the "check" result goes stale for every concurrent reader.</p>
+<p>This is exactly the classic lost-update anomaly, and it's why "it worked in my local test with one browser tab" is meaningless evidence for this code path — the failure only appears under genuine concurrent access, which is precisely what a flash sale guarantees.</p>
+
+<h3>Solution A: Pessimistic row-level locking</h3>
+<p>The direct fix is to make the check-then-act sequence atomic by acquiring an exclusive lock on the row before reading it, so no other transaction can read-and-race until the first transaction commits or rolls back:</p>
+<pre><code>BEGIN;
+SELECT quantity FROM inventory WHERE product_id = 42 FOR UPDATE;
+-- row is now locked; every other transaction requesting
+-- FOR UPDATE on this row blocks here until we commit/rollback
+UPDATE inventory SET quantity = quantity - 1 WHERE product_id = 42;
+COMMIT;
+</code></pre>
+<p><code>SELECT ... FOR UPDATE</code> tells the database to take a row-level exclusive lock as part of the read, not just the write, closing the gap where a stale read could be acted on. This is genuinely correct — no amount of concurrency can cause an overshoot, because the database itself is now the serialization point.</p>
+<p>The problem is throughput. Every concurrent request for the same product now queues behind a single row lock, turning what should be a highly parallel workload into an effectively single-threaded one for that row. If each locked transaction (lock acquisition, decrement, commit, lock release) takes even a few milliseconds, the theoretical ceiling for one hot row is in the low thousands of operations per second — nowhere near what a 1000x traffic spike on a single popular SKU demands. Worse, waiting transactions hold connections open, which can exhaust the database's connection pool and start blocking unrelated queries against the same pool, turning one hot product into an outage for the whole storefront.</p>
+
+<h3>Solution B: Optimistic locking with a version column</h3>
+<p>Optimistic locking assumes contention is the exception rather than the rule and only pays a penalty when a conflict actually happens, rather than serializing every access up front:</p>
+<pre><code>SELECT quantity, version FROM inventory WHERE product_id = 42;
+-- application checks quantity > 0
+
+UPDATE inventory
+SET quantity = quantity - 1, version = version + 1
+WHERE product_id = 42 AND version = :versionReadEarlier;
+-- if 0 rows affected, someone else updated first: retry from the SELECT</code></pre>
+<p>No lock is held between the read and the write. Instead, the <code>WHERE version = :versionReadEarlier</code> clause makes the update conditional on nothing else having changed the row in between. If another transaction won the race and updated the row first, the version no longer matches, zero rows are affected, and the application detects this and retries the whole read-modify-write cycle.</p>
+<p>Under moderate contention this is a clear win — most requests succeed on the first try with no blocking at all, so throughput is much closer to the database's raw update capacity than the pessimistic approach. But it degrades badly under <em>extreme</em> contention, which is exactly the flash-sale regime: if 10,000 requests are racing for the last few units, the vast majority will fail their version check and retry, and those retries re-contend with the next wave of retries, producing a retry storm — a self-inflicted amplification of load where the system spends most of its capacity re-attempting work that will mostly fail again, rather than making forward progress. Optimistic locking assumes conflicts are rare; a flash sale on a scarce item is a scenario engineered to make conflicts the common case.</p>
+
+<h3>Solution C: Move the hot counter into Redis</h3>
+<p>The insight that actually resolves the tension is that the database doesn't need to be the arbiter of the hot counter at all. Redis is single-threaded for command execution, which means a single <code>DECR</code> is inherently atomic with no locking overhead — there's no interleaving to race against because commands execute one at a time, in order, by construction:</p>
+<pre><code>DECR inventory:product:42
+-- returns the new value atomically; if it goes below 0,
+-- that request "lost" and should not proceed to checkout</code></pre>
+<p>This alone handles the decrement atomically, but a plain <code>DECR</code> can't express "decrement only if the result would stay non-negative" as a single operation — you'd be back to check-then-act if you read the value first. The fix is a Lua script, which Redis executes atomically as a single unit (no other command can run in the middle of it):</p>
+<pre><code>-- KEYS[1] = inventory:product:42
+local stock = tonumber(redis.call('GET', KEYS[1]))
+if stock and stock > 0 then
+    redis.call('DECR', KEYS[1])
+    return stock - 1
+else
+    return -1  -- sold out; caller must not proceed
+end</code></pre>
+<p>Because the entire check-and-decrement happens inside one atomic Lua execution on a single-threaded server, this reproduces exactly the correctness guarantee of <code>SELECT ... FOR UPDATE</code> — no two callers can both see "stock available" and both succeed when only one unit remains — but at in-memory speed with no lock queue, no connection pool contention, and no disk I/O on the hot path. Redis can sustain tens to hundreds of thousands of such operations per second on modest hardware, which is the throughput regime a flash sale actually needs.</p>
+<p>The trade-off is that Redis now holds a piece of state that must eventually be reconciled with the database of record. The typical pattern is: Redis is the fast, authoritative gate for "is there stock left, and did this request reserve a unit," while the database is updated asynchronously (often via the queue described in Section 3) to persist the final, durable record. This introduces a brief window where Redis and the database can disagree, which is acceptable as long as Redis is treated as the single source of truth for the decrement decision during the sale window, and the database write is guaranteed to eventually happen (not "may happen").</p>
+
+<table>
+<tr><th>Approach</th><th>Mechanism</th><th>Throughput under extreme contention</th><th>Failure mode if misused</th></tr>
+<tr><td>Pessimistic lock (<code>SELECT FOR UPDATE</code>)</td><td>Row-level exclusive lock serializes access</td><td>Low — bounded by lock hold time and connection pool size</td><td>Connection pool exhaustion cascades into unrelated query failures</td></tr>
+<tr><td>Optimistic lock (version column)</td><td>Conditional update, retry on version mismatch</td><td>Good under moderate contention, collapses into a retry storm under extreme contention</td><td>Wasted CPU/DB cycles on doomed retries starve real progress</td></tr>
+<tr><td>Redis atomic <code>DECR</code> / Lua script</td><td>Single-threaded execution model gives free atomicity</td><td>High — tens to hundreds of thousands of ops/sec</td><td>Redis and DB state can drift if the async reconciliation write is dropped or not idempotent</td></tr>
+</table>
+
+<div class="callout warn">
+<div class="callout-title">A version column doesn't fix contention, it just detects it</div>
+<p>It's a common misreading to treat optimistic locking as strictly "better" than pessimistic locking because it doesn't block. It doesn't block, but under enough contention the aggregate work done by all the failed-and-retried attempts can exceed what a queue of waiting pessimistic locks would have cost, because every failed attempt already paid for a full read round-trip before discovering it lost. The right lens is: pessimistic locking pays cost up front in waiting, optimistic locking pays cost after the fact in wasted retries, and at flash-sale-level contention neither is as cheap as removing the database from the hot path entirely.</p>
+</div>
+
+<h2>3. Queueing Instead of Processing Synchronously</h2>
+<p>Even with an atomic Redis decrement, synchronously handling every incoming "buy" request end-to-end — validate, reserve inventory, charge payment, create order, confirm — means every one of the 100-1000x spike of requests is doing real, non-trivial work on the request thread, including a call to an external payment provider that the system does not control the latency of. The pattern that actually survives the spike is to shrink the synchronous critical path down to the bare minimum needed to make a correctness decision, and defer everything else.</p>
+<p>Concretely: the purchase endpoint does only the atomic inventory check-and-reserve (the Lua script in Section 2), and if a unit was successfully reserved, it publishes a "process this order" message to a queue and immediately returns an acknowledgment to the user — something like "we've received your request, you'll be notified" — rather than a final "your order is confirmed" response. A pool of consumer workers, sized to what the payment provider and order database can sustainably handle (not sized to match the spike), drains the queue at a controlled rate and performs the slower steps: payment capture, order persistence, shipping kickoff.</p>
+<p>This is a direct application of load leveling: the queue acts as a buffer that absorbs the burst and lets consumers process at a smooth, sustainable rate instead of being forced to scale instantaneously to match an instantaneous spike. It connects directly to the mechanics in <a href="#/async-messaging">async-messaging</a> — the queue needs at-least-once delivery with idempotent consumers (a network retry or consumer crash-and-redeliver must not double-charge or double-reserve), and a dead-letter path for orders that fail processing repeatedly (a declined card, a payment provider timeout) so they don't block the queue indefinitely.</p>
+<div class="callout tip">
+<div class="callout-title">The user experience genuinely changes, and that's the point</div>
+<p>This is a real product trade-off, not just an implementation detail: the user no longer gets an instant "confirmed" response, they get an instant "accepted" response followed by an asynchronous confirmation (push notification, email, or a status they can poll). This is the correct trade during a spike because a synchronous confirmation for every request would require synchronous capacity for every request, which is precisely what the system cannot provide at 100-1000x baseline. Communicating this honestly in the UI (a countdown, a queue position, or just "processing your order") is what makes the asynchronous model feel intentional rather than broken.</p>
+</div>
+
+<h2>4. Pre-Warming Caches Before the Sale Starts</h2>
+<p>A cache that is cold — empty, or evicted due to inactivity — is invisible during normal traffic because the first request that misses simply pays a one-time penalty populating it, and subsequent requests are fast. During a flash sale this dynamic is catastrophic instead of mild: the sale start time is a known, scheduled instant at which the entire spike arrives simultaneously, so if the cache is cold at that exact moment, the full 100-1000x request volume all misses at once and falls through to the origin (database, product service) simultaneously — which is worse than having no cache at all, because now every one of those requests also pays the overhead of a failed cache lookup on top of the origin hit, and the origin receives a thundering herd it was never sized for.</p>
+<p>The fix is deliberate and simple: since the sale start time is known in advance, run a warming job minutes before the sale opens that proactively reads the hot keys — product detail pages, images metadata, the initial inventory count — into the cache, so that the very first wave of real traffic is already served from a warm cache. This is fundamentally different from organic cache warming (letting real traffic populate it) because organic warming assumes a ramp-up period during which occasional misses are tolerable; a flash sale has no ramp-up, it has a step function.</p>
+<div class="callout warn">
+<div class="callout-title">Pre-warming interacts with TTLs and eviction policy</div>
+<p>Warming the cache five minutes early is wasted effort if the entries are configured with a two-minute time-to-live and expire before the sale actually opens, or if an LRU eviction policy under unrelated background traffic evicts the just-warmed keys before they're used. Pre-warming needs a TTL set to comfortably outlast the gap between the warming job and the sale start (or no expiry at all until the sale concludes), and ideally a separate cache instance or reserved capacity for sale-critical keys so they aren't competing for eviction priority with unrelated traffic. See <a href="#/caching-strategies">caching-strategies</a> for the general mechanics of TTL and eviction that this builds on.</p>
+</div>
+
+<h2>5. Separating the Read Path from the Write Path</h2>
+<p>Not all traffic during a flash sale is a purchase attempt — the large majority is browsing: loading the product page, checking the countdown timer, refreshing to see if the sale has started, viewing images and descriptions. This read traffic is enormous in volume but has no correctness constraint remotely as strict as inventory — serving a product description that's a few seconds stale is harmless, unlike serving a stale inventory count that leads to overselling. The design implication is to physically and architecturally separate these two paths so they don't compete for the same resources:</p>
+<ul>
+<li><strong>Static assets and product pages behind a CDN</strong>: images, CSS/JS bundles, and largely-static product page HTML/JSON should be served from edge caches geographically close to users, so this volume never even reaches the origin infrastructure. This is the single highest-leverage thing to get right, because it removes the largest fraction of total request volume from the systems that actually need to be protected.</li>
+<li><strong>Product detail caching separate from the inventory counter</strong>: a product's title, description, images, and price change rarely and can be cached aggressively (minutes to hours) in a general-purpose cache layer or even the CDN. The inventory count changes on every successful purchase and must live in its own fast, atomically-updatable store (the Redis counter from Section 2). Conflating these — for example, caching the whole product object including its quantity field with one TTL — either makes the count stale (risking oversell if served too loosely) or forces frequent invalidation of the entire product object just because the count changed (defeating the purpose of caching the stable fields at all).</li>
+</ul>
+<p>The net effect is that the purchase path — the part of the system doing hot, contended, correctness-critical writes — only ever sees traffic from users who have actually decided to buy, not the much larger population still browsing or refreshing. Without this separation, read traffic alone could saturate the same database connections and application servers the purchase path depends on, causing the write path to degrade even though none of that read traffic was itself trying to buy anything.</p>
+
+<h2>6. The Saga Pattern for Order Fulfillment</h2>
+<p>Once an order moves past the initial inventory reservation, it typically spans multiple services or resources that cannot be updated in a single local database transaction: payment (often an external provider), inventory (a decrement that should become durable, not just reserved in Redis), order records, and shipping/fulfillment kickoff. Distributed transactions across these boundaries (two-phase commit) don't scale well and don't fit well with an external payment provider that has no notion of participating in your internal transaction protocol. The Saga pattern solves this by breaking the overall operation into a sequence of local transactions, each with a corresponding <strong>compensating action</strong> that undoes its effect if a later step in the sequence fails:</p>
+<pre><code>Step 1: Reserve inventory (Redis DECR, or a "reserved" status row)
+Step 2: Create order record (status = PENDING_PAYMENT)
+Step 3: Charge payment via provider
+Step 4: Confirm inventory decrement as final/durable
+Step 5: Kick off shipping/fulfillment
+
+If Step 3 (payment) fails:
+  -> Compensate Step 2: mark order CANCELLED
+  -> Compensate Step 1: release the reserved unit back to available stock
+
+If Step 5 (shipping kickoff) fails after payment succeeded:
+  -> Retry shipping kickoff (idempotent), do NOT unwind payment —
+     compensate forward, not backward, once money has moved</code></pre>
+<p>The critical design decision in a saga is choosing, for each step, whether a failure should be handled by compensating backward (undoing prior steps) or retrying forward (because undoing would itself be more disruptive or impossible — refunding a payment that already succeeded, for instance, is a much heavier operation than retrying a shipping API call). This is why the ordering in the pipeline above matters: inventory reservation happens before payment specifically so that a failed payment can cheaply release inventory that was only ever "reserved," not yet durably committed, whereas nothing after a successful payment should trigger an inventory-release compensation, because that would mean taking someone's money for an item no longer being reserved for them.</p>
+<p>This composes directly with the queueing model from Section 3: each saga step is naturally implemented as a queue consumer that, on success, publishes the next step's message, and on failure, publishes a compensation message rather than throwing an exception that's invisible to the rest of the pipeline. The full mechanics of choreographed versus orchestrated sagas, and how compensating actions are tracked and replayed reliably, are covered in <a href="#/distributed-systems-core">distributed-systems-core</a> — the flash sale is simply the domain where the consequence of getting this wrong (a charged customer with no reserved inventory, or reserved inventory nobody paid for) is maximally visible.</p>
+<div class="callout">
+<div class="callout-title">Reservation is a distinct state from a final decrement</div>
+<p>It's worth keeping "reserved" and "sold" as explicitly different states rather than collapsing them into one decrement. A reservation (the Redis <code>DECR</code> at request time) says "don't let anyone else take this unit while we find out if this order will actually complete." Only after payment succeeds does that reservation become a final, durable sale. If payment fails and the two states were never distinguished, releasing the unit back to available stock requires re-incrementing a counter that other concurrent operations are also mutating — reintroducing exactly the kind of race this design was built to avoid. A short-lived reservation with an expiry (release automatically if payment doesn't complete within, say, 5-10 minutes) also protects against a client that reserves a unit and simply abandons the checkout flow.</p>
+</div>
+
+<h2>7. Rate Limiting and Bot Mitigation on the Purchase Endpoint</h2>
+<p>A flash sale creates a strong, direct financial incentive for automated buying — scripts that hit the purchase endpoint far faster and more reliably than a human clicking a button, often to acquire scarce inventory for resale. This isn't an edge case to shrug off; unmitigated, bots can claim a disproportionate share of limited stock within the first fraction of a second, before most legitimate users have even finished loading the page. Protecting against this requires layering several distinct mechanisms, because no single one is sufficient on its own:</p>
+<ul>
+<li><strong>Per-user/per-IP rate limiting</strong> on the purchase endpoint (e.g., a token bucket allowing a small number of purchase attempts per minute per account) blunts the simplest scripted attacks, though it's easily defeated by an attacker with many accounts or many IPs.</li>
+<li><strong>A queueing/virtual-waiting-room step before checkout</strong> — admitting users into the purchase flow at a controlled rate (matching what the backend can sustain) rather than letting the entire spike hit the purchase endpoint simultaneously — protects the backend regardless of whether the incoming load is legitimate or automated, and has the side benefit of making the experience fairer and more predictable for real users.</li>
+<li><strong>CAPTCHA or proof-of-work challenges</strong> at the point of adding to cart or checking out add friction that is cheap for a human doing it once but expensive for a script trying to do it thousands of times per second, though they add real friction for legitimate users too and are an arms race against increasingly sophisticated bypass tooling.</li>
+<li><strong>Behavioral and device signals</strong> (request timing patterns too regular to be human, missing browser fingerprint signals, known data-center IP ranges rather than residential ones) can be scored to flag likely automation without necessarily blocking outright, feeding into a soft throttle rather than a hard reject that risks false-positiving real customers.</li>
+</ul>
+<p>None of these are perfect in isolation, which is why production systems layer them: rate limiting handles the crude case cheaply, a waiting-room step caps absolute throughput to what the backend can handle regardless of traffic legitimacy, and challenge/behavioral signals raise the cost of automation without fully relying on any single signal being unbeatable. The rate limiter and circuit-breaking concerns here share the same first-principles grounding as the general resilience patterns in <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a> — a flash sale is simply the scenario where the "what if load exceeds capacity by orders of magnitude" question stops being hypothetical.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+<details class="concept-qa">
+<summary>Why does "check quantity, then decrement" fail even if each individual SQL statement is correct?</summary>
+<div class="qa-body">Correctness under concurrency isn't a property of a single thread's sequence of statements — it's a property of every possible interleaving across all concurrently executing threads. The SELECT and the UPDATE are each individually valid SQL, but nothing prevents another transaction's SELECT from executing in the gap between this transaction's SELECT and its UPDATE. If ten requests all read "quantity = 1" before any of them commits a decrement, all ten will independently conclude the item is available and proceed, because each one's decision was based on a read that became stale the instant a concurrent transaction also read it. The fix always involves closing that gap — either by locking the row so no other reader can even take a stale read (pessimistic), by making the write conditionally fail if anything changed since the read (optimistic), or by making the read-and-decrement a single atomic operation (Redis DECR/Lua) so there's no gap to race into in the first place.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does optimistic locking perform worse than expected under extreme contention, given that it avoids blocking?</summary>
+<div class="qa-body">Optimistic locking is designed around the assumption that most attempts will succeed on the first try and conflicts are the exception — it trades the cost of blocking for the cost of occasionally redoing work. Under moderate contention this assumption holds and it outperforms pessimistic locking. But when thousands of requests are racing for the last few units of an item, the assumption inverts: most attempts will fail their version check, because by definition only as many can succeed as there are units left. Every failed attempt still paid for a full read round-trip and a failed write attempt before discovering it lost, and then it retries, competing with the next wave of already-failing retries. The aggregate work done across all the doomed attempts can exceed what a bounded queue of waiting pessimistic locks would have cost, because pessimistic locking never does wasted work — it just waits.</div>
+</details>
+<details class="concept-qa">
+<summary>Why is a single Redis DECR not enough to safely handle inventory, and what does the Lua script add?</summary>
+<div class="qa-body">A plain DECR is atomic in the sense that Redis will never lose or misapply a decrement under concurrent callers — but atomicity of the decrement alone doesn't express the business rule "only decrement if the result stays non-negative." If the application reads the current value first, checks it's positive, and then issues DECR as a separate step, that reintroduces exactly the check-then-act gap that caused the original race, just relocated to Redis instead of the database. A Lua script solves this because Redis executes the entire script as one atomic unit — no other client's command can execute in the middle of it — so the read-check-decrement sequence becomes indivisible, reproducing the guarantee of SELECT FOR UPDATE without needing a lock, because there's genuinely nothing else running concurrently with it on Redis's single command-execution thread.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does moving the counter to Redis create a new problem of its own, and how is it managed?</summary>
+<div class="qa-body">Redis becomes a second source of state for inventory that must eventually agree with the database of record, and there's a window during which they can disagree — for example, if the process that's supposed to asynchronously persist a Redis decrement to the database crashes before doing so. This is managed by treating Redis as authoritative for the fast admission decision (did this request get to reserve a unit, yes or no) during the sale window, while guaranteeing the database write happens eventually via a durable queue with retries, rather than a fire-and-forget call. The consumer that performs this persistence must also be idempotent, since at-least-once delivery means the same "persist this decrement" message might be processed more than once, and a non-idempotent handler would double-count the decrement in the database even though Redis only decremented once.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does accepting the purchase request into a queue and returning an immediate acknowledgment actually help, rather than just delaying the same amount of total work?</summary>
+<div class="qa-body">It doesn't reduce the total amount of work the system eventually has to do, but it decouples the rate at which work arrives from the rate at which it's processed. Without a queue, every one of the spike's requests must be fully handled — including a call to an external payment provider — on a request thread at the moment it arrives, which means the system's peak capacity requirement is dictated by the spike itself. With a queue, the synchronous path only does the minimal, fast, atomic inventory check, and a fixed-size pool of consumers drains the queue at a rate matched to what downstream systems (payment provider, order database) can sustainably handle. The queue's depth absorbs the difference between arrival rate and processing rate, so the system needs to be provisioned for sustainable throughput, not peak instantaneous throughput — at the cost of the user getting an "accepted" response before a "confirmed" one.</div>
+</details>
+<details class="concept-qa">
+<summary>Why must a Saga's compensating actions be direction-aware — why not just always roll everything back on any failure?</summary>
+<div class="qa-body">Not all steps are equally reversible, and treating them as if they were leads to worse outcomes than the failure itself. Releasing a reservation that hasn't been paid for is cheap and safe — nobody has been charged, so undoing it has no external side effect beyond making the unit available again. But unwinding a step after a payment has already succeeded means issuing a refund, which is a heavier, sometimes delayed, and user-visible operation, and doing it reflexively for a downstream failure that has nothing to do with the payment (a shipping API hiccup, for instance) creates unnecessary refund-and-recharge churn for the customer. The general rule is to compensate backward only for steps that are cheap and safe to undo and haven't yet had irreversible external effects, and to retry forward (with idempotent retries) once a step's effects are no longer cheaply reversible.</div>
+</details>
+<details class="concept-qa">
+<summary>Why is layering rate limiting, a waiting room, and challenge mechanisms necessary instead of picking the single best one?</summary>
+<div class="qa-body">Each mechanism defends against a different shape of abuse and has a different failure mode when used alone. Rate limiting per account or IP is cheap but trivially defeated by an attacker with many accounts or many IP addresses. A waiting-room admission step caps the absolute rate at which requests reach the purchase endpoint regardless of whether the traffic is legitimate or automated, which protects backend capacity unconditionally, but doesn't by itself stop bots from occupying a disproportionate share of the admitted slots. Challenge mechanisms raise the cost of automating a single attempt but add friction for real users and are subject to an ongoing arms race with bypass techniques. None of them close every gap alone; together, they raise the total cost and reduce the total throughput available to automated actors while keeping the experience workable for people, which is the realistic goal — the aim is to make abuse expensive and rare, not to make it mathematically impossible.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Phase 1-2 · Saga steps, compensating actions, and concurrent state races generalize the mechanics used here</div></div>
+<div class="related-card" onclick="window.location.hash='/caching-strategies'"><div class="rc-title">Caching Strategies</div><div class="rc-sub">Phase 2 · TTL, eviction, and warming mechanics that pre-warming and read-path separation build directly on</div></div>
+<div class="related-card" onclick="window.location.hash='/async-messaging'"><div class="rc-title">Async Messaging</div><div class="rc-sub">Phase 2-3 · Delivery guarantees and idempotent consumers underpin the order-queueing and saga steps</div></div>
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience &amp; Fault Tolerance</div><div class="rc-sub">Phase 3 · Rate limiting, load shedding, and graceful degradation under load spikes beyond capacity</div></div>
+</div>

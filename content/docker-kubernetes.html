@@ -1,0 +1,273 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Bonus · Bonus</p>
+<h1>Containers & Orchestration: Docker, Kubernetes Fundamentals</h1>
+<div class="topic-tags">
+<span class="tag">Linux Namespaces</span>
+<span class="tag">cgroups</span>
+<span class="tag">Docker Images & Layers</span>
+<span class="tag">Multi-Stage Builds</span>
+<span class="tag">Pods & Deployments</span>
+<span class="tag">Services & Networking</span>
+<span class="tag">Probes & Autoscaling</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Almost every confusing container production incident — a service that gets killed and restarted in an endless loop right after deploy, a "phantom" memory limit that kills a JVM process that swears it has headroom, a service that can reach another by name in one environment and not another — is explainable in about two sentences once you know what a container and a Pod actually are at the mechanical level. Most people learn Docker and Kubernetes as a sequence of YAML incantations to copy-paste, which works right up until something deviates from the tutorial, at which point there's no mental model to fall back on. This page builds that model from the Linux kernel primitives upward, so the YAML becomes a direct, predictable expression of the underlying mechanics rather than magic.</p>
+</div>
+
+<h2>1. What a Container Actually Is</h2>
+<p>The single most important correction to make up front: <strong>a container is not a lightweight virtual machine.</strong> A VM virtualizes hardware — a hypervisor (like KVM or Xen) presents each guest with its own virtual CPU, virtual memory, virtual disk, and virtual NIC, and each guest boots its own independent kernel on top of that virtual hardware. A container does none of this. A container is an ordinary process running on the host's existing kernel, with the kernel configured to make that process believe it has its own isolated filesystem, network stack, process tree, and hostname. There is exactly one kernel involved — the host's — shared by every container on that machine.</p>
+<p>This single fact explains nearly every practical difference between the two:</p>
+<table>
+<tr><th>Property</th><th>Virtual Machine</th><th>Container</th></tr>
+<tr><td>What's isolated</td><td>Full hardware (via hypervisor), separate kernel per guest</td><td>Kernel-level views (namespaces), shared kernel</td></tr>
+<tr><td>Startup time</td><td>Seconds to minutes (boots a kernel + init system)</td><td>Milliseconds to low seconds (just starts a process)</td></tr>
+<tr><td>Resource overhead</td><td>Each guest reserves its own kernel, memory, device drivers</td><td>Only the process's own memory/CPU; no duplicated kernel</td></tr>
+<tr><td>Isolation strength</td><td>Strong — a hypervisor escape is rare and high-severity</td><td>Weaker — a kernel vulnerability can cross container boundaries</td></tr>
+<tr><td>Can run a different kernel/OS</td><td>Yes (Windows guest on Linux host, etc.)</td><td>No — must share the host's kernel (Linux containers need a Linux kernel)</td></tr>
+<tr><td>Density per host</td><td>Tens of VMs typically</td><td>Hundreds to thousands of containers typically</td></tr>
+</table>
+<p>The mechanism that makes this possible is two independent Linux kernel features working together: <strong>namespaces</strong> for isolation and <strong>cgroups</strong> for resource limiting. Docker (and every other container runtime — containerd, CRI-O, Podman) is fundamentally a user-friendly interface over these two kernel facilities plus a packaging format (the image). Understanding namespaces and cgroups separately matters because they solve two completely different problems, and conflating them is where a lot of confusion about "what containers protect you from" comes from.</p>
+
+<h3>Namespaces: isolating what a process can see</h3>
+<p>A namespace wraps a global kernel resource so that a process inside the namespace sees its own isolated instance of that resource, while a process outside sees the real, full one (or a different isolated instance). Each namespace type virtualizes a different kind of resource:</p>
+<ul>
+<li><strong>PID namespace</strong> — the container's first process becomes PID 1 inside its own namespace, even though it's some arbitrary PID (say, 48213) on the host. Processes inside the container cannot see, signal, or even know about processes outside their PID namespace. This is why <code>ps aux</code> run inside a container shows only that container's processes.</li>
+<li><strong>Network namespace</strong> — gives the container its own network stack: its own loopback interface, its own routing table, its own set of IP addresses and ports. A process bound to port 8080 inside one container's network namespace does not conflict with a different process bound to port 8080 in a different network namespace on the same host — they're simply not the same port from the kernel's point of view.</li>
+<li><strong>Mount namespace</strong> — gives the container its own view of the filesystem tree. This is what makes a container's root filesystem (<code>/</code>) appear to be an entire independent Linux filesystem, built from the image's layers, even though it's really just a directory structure on the host's disk that this namespace has been told is root.</li>
+<li><strong>UTS namespace</strong> — isolates hostname and domain name, so each container can have its own hostname (typically set to the container ID by default).</li>
+<li><strong>IPC namespace</strong> — isolates System V IPC and POSIX message queues, so containers can't accidentally attach to each other's shared memory segments or semaphores.</li>
+<li><strong>User namespace</strong> — maps user and group IDs inside the container to a different (often unprivileged) range on the host, so a process that is "root" (UID 0) inside the container can be mapped to a genuinely unprivileged UID on the host, limiting the blast radius if a container process escapes.</li>
+</ul>
+<p>Put together: when you run a container, the runtime calls <code>clone()</code> (or <code>unshare()</code>) with a combination of these namespace flags, then execs your process inside that new set of namespaces. Nothing about this requires a hypervisor, a second kernel, or virtualized hardware — it's entirely the host kernel presenting different views of itself to different processes.</p>
+
+<h3>cgroups: limiting what a process can consume</h3>
+<p>Namespaces answer "what can this process see." They say nothing about "how much CPU or memory can this process use" — without a separate mechanism, a runaway container process could still consume 100% of the host's CPU or exhaust all its memory, starving every other container on the same machine. That's the job of control groups (cgroups), a completely separate kernel subsystem that lets you organize processes into hierarchical groups and attach resource limits and accounting to each group: CPU shares/quotas, memory limits, block I/O bandwidth, and number of processes (pids).</p>
+<p>When Docker or Kubernetes sets a memory limit on a container, it's writing that number into the container's cgroup (in cgroup v2, a file like <code>memory.max</code> under <code>/sys/fs/cgroup/.../memory.max</code>). When the processes in that cgroup collectively try to exceed that limit, the kernel's out-of-memory killer targets a process in that cgroup — not necessarily anywhere else on the host.</p>
+<div class="callout warn">
+<div class="callout-title">Why a JVM inside a container can get OOMKilled even though the heap "fits"</div>
+<p>A container's memory limit (set via <code>docker run -m</code> or Kubernetes' <code>resources.limits.memory</code>) caps the <em>total</em> memory of every process in the cgroup — heap, thread stacks, metaspace, direct buffers, JIT code cache, and the JVM's own native overhead, not just <code>-Xmx</code>. Older JVMs (pre-JDK 10, without proper cgroup awareness) would look at the host's total physical memory to size default heap fractions, completely ignoring the container's cgroup limit, and would happily try to grow the heap toward a fraction of, say, 64GB of host RAM while actually confined to a 512Mi cgroup. Modern JVMs (JDK 10+, with <code>-XX:+UseContainerSupport</code> enabled by default) correctly read the cgroup limits, but even then, if you set <code>-Xmx</code> close to the container's memory limit, there's no room left for non-heap memory, and the kernel's OOM killer terminates the process — which shows up as exit code 137 and a Pod status of <code>OOMKilled</code>, with no Java-level <code>OutOfMemoryError</code> or stack trace at all, because the JVM process was killed from outside, not from within. The fix is to always leave meaningful headroom between <code>-Xmx</code> and the container memory limit (a common starting point is capping heap at roughly 50-70% of the limit) to leave room for everything else the JVM needs.</p>
+</div>
+
+<div class="callout">
+<div class="callout-title">The isolation trade-off this architecture implies</div>
+<p>Because every container ultimately makes system calls into the same host kernel, a serious kernel vulnerability (a privilege escalation bug, a namespace-escape bug) can in principle let a process break out of its container and affect the host or other containers — something a hypervisor-level VM boundary is structurally harder to breach, because a VM guest doesn't share a kernel with anything. This is the real reason multi-tenant, security-sensitive workloads sometimes reach for gVisor, Kata Containers, or Firecracker microVMs (used by AWS Lambda and Fargate) — they wrap containers in either a userspace kernel emulation layer or an actual lightweight VM boundary, deliberately trading away some of the raw speed and density benefit of "just a process" in exchange for a stronger isolation guarantee.</p>
+</div>
+
+<h2>2. Docker Images, Layers, and Containers</h2>
+<p>An <strong>image</strong> is an immutable, read-only template: a filesystem snapshot plus metadata (default command, exposed ports, environment variables) needed to run something. A <strong>container</strong> is a running (or stopped) instance of an image — the same relationship as a class and an object. You can start many containers from the same image, each with its own writable layer, its own process tree, and its own network namespace, all sharing the same underlying read-only image data.</p>
+<p>An image is built as a stack of <strong>layers</strong>, and each layer corresponds to one instruction in the Dockerfile that modifies the filesystem (<code>RUN</code>, <code>COPY</code>, <code>ADD</code>) — instructions like <code>ENV</code>, <code>EXPOSE</code>, or <code>CMD</code> only add metadata and don't create a filesystem layer. Each layer is content-addressed (identified by a hash of its contents) and immutable once built. When a container runs, Docker stacks all of the image's read-only layers using a union filesystem (overlay2 is the current standard driver on Linux) and adds one thin writable layer on top, unique to that container instance. Any file the running process modifies gets copy-on-write semantics: the file is copied up into the container's writable layer before being changed, leaving the underlying image layers untouched. This is precisely why deleting a container doesn't affect the image, and why the same image can be safely used to spin up ten containers concurrently without them interfering with each other's filesystem writes.</p>
+
+<h3>Why layer ordering determines build cache efficiency</h3>
+<p>Docker caches each layer keyed by (a) the instruction and its arguments, and (b) the state of the layer below it. When you rebuild an image, Docker walks the Dockerfile top to bottom, and for each instruction, checks whether an identical instruction with an identical parent layer already exists in the cache. The moment one instruction's inputs differ from what's cached (e.g., a `COPY` picks up a changed file), that layer is rebuilt — and critically, <strong>every layer after it is invalidated too</strong>, even if their own inputs didn't change, because their parent layer changed.</p>
+<p>This is why a poorly ordered Dockerfile like the following is slow to iterate on:</p>
+<pre><code>FROM eclipse-temurin:21-jdk
+WORKDIR /app
+COPY . .
+RUN mvn -f pom.xml clean package -DskipTests
+</code></pre>
+<p>Here, <code>COPY . .</code> copies the entire source tree — including files that change on every single edit (a controller class, a test file) — into one layer, immediately before the expensive dependency-resolution-and-compile step. Any source change invalidates that <code>COPY</code> layer, which invalidates the <code>RUN mvn package</code> layer after it, forcing Maven to re-resolve every dependency from scratch on every single build. The fix is to order instructions from least-frequently-changing to most-frequently-changing, so cache hits survive as long as possible:</p>
+<pre><code>FROM eclipse-temurin:21-jdk AS build
+WORKDIR /app
+COPY pom.xml .
+RUN mvn -f pom.xml dependency:go-offline    # cached unless pom.xml changes
+COPY src ./src
+RUN mvn -f pom.xml clean package -DskipTests
+</code></pre>
+<p>Now, changing application source code only invalidates the last two layers; the (usually much slower) dependency-download layer stays cached as long as <code>pom.xml</code> is untouched.</p>
+
+<h2>3. A Dockerfile for a Java Application</h2>
+<h3>Base image choice: JDK vs JRE vs distroless</h3>
+<p>The base image you build on top of has a direct, measurable effect on final image size, attack surface, and startup behavior:</p>
+<table>
+<tr><th>Base image type</th><th>Contains</th><th>Typical use</th><th>Trade-off</th></tr>
+<tr><td>Full JDK (e.g. <code>eclipse-temurin:21-jdk</code>)</td><td>Compiler, debugger tools, full JRE</td><td>Build stage — needs <code>javac</code>, build tools</td><td>Large (300-500MB+); unnecessary at runtime</td></tr>
+<tr><td>JRE only (e.g. <code>eclipse-temurin:21-jre</code>)</td><td>Runtime only, no compiler</td><td>Runtime stage for a compiled app</td><td>Smaller than JDK, still a full Linux userspace (shell, package manager, coreutils)</td></tr>
+<tr><td>Slim/Alpine variants</td><td>Minimal Linux distro + JRE</td><td>Runtime stage, size-sensitive deployments</td><td>Smaller still; Alpine's musl libc can occasionally cause subtle native-library incompatibilities vs glibc</td></tr>
+<tr><td>Distroless (e.g. <code>gcr.io/distroless/java21</code>)</td><td>Just enough to run the JVM — no shell, no package manager, no coreutils</td><td>Production runtime, security-sensitive deployments</td><td>Smallest attack surface (nothing to <code>exec</code> into for an attacker who gets code execution) but harder to debug interactively — there's no shell to <code>docker exec</code> into</td></tr>
+</table>
+<p>The reasoning behind choosing JRE (or slimmer) over JDK for the final runtime image is simple: the compiler, javadoc tool, and other JDK-only binaries serve no purpose once your code is already compiled into <code>.class</code> files or a fat jar, and every byte and every binary you ship is both wasted image-pull bandwidth and additional attack surface (a compiler is also a tool an attacker with code execution could use).</p>
+
+<h3>Multi-stage builds</h3>
+<p>The mechanism that lets you use a large JDK image to <em>build</em> the application while shipping a small JRE image to <em>run</em> it is the multi-stage build: multiple <code>FROM</code> instructions in one Dockerfile, where later stages can selectively copy specific artifacts out of earlier stages using <code>COPY --from=&lt;stage&gt;</code>, discarding everything else the build stage contained (source code, the build tool itself, intermediate compiled classes, the dependency cache).</p>
+<pre><code># Stage 1: build — has Maven, the JDK, and the full source tree
+FROM eclipse-temurin:21-jdk AS build
+WORKDIR /app
+COPY pom.xml .
+RUN mvn -f pom.xml dependency:go-offline
+COPY src ./src
+RUN mvn -f pom.xml clean package -DskipTests
+
+# Stage 2: runtime — only the JRE and the built jar survive
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY --from=build /app/target/app.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+</code></pre>
+<p>The final image contains no Maven, no source code, no <code>.m2</code> dependency cache, and no build-time tooling — only the JRE and the one runnable artifact. This routinely shrinks a naive single-stage image from well over a gigabyte down to under 200-300MB, which matters directly for how fast a new Pod can pull the image and start (relevant when Kubernetes is scheduling replacement Pods under load, see the Horizontal Pod Autoscaling and rolling-update sections below).</p>
+<div class="callout tip">
+<div class="callout-title">Layer caching still applies across stages</div>
+<p>Each stage's layers are cached independently and reused across builds the same way single-stage layers are, including reuse via <code>--from</code>. This is why splitting the dependency-resolution step from the source-copy step (as shown above) is worth doing even inside a multi-stage build — it's an orthogonal optimization to the multi-stage split itself.</p>
+</div>
+
+<h2>4. Container Networking Basics</h2>
+<p>By default, Docker creates a <strong>bridge network</strong> on the host — a virtual switch (implemented as a Linux bridge device, commonly named <code>docker0</code>) that every container attaches to via a virtual ethernet pair, one end inside the container's network namespace and the other end plugged into the bridge. Containers on the same bridge can reach each other over this virtual LAN using their internal IP addresses, and the host can reach out to the internet on their behalf via NAT (network address translation) rules that Docker installs.</p>
+<p>Two mechanics matter in practice:</p>
+<ul>
+<li><strong>Port mapping</strong> (<code>docker run -p 8080:80</code>) — a container's internal port (say, 80, where the app inside actually listens) is not reachable from the host or the outside world unless explicitly published. The mapping <code>-p HOST_PORT:CONTAINER_PORT</code> tells Docker to install a NAT/iptables rule forwarding traffic arriving on the host's port 8080 to port 80 inside the container's network namespace. Without a published port, the container is only reachable from other containers on the same bridge network, not from the host machine's own network interface externally.</li>
+<li><strong>Name-based resolution on user-defined networks</strong> — the <em>default</em> bridge network (the one that exists automatically) does not provide DNS-based name resolution between containers; you'd have to use raw container IPs, which is fragile because IPs are reassigned on restart. If you instead create a user-defined bridge network (<code>docker network create my-net</code> and attach containers to it), Docker runs an embedded DNS server for that network, and containers can resolve each other purely by container name or service name (e.g., a container named <code>redis</code> is reachable from another container on the same network simply as the hostname <code>redis</code>, no IP needed). This is the entire reason a typical <code>docker-compose.yml</code> lets one service refer to another by its service name in a connection string — compose automatically creates a user-defined network for the whole file and attaches every service to it.</li>
+</ul>
+<p>This same idea — stable names instead of unstable IPs — reappears at a much larger scale as Kubernetes' Service abstraction, covered below, and is the same underlying problem discussed generally under <a href="#/microservice-patterns">microservice-patterns</a>' service discovery section.</p>
+
+<h2>5. Why Kubernetes Exists, and the Pod</h2>
+<p>Docker (or any single container runtime) answers "how do I package and run one container on one machine." It has no opinion about what happens across a fleet of machines: which machine a container should run on, what happens when that machine dies, how to run five replicas instead of one, how to roll out a new version without downtime, or how one service finds another when container IPs are constantly being created and destroyed. Kubernetes is an orchestration layer that answers exactly these fleet-level questions, by continuously reconciling a declared desired state (expressed as YAML) against the actual observed state of a cluster of machines (nodes).</p>
+<p>Kubernetes deliberately does not let you schedule a bare container. The smallest unit it schedules is a <strong>Pod</strong>. The reasoning: a container is, by design, a single isolated process (or process tree) — but real workloads sometimes need two or more processes that are so tightly coupled they must always be scheduled together, share a network identity, and share certain volumes. A canonical example is a main application container plus a sidecar container that tails and ships logs, or a service mesh proxy (like an Envoy sidecar in Istio) that intercepts all inbound/outbound traffic for the main container. Trying to schedule these as two independent containers with no relationship would let the scheduler place them on different nodes, which breaks the whole point — the sidecar needs to share the same network namespace and localhost as the main container.</p>
+<p>A Pod solves this by wrapping one or more containers with a shared network namespace (all containers in a Pod share one IP address and can reach each other over <code>localhost</code>) and optionally shared volumes, and guaranteeing they are always scheduled onto the same node together, created together, and destroyed together. The overwhelmingly common case is still one container per Pod — the sidecar pattern is the exception, not the default — but the abstraction exists specifically to handle the tightly-coupled case correctly rather than bolting it on later.</p>
+<div class="callout">
+<div class="callout-title">A Pod is disposable and gets a new IP every time</div>
+<p>Pods are not meant to be resurrected in place. If a Pod dies, Kubernetes does not restart "that same Pod" with its old IP intact in any durable sense that other components should rely on — it creates a brand-new Pod object, typically with a new IP address. This is precisely the instability that makes routing directly to Pod IPs unworkable at any real scale, and is the whole reason the Service abstraction (section 7) exists.</p>
+</div>
+
+<h2>6. Deployments and ReplicaSets</h2>
+<p>A <strong>ReplicaSet</strong> is the controller responsible for one job: ensure that exactly N Pods matching a given label selector are running at all times. It continuously watches the cluster state, and if the observed count of matching, healthy Pods drops below N (a Pod crashed, a node died), it creates new Pods to bring the count back up; if it's above N (a duplicate, a leftover), it deletes the excess. This reconciliation loop — compare desired vs actual, act on the difference, repeat — is the core operating pattern behind essentially every Kubernetes controller, not just ReplicaSets.</p>
+<p>You almost never create a ReplicaSet directly. Instead you create a <strong>Deployment</strong>, which manages ReplicaSets on your behalf and adds the one capability a bare ReplicaSet doesn't have: safely rolling out a change to the Pod template (a new image tag, a new environment variable) without downtime. When you update a Deployment's Pod template, it does not mutate the existing ReplicaSet's Pods in place — it creates a brand new ReplicaSet with the new template, and then incrementally shifts Pod count from the old ReplicaSet to the new one (scaling the new one up and the old one down in lockstep), governed by two settings:</p>
+<pre><code>spec:
+  replicas: 6
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # how many *extra* Pods over the desired count are allowed during rollout
+      maxUnavailable: 0  # how many of the desired count are allowed to be missing during rollout
+</code></pre>
+<p>With <code>maxSurge: 1</code> and <code>maxUnavailable: 0</code> on 6 replicas, Kubernetes will bring up 1 new-version Pod (total 7 momentarily), wait for it to become <strong>ready</strong> (this is exactly where readiness probes, discussed next, become load-bearing), then terminate one old-version Pod, and repeat — old Pods are only removed once a replacement new Pod has proven it can actually serve traffic. This is what makes a rolling update zero-downtime in practice, and it's also why a rollout can stall indefinitely: if new Pods never pass their readiness probe, the Deployment controller will not proceed to terminate any more old Pods, leaving the rollout parked at a mix of old and new versions rather than either failing loudly or completing.</p>
+<p>Because the old ReplicaSet isn't deleted (just scaled to zero), a Deployment also gives you rollback for free — <code>kubectl rollout undo</code> simply reverses the direction of the same scale-up/scale-down dance using the previous ReplicaSet's already-defined template.</p>
+
+<h2>7. Services: Stable Identity in Front of Unstable Pods</h2>
+<p>Given that Pods are disposable and get new IPs on every recreation, nothing in the system could reliably hardcode a Pod IP to talk to it — the moment that Pod is rescheduled, the IP is stale. A <strong>Service</strong> is Kubernetes' answer: a stable virtual IP and DNS name that sits in front of a dynamically changing set of Pods, selected by label, and load-balances traffic across whichever of those Pods are currently ready.</p>
+<p>Mechanically, a Service doesn't proxy traffic through a single bottleneck process in the typical case. <code>kube-proxy</code> (running on every node) watches the Kubernetes API for Service and Endpoint changes and programs the node's packet-filtering rules (iptables rules, or IPVS in higher-throughput setups) so that traffic sent to the Service's virtual IP is transparently rewritten (DNAT'd) to one of the backing Pod IPs directly at the kernel level — there's no separate load-balancer process the packet has to pass through, which keeps this fast. The list of currently-healthy Pod IPs backing a Service is tracked in an associated <code>Endpoints</code> (or <code>EndpointSlice</code>) object, which is kept in sync automatically as Pods come and go and as they pass or fail readiness checks.</p>
+<p>This is the same service-discovery problem discussed in <a href="#/microservice-patterns">microservice-patterns</a> — "how does caller A find a currently-live instance of service B without hardcoding IPs" — solved at the platform layer instead of via a client-side library or a separate discovery service like Eureka.</p>
+
+<h3>Service types</h3>
+<table>
+<tr><th>Type</th><th>What it does</th><th>Typical use</th></tr>
+<tr><td>ClusterIP (default)</td><td>Allocates a virtual IP reachable only from inside the cluster</td><td>Internal service-to-service communication — the overwhelming majority of Services</td></tr>
+<tr><td>NodePort</td><td>Additionally opens a fixed port (30000-32767 range) on every node's own IP, forwarding to the Service</td><td>Simple external access without a cloud load balancer, or as a building block other mechanisms use internally</td></tr>
+<tr><td>LoadBalancer</td><td>Additionally provisions an external, cloud-provider load balancer (an AWS NLB/ELB, GCP forwarding rule) that routes to the NodePort/Service</td><td>Production-grade external entry points, one per Service, each with a real external IP</td></tr>
+</table>
+<p>These are additive, not exclusive alternatives — a LoadBalancer-type Service still has a ClusterIP and a NodePort underneath; it just adds an externally-reachable layer on top. In practice, most production clusters expose only a small number of entry points via an <code>Ingress</code> resource (an L7 HTTP router, conceptually similar to the L7 load balancers discussed in <a href="#/hld-basics-scaling">hld-basics-scaling</a>) sitting in front of many ClusterIP Services, rather than giving every single Service its own expensive cloud load balancer.</p>
+
+<h2>8. Liveness vs Readiness Probes</h2>
+<p>Kubernetes needs a way to answer two genuinely different questions about a running container, and conflating them is one of the most common causes of self-inflicted outages during deploys:</p>
+<ul>
+<li><strong>Liveness probe</strong> answers: "is this process stuck/deadlocked/wedged and should be killed and restarted?" If the liveness probe fails repeatedly (per <code>failureThreshold</code>), the kubelet kills the container and a new one is started in its place — same Pod object, fresh container process.</li>
+<li><strong>Readiness probe</strong> answers: "is this container currently able to correctly handle a request right now?" If the readiness probe fails, the Pod is <em>not</em> killed — it's simply removed from the Service's Endpoints list, so no new traffic is routed to it, while it keeps running and gets a chance to recover.</li>
+</ul>
+<pre><code>livenessProbe:
+  httpGet:
+    path: /actuator/health/liveness
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /actuator/health/readiness
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 3
+</code></pre>
+<div class="callout warn">
+<div class="callout-title">Why conflating the two causes a slow-starting app to die in a restart loop</div>
+<p>A Spring Boot application performing schema migrations (Flyway/Liquibase), warming a cache, or establishing a connection pool at startup can easily take 30-60 seconds before it's actually capable of serving a request correctly — even though the HTTP server itself, and thus a naive health endpoint, may start responding to requests within a couple of seconds. If a single probe is used for both liveness and readiness with a short <code>initialDelaySeconds</code>, one of two bad things happens: either the probe is checking full readiness and the liveness check fails during legitimate startup work, causing Kubernetes to kill and restart the container before it ever finished starting — which restarts the clock on the same slow startup, producing <code>CrashLoopBackOff</code> indefinitely; or the probe is a trivial "process is up" check used for both, in which case the Pod gets marked ready and starts receiving real user traffic before its cache is warm or its migrations are done, causing a wave of errors right after every deploy. The fix is exactly why the two probes exist as separate concepts: liveness should be a cheap, minimal check that only fails when the process is truly wedged (so it should almost never trip during normal, if slow, startup — a generous <code>initialDelaySeconds</code> or a separate <code>startupProbe</code> that suppresses liveness checks until initial startup completes handles this), while readiness should be a more thorough check of actual capability to serve traffic, and is expected to legitimately fail during startup and immediately after a dependency (like a database) becomes briefly unavailable, without that ever triggering a restart.</p>
+</div>
+
+<h2>9. ConfigMaps and Secrets</h2>
+<p>Container images should be environment-agnostic — the same image built once should be deployable to staging and production without rebuilding it just to point it at a different database URL. Kubernetes externalizes this configuration through two objects that are mechanically similar but semantically distinct:</p>
+<ul>
+<li>A <strong>ConfigMap</strong> holds non-sensitive key-value configuration (a Spring profile name, a feature flag, a timeout value) and can be injected into a Pod either as environment variables or as mounted files.</li>
+<li>A <strong>Secret</strong> holds sensitive values (database passwords, API keys, TLS certificates) using the same mechanics as a ConfigMap (env vars or mounted files), but with additional handling: values are base64-encoded (not encrypted by default — this is an important, frequently misunderstood detail, since base64 is trivially reversible and Secrets need encryption-at-rest enabled at the cluster/etcd level to actually be encrypted on disk), and Kubernetes avoids writing Secret contents to disk on the node unnecessarily and can restrict which Pods/ServiceAccounts can read a given Secret via RBAC.</li>
+</ul>
+<pre><code>envFrom:
+  - configMapRef:
+      name: app-config
+  - secretRef:
+      name: app-secrets
+</code></pre>
+<p>Mounting as a file rather than an environment variable has one operational advantage worth knowing: a mounted ConfigMap/Secret volume can be configured to auto-update in place when the underlying object changes (the kubelet periodically re-syncs the mounted content), whereas environment variables are fixed at container start and require a Pod restart to pick up any change.</p>
+
+<h2>10. Resource Requests, Limits, and the Scheduler</h2>
+<p>Every container in a Pod can declare two different resource numbers, and the distinction between them drives two entirely different mechanisms:</p>
+<pre><code>resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+</code></pre>
+<p><strong>Requests</strong> are what the scheduler uses to decide <em>where</em> a Pod can be placed. The scheduler will only place a Pod onto a node that has at least that much unreserved capacity left (summed across all requests of Pods already on that node) — this is a scheduling-time guarantee, not a runtime enforcement. A node with 4 CPUs and 8GB of memory can host Pods whose requests sum up to at most that, regardless of what their limits say or what they actually use moment to moment.</p>
+<p><strong>Limits</strong> are what gets enforced at runtime via cgroups, as described in section 1. A container's memory limit becomes a hard ceiling — exceeding it gets the container OOMKilled by the kernel, no matter how much idle memory the node otherwise has. CPU limits are enforced differently: rather than killing the process, the kernel's CPU bandwidth controller throttles the container, denying it CPU time for the remainder of each scheduling period once it's used its allotted quota, which shows up as increased latency and CPU-throttling metrics rather than a crash.</p>
+<div class="callout">
+<div class="callout-title">Requests without limits, and the eviction connection</div>
+<p>If you set a request but no limit, a Pod can burst above its request and consume spare capacity on the node — useful for bursty workloads — but this also means a node can become genuinely overcommitted on actual usage (even though it was never overcommitted on requests). When a node runs low on an actual resource like memory, the kubelet's eviction manager kicks in and starts evicting Pods to relieve pressure, and it does so with a specific priority order: Pods whose usage exceeds their <em>requests</em> the most are evicted first (this is also influenced by Quality of Service class — <code>BestEffort</code> Pods with no requests/limits at all are evicted before <code>Burstable</code> Pods with requests below limits, which are evicted before <code>Guaranteed</code> Pods where requests equal limits exactly). Setting accurate requests is therefore not just a scheduling nicety — it directly determines which of your Pods get sacrificed first when a node is under memory pressure.</p>
+</div>
+
+<h2>11. Horizontal Pod Autoscaling</h2>
+<p>A Deployment's replica count is normally a static number you set — but real load is not static. The Horizontal Pod Autoscaler (HPA) is a controller that watches a metric (by default, average CPU utilization across the Deployment's Pods, sourced from the metrics-server; it can also watch memory or custom/external metrics like queue depth or requests-per-second via the custom metrics API) and adjusts the Deployment's replica count up or down to keep that metric near a target value.</p>
+<pre><code>apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: order-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+</code></pre>
+<p>This is a direct, automated implementation of the horizontal-scaling idea introduced in <a href="#/hld-basics-scaling">hld-basics-scaling</a>: instead of a person watching a dashboard and manually running a scale command, the reconciliation loop itself continuously measures load and adjusts capacity. It inherits the same precondition discussed there — Pods must be interchangeable (stateless, or with state externalized) for adding or removing replicas to be safe — and it composes directly with the Deployment's rolling-update mechanism and the readiness probe: newly created Pods from a scale-up event only start receiving traffic once their readiness probe passes, so a burst of new replicas doesn't get flooded with traffic before they've actually finished initializing.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+<details class="concept-qa">
+<summary>Why is a container so much faster to start than a VM, in mechanical terms?</summary>
+<div class="qa-body">Starting a VM requires a hypervisor to initialize virtual hardware and then boot an entire independent kernel on top of it — POST-equivalent firmware steps, kernel initialization, driver probing, an init system starting services — all before the actual application process can even begin. Starting a container skips all of that, because there is no second kernel to boot: the host kernel is already running. Starting a container is just the kernel setting up a handful of namespaces (via a `clone()`/`unshare()` call) and a cgroup, then exec-ing your process directly. The work involved is comparable to starting any ordinary process on the host, which is why containers start in milliseconds to low seconds while VMs take seconds to minutes.</div>
+</details>
+<details class="concept-qa">
+<summary>If containers share the host kernel, what is actually stopping one container from seeing or killing another container's processes?</summary>
+<div class="qa-body">The PID namespace. Each container gets its own PID namespace, and the kernel's process-tree data structures only expose, to a process inside a given PID namespace, the other processes that are also inside that same namespace (or a namespace nested under it). A `kill()` syscall targeting a PID that exists in a different, unrelated namespace simply has no valid target to act on, because PIDs are only meaningful within a namespace — the same numeric PID can refer to entirely different processes in different namespaces simultaneously. This is a kernel-enforced boundary, not an application-level convention, which is why it holds even for a malicious or buggy process inside the container.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does Kubernetes schedule Pods instead of individual containers?</summary>
+<div class="qa-body">Because some workloads consist of multiple containers that must be co-located on the same node, share a network namespace (so they can talk over localhost and share one IP), and be created/destroyed as a single unit — a sidecar log shipper or a service-mesh proxy alongside a main application container are the classic examples. If the scheduler placed containers independently, there would be no guarantee two related containers land on the same node, and no shared network identity between them. The Pod is the abstraction that groups containers with this tight coupling; the common single-container case is simply a Pod with one container in it, not a separate, simpler code path.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does a Service need to exist at all — why can't clients just call Pod IPs directly?</summary>
+<div class="qa-body">Because Pods are ephemeral by design: when a Pod is deleted and replaced (a crash, a rolling update, a scale-down/up, a node failure), Kubernetes creates a new Pod object, typically with a brand-new IP address — it does not preserve the old Pod's identity or IP. Any client that cached or hardcoded a Pod IP would start failing the moment that Pod was replaced, with no mechanism to learn the new IP. A Service provides a virtual IP and DNS name that stays constant across the entire lifetime of the Service object, while kube-proxy keeps the underlying mapping to currently-healthy Pod IPs continuously up to date in the kernel's packet-filtering rules — so clients only ever need to know the Service's stable identity, never any individual Pod's IP.</div>
+</details>
+<details class="concept-qa">
+<summary>Why can a container be killed for using "too much memory" even when the JVM's own heap settings look safe?</summary>
+<div class="qa-body">A container's memory limit is enforced by a cgroup, and the cgroup accounts for the total memory used by every process and every kind of memory allocation inside it — not just the JVM heap. Thread stacks, metaspace, the JIT compiler's code cache, direct/native byte buffers, and the JVM's own internal native structures all count against the same limit as the heap. If `-Xmx` is set very close to the container's memory limit, there's no room left for this non-heap overhead, and the kernel's out-of-memory killer terminates the entire process from outside the JVM — which is why the failure shows up as an externally-triggered `OOMKilled` / exit code 137 rather than a catchable `java.lang.OutOfMemoryError`. The JVM never gets a chance to log a heap dump or a stack trace, because it wasn't the JVM's own allocator that decided memory was exhausted; the kernel did.</div>
+</details>
+<details class="concept-qa">
+<summary>What's the practical difference between a liveness probe failing and a readiness probe failing?</summary>
+<div class="qa-body">A failing liveness probe results in the container being killed and restarted in place — the assumption is the process is unrecoverably stuck and a fresh process is the only way out. A failing readiness probe results in the Pod being pulled out of the Service's Endpoints list, so it simply stops receiving new traffic, while the container keeps running untouched and gets the chance to recover on its own (finish a slow startup task, reconnect to a database that blipped). Using the same check for both conflates "is this permanently broken" with "is this temporarily not ready," and the usual failure mode is a container getting killed mid-startup because a strict readiness-style check was wired up as the liveness probe, which resets the startup clock and can produce an indefinite restart loop.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does splitting a Dockerfile's COPY instructions (dependency manifest first, source code second) actually speed up builds?</summary>
+<div class="qa-body">Docker's build cache invalidates a layer, and every layer stacked after it, the moment that layer's inputs change. If the entire source tree is copied in one instruction right before the dependency-resolution-and-compile step, then any source code edit — even a one-line change in a class with no new dependencies — invalidates that copy layer and therefore the expensive dependency-download layer after it, forcing a full re-download on every build. By copying only the dependency manifest (`pom.xml`) first and running dependency resolution against just that, the dependency layer's cache key only changes when the manifest itself changes. Source code is copied in a separate, later instruction, so ordinary code edits only invalidate the cheap compile step, not the expensive network-bound dependency fetch.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/hld-basics-scaling'"><div class="rc-title">HLD Basics: Scaling & Load Balancers</div><div class="rc-sub">Days 01-05 · Horizontal Pod Autoscaling is an automated version of the same horizontal-scaling reasoning</div></div>
+<div class="related-card" onclick="window.location.hash='/microservice-patterns'"><div class="rc-title">Microservice Patterns</div><div class="rc-sub">Service discovery, sidecars, and container-to-container networking build directly on Kubernetes Services and Pods</div></div>
+<div class="related-card" onclick="window.location.hash='/ci-cd-deployment'"><div class="rc-title">CI/CD & Deployment</div><div class="rc-sub">Image builds, registries, and rolling Deployments are the mechanics a pipeline actually drives</div></div>
+<div class="related-card" onclick="window.location.hash='/observability-production'"><div class="rc-title">Observability in Production</div><div class="rc-sub">Probes, resource limits, and eviction all surface as metrics and alerts you need to interpret correctly</div></div>
+</div>

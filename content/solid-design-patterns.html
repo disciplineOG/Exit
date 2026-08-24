@@ -1,0 +1,374 @@
+<p class="topic-breadcrumb">Phase 2 — Framework Core & Mid-Scale Architecture · Days 31–35 · Spring / LLD</p>
+<h1>SOLID Principles & Design Patterns</h1>
+<div class="topic-tags">
+<span class="tag">Single Responsibility</span>
+<span class="tag">Open/Closed</span>
+<span class="tag">Liskov Substitution</span>
+<span class="tag">Interface Segregation</span>
+<span class="tag">Dependency Inversion</span>
+<span class="tag">Creational Patterns</span>
+<span class="tag">Structural & Behavioral Patterns</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Most "clean code" advice is aesthetic preference dressed up as law, but SOLID and the classic Gang-of-Four patterns describe something more mechanical: they predict which parts of a codebase will require a rewrite versus an edit when a new requirement lands. A class that violates Single Responsibility doesn't just "feel messy" — it means two unrelated teams will eventually edit the same file for unrelated reasons, and one of their changes will silently break the other's tests. Understanding these principles precisely, rather than as slogans, is what lets you predict where a design will crack under a specific kind of future change before you've written that change.</p>
+</div>
+
+<h2>1. Single Responsibility Principle (SRP)</h2>
+<p>The formal statement — "a class should have only one reason to change" — is easy to misread as "a class should do one thing," which is too vague to apply. The precise, mechanical test is: <strong>enumerate the distinct actors or business concerns that could each independently demand a change to this class</strong>. If that list has more than one entry, the class has more than one responsibility, and those responsibilities will eventually be pulled in different directions by different callers.</p>
+
+<pre><code>// VIOLATION: three unrelated reasons to change live in one class
+class InvoiceService {
+    Invoice createInvoice(Order order) { /* pricing + tax logic */ }
+
+    void saveInvoice(Invoice invoice) {
+        // JDBC connection handling, SQL strings
+        Connection conn = DriverManager.getConnection(DB_URL);
+        // ... raw SQL INSERT
+    }
+
+    String renderInvoiceHtml(Invoice invoice) {
+        // HTML templating logic mixed into the same class
+        return "&lt;html&gt;...&lt;/html&gt;";
+    }
+}</code></pre>
+
+<p>Ask "what would force <code>InvoiceService</code> to change?" and you get three unrelated answers: the finance team changes tax rules, the DBA changes the schema or switches from JDBC to a JPA repository, and a designer changes the invoice's HTML layout. None of these three people should need to touch, recompile, or re-review the other two concerns' code — but because they're in one class, a schema migration and a pricing bug fix now show up in the same diff, and a unit test for pricing logic has to spin up a database connection just to instantiate the class.</p>
+
+<pre><code>// FIX: one reason to change per class
+class InvoicePricingService {
+    Invoice createInvoice(Order order) { /* pricing + tax only */ }
+}
+class InvoiceRepository {
+    void save(Invoice invoice) { /* persistence only */ }
+}
+class InvoiceRenderer {
+    String toHtml(Invoice invoice) { /* presentation only */ }
+}</code></pre>
+
+<p>Concretely, what breaks when SRP is violated is <strong>testability</strong> (you can't unit test pricing without a live database), <strong>maintainability</strong> (a merge conflict between the DBA's schema change and the finance team's tax fix, in a file neither fully understands), and <strong>reusability</strong> (you can't reuse the pricing logic in a batch job without dragging along HTML rendering code and its templating dependency).</p>
+
+<div class="callout">
+<div class="callout-title">SRP is about actors, not line count</div>
+<p>A 500-line class that only ever changes for one reason (say, a state machine with many transitions) is not an SRP violation. A 20-line class that two unrelated teams need to modify for unrelated reasons is. Don't use size as a proxy — use "who asks for changes here."</p>
+</div>
+
+<h2>2. Open/Closed Principle (OCP)</h2>
+<p>A module should be <strong>open for extension but closed for modification</strong>: you should be able to add new behavior by adding new code, not by editing code that already works and is already covered by regression tests. The mechanism that makes this possible is polymorphism — you replace a conditional that branches on type with a common interface, and each new case becomes a new implementation rather than a new branch.</p>
+
+<pre><code>// VIOLATION: adding a payment method means editing this method again
+class PaymentProcessor {
+    void process(String type, double amount) {
+        if (type.equals("CREDIT_CARD")) {
+            // charge via card network
+        } else if (type.equals("PAYPAL")) {
+            // call PayPal API
+        }
+        // every new payment method edits this same method
+    }
+}</code></pre>
+
+<p>Every time a new payment method is added, you re-open a method that was already tested and working for credit cards and PayPal, risking a regression in code unrelated to the new feature. The fix inverts the direction of the dependency: define an abstraction, and let each case supply its own implementation.</p>
+
+<pre><code>interface PaymentMethod {
+    void process(double amount);
+}
+class CreditCardPayment implements PaymentMethod {
+    public void process(double amount) { /* card network call */ }
+}
+class PayPalPayment implements PaymentMethod {
+    public void process(double amount) { /* PayPal API call */ }
+}
+// Adding UpiPayment later requires zero edits to existing classes.
+class PaymentProcessor {
+    void process(PaymentMethod method, double amount) {
+        method.process(amount);
+    }
+}</code></pre>
+
+<p>Note that OCP is never absolute — somewhere, something has to map a request to a concrete <code>PaymentMethod</code> (a factory, a Spring bean lookup by qualifier, a registry populated at startup). OCP doesn't eliminate that decision point; it isolates it to one small, well-understood piece of wiring code instead of spreading the branching logic through business methods. This is also precisely the principle that the <a href="#/spring-core-mechanics">Strategy pattern</a> (covered below) exists to implement mechanically.</p>
+
+<h2>3. Liskov Substitution Principle (LSP)</h2>
+<p>LSP says a subtype must be usable through its supertype's reference without the caller noticing anything is different — the subtype must honor the supertype's <em>contract</em>, not merely its method signatures. This is a stronger requirement than "compiles without errors," because Java's type checker verifies signatures but has no way to verify behavioral promises like "this method never mutates the object's width independently of its height."</p>
+
+<div class="callout warn">
+<div class="callout-title">The classic Square-extends-Rectangle trap</div>
+<p>Modeling <code>Square</code> as a subclass of <code>Rectangle</code> looks correct geometrically — a square is a rectangle with equal sides — but it is an LSP violation in code, because <code>Rectangle</code>'s implicit contract is "setting width does not change height, and vice versa." A <code>Square</code> must break that contract to remain a valid square.</p>
+</div>
+
+<pre><code>class Rectangle {
+    protected int width, height;
+    void setWidth(int w)  { this.width = w; }
+    void setHeight(int h) { this.height = h; }
+    int area() { return width * height; }
+}
+
+class Square extends Rectangle {
+    @Override void setWidth(int w)  { width = height = w; }  // must keep sides equal
+    @Override void setHeight(int h) { width = height = h; }
+}
+
+// Caller written against the Rectangle contract:
+void resize(Rectangle r) {
+    r.setWidth(5);
+    r.setHeight(10);
+    assert r.area() == 50;   // holds for any real Rectangle...
+}
+resize(new Square(...));      // ...but fails for Square: area() == 100</code></pre>
+
+<p>The caller made a "reasonable assumption about the supertype's contract" — that width and height are independent — and that assumption is exactly what <code>Square</code> had to violate to satisfy its own invariant (equal sides). This is not a bug in the caller; it's a bug in the inheritance modeling. The fix is to stop expressing "is described by the same shape hierarchy" as "is a subtype of." Either make both immutable value types with no setters (so there's no mutation contract to violate), or don't use inheritance between them at all — model both as implementations of a `Shape` interface exposing only `area()`, with no shared mutable state or setters whose independence is assumed.</p>
+
+<p>The mechanical test for LSP, generalized beyond this example: for every method a subclass overrides, ask whether it (a) throws exceptions the superclass method didn't promise to throw, (b) returns a narrower or incompatible range of values, (c) weakens a precondition callers rely on, or (d) strengthens a postcondition in a way that surprises code written only against the supertype. Any "yes" is an LSP violation, regardless of whether the code compiles.</p>
+
+<h2>4. Interface Segregation Principle (ISP)</h2>
+<p>ISP says many small, client-specific interfaces beat one large interface that forces every implementer to provide (or stub out) methods it has no use for. The cost of violating ISP is concrete: implementers throw <code>UnsupportedOperationException</code> from methods they can't meaningfully support, and every caller of the fat interface is coupled to methods it doesn't call — meaning a change to an unrelated method's signature forces a recompile of code that never used it.</p>
+
+<pre><code>// VIOLATION: one fat interface for every kind of worker
+interface Worker {
+    void work();
+    void eat();
+    void attendStandup();
+}
+
+class RobotWorker implements Worker {
+    public void work() { /* fine */ }
+    public void eat() { throw new UnsupportedOperationException(); }         // robots don't eat
+    public void attendStandup() { throw new UnsupportedOperationException(); } // or stand up
+}</code></pre>
+
+<pre><code>// FIX: segregate by capability
+interface Workable  { void work(); }
+interface Eatable    { void eat(); }
+interface Attendable { void attendStandup(); }
+
+class HumanWorker implements Workable, Eatable, Attendable { ... }
+class RobotWorker  implements Workable { public void work() { ... } } // no stubs needed</code></pre>
+
+<p>A caller that only needs to trigger work should depend on <code>Workable</code>, not <code>Worker</code> — that way, adding a new method to <code>Attendable</code> (e.g., <code>void submitStandupNotes()</code>) never forces a recompile of code that only ever called <code>work()</code>. This composes directly with dependency inversion (next section): the whole point of depending on an abstraction is undermined if that abstraction is bloated enough to require irrelevant methods.
+
+<h2>5. Dependency Inversion Principle (DIP)</h2>
+<p>DIP is the principle most people conflate with dependency injection, but they are not the same thing — DIP is the design rule, DI is one mechanical technique for satisfying it. DIP states: <strong>high-level modules (business policy) should not depend on low-level modules (implementation detail); both should depend on an abstraction</strong>. The abstraction is owned by the high-level module, not the low-level one — this reversal of ownership is why it's called "inversion."</p>
+
+<pre><code>// VIOLATION: high-level policy depends directly on a low-level concrete class
+class OrderService {
+    private final MySqlOrderRepository repository = new MySqlOrderRepository();
+    void placeOrder(Order order) {
+        repository.save(order);   // hard-wired to MySQL, and to `new`
+    }
+}</code></pre>
+
+<p>Two things break here. First, <strong>testability</strong>: unit-testing <code>OrderService</code> means either running a real MySQL instance or leaving the test coupled to persistence details entirely unrelated to order-placement logic. Second, <strong>extensibility</strong>: switching to DynamoDB, or adding a caching layer in front of MySQL, means editing <code>OrderService</code> itself — a class that has nothing conceptually to do with which database is in use.</p>
+
+<pre><code>// FIX: high-level module depends on an abstraction it defines
+interface OrderRepository {           // owned by the high-level module's package
+    void save(Order order);
+}
+class OrderService {
+    private final OrderRepository repository;
+    OrderService(OrderRepository repository) { this.repository = repository; } // injected
+    void placeOrder(Order order) { repository.save(order); }
+}
+class MySqlOrderRepository implements OrderRepository { ... }  // low-level detail, depends on the abstraction too</code></pre>
+
+<p>Now both <code>OrderService</code> (high-level) and <code>MySqlOrderRepository</code> (low-level) depend on <code>OrderRepository</code> — neither depends on the other directly. Swapping persistence technology means writing a new class that implements the interface; <code>OrderService</code> never changes. Testing means passing an in-memory fake or a Mockito mock that implements <code>OrderRepository</code>. This is precisely why Spring's dependency injection container is meaningful rather than a convenience: it doesn't cause you to follow DIP, it just automates the wiring once your code already follows DIP. Injecting a concrete class directly (`new MySqlOrderRepository()` via `@Autowired` on the concrete type) gives you Spring's object graph management but none of DIP's actual decoupling — see <a href="#/spring-core-mechanics">Spring Core Mechanics</a> for how the container resolves interface-typed dependencies to concrete beans at runtime.</p>
+
+<table>
+<tr><th>Principle</th><th>One-line test</th><th>What breaks if violated</th></tr>
+<tr><td>SRP</td><td>List the actors who could force a change — is it more than one?</td><td>Unrelated changes collide in one file; hard to test in isolation</td></tr>
+<tr><td>OCP</td><td>Does adding a new case require editing existing, tested code?</td><td>Regressions in old behavior when adding new behavior</td></tr>
+<tr><td>LSP</td><td>Does the override change preconditions/postconditions callers assume?</td><td>Correct-looking code breaks at runtime for specific subtypes</td></tr>
+<tr><td>ISP</td><td>Does an implementer stub out methods it can't support?</td><td>Fake implementations, unrelated recompiles, brittle contracts</td></tr>
+<tr><td>DIP</td><td>Does the high-level class name a concrete low-level class?</td><td>Can't test without real infra; can't swap implementations</td></tr>
+</table>
+
+<h2>6. Creational Patterns: Deferring Object Construction</h2>
+<h3>Factory Method &amp; Abstract Factory</h3>
+<p>Reach for a factory when <strong>the exact concrete type needed isn't known until runtime</strong> — it depends on configuration, user input, or a request parameter — and you want callers to depend only on an interface, never on a constructor of a specific implementation (which would itself be a DIP violation).</p>
+<pre><code>interface NotificationSender { void send(String msg); }
+
+class NotificationFactory {
+    static NotificationSender create(String channel) {
+        return switch (channel) {
+            case "EMAIL" -> new EmailSender();
+            case "SMS"   -> new SmsSender();
+            case "PUSH"  -> new PushSender();
+            default -> throw new IllegalArgumentException(channel);
+        };
+    }
+}</code></pre>
+<p>Factory Method defers creation to a single method (often overridden per-subclass); <strong>Abstract Factory</strong> goes one level further and produces an entire family of related objects that must stay consistent with each other — e.g., a <code>UIFactory</code> interface with <code>DarkThemeFactory</code> and <code>LightThemeFactory</code> implementations, each producing a matching <code>Button</code>, <code>Checkbox</code>, and <code>ScrollBar</code> so you never accidentally mix a dark-theme button with a light-theme scrollbar. Use Abstract Factory specifically when creation decisions need to be made as a coordinated group, not independently per object.</p>
+
+<h3>Singleton — and why it's dangerous</h3>
+<p>Singleton restricts a class to exactly one instance, reachable globally. It's tempting for things like configuration readers or connection pools, but it comes with real costs: it introduces <strong>global mutable state</strong> (any code, anywhere, can read or mutate the single instance, making reasoning about state changes non-local), it makes <strong>testing harder</strong> (tests can't easily substitute a fake instance, and state leaks between tests unless explicitly reset), and naive lazy-initialization implementations have subtle <strong>thread-safety bugs</strong>.</p>
+<pre><code>// BROKEN under concurrency: two threads can both see instance == null
+class Config {
+    private static Config instance;
+    static Config getInstance() {
+        if (instance == null) {           // race window here
+            instance = new Config();
+        }
+        return instance;
+    }
+}</code></pre>
+<p>Synchronizing the whole method works but serializes every call forever, even after the instance exists. The standard fix in Java is the <strong>initialization-on-demand holder idiom</strong>, which leans on the JVM's own classloading guarantees instead of explicit locking:</p>
+<pre><code>class Config {
+    private Config() {}
+    private static class Holder {
+        static final Config INSTANCE = new Config();  // built lazily, thread-safely
+    }
+    static Config getInstance() {
+        return Holder.INSTANCE;
+    }
+}</code></pre>
+<p>The JVM guarantees a class is initialized at most once, and that initialization happens-before any subsequent access from any thread (JLS class-initialization semantics) — so <code>Holder</code> isn't loaded (and <code>INSTANCE</code> isn't constructed) until <code>getInstance()</code> is first called, and every thread that calls it afterward sees the fully-constructed instance with no explicit <code>synchronized</code> block on the hot path.</p>
+<div class="callout warn">
+<div class="callout-title">Singleton versus a Spring singleton-scoped bean</div>
+<p>Spring's default bean scope is also called "singleton," but it means something narrower and safer: one instance per <code>ApplicationContext</code>, not one instance per JVM process. You get the "shared instance" benefit without a hard-coded static accessor, and tests can spin up an independent context with its own instance — sidestepping most of classic Singleton's testing pain.</p>
+</div>
+
+<h3>Builder</h3>
+<p>Builder solves telescoping constructors — the pattern where a class with many optional fields grows an ever-longer chain of overloaded constructors to cover every combination of "which optional fields are set."</p>
+<pre><code>// VIOLATION: telescoping constructors
+new HttpRequest("GET", url, null, null, 30, false);   // what do these positions mean?
+
+// FIX: builder makes each optional field self-documenting and omittable
+HttpRequest req = HttpRequest.builder()
+    .method("GET")
+    .url(url)
+    .timeoutSeconds(30)
+    .build();  // headers and retry default sensibly, no positional guessing</code></pre>
+<p>Builder is most valuable exactly when a class has several optional constructor parameters with sensible defaults — it turns an error-prone positional call into a readable, self-validating sequence, and lets the class remain immutable (all fields set once, at <code>build()</code>, rather than via mutable setters scattered through calling code).</p>
+
+<h2>7. Structural Patterns: Composing Existing Interfaces</h2>
+<h3>Adapter</h3>
+<p>Adapter solves a narrow, specific problem: you have a class whose interface doesn't match what your code expects, and you cannot (or should not) modify that class — it's a third-party library, a legacy class with other callers, or a class you don't own the source of.</p>
+<pre><code>// Third-party class you can't change:
+class LegacyXmlParser {
+    String parseToXmlString(byte[] data) { ... }
+}
+// Your code expects this interface:
+interface JsonParser { String parseToJson(byte[] data); }
+
+// Adapter bridges the mismatch without touching LegacyXmlParser:
+class XmlToJsonAdapter implements JsonParser {
+    private final LegacyXmlParser legacy = new LegacyXmlParser();
+    public String parseToJson(byte[] data) {
+        String xml = legacy.parseToXmlString(data);
+        return convertXmlToJson(xml);
+    }
+}</code></pre>
+<p>The signal that you need Adapter, specifically, is "the shapes are incompatible but the underlying capability is the same" — contrast this with Decorator below, where the interface already matches and you're adding behavior, not translating it.</p>
+
+<h3>Decorator</h3>
+<p>Decorator attaches new behavior to an individual object at runtime, wrapping it behind the same interface, as an alternative to a combinatorial explosion of subclasses. If you had `Stream`, `BufferedStream`, `EncryptedStream`, `BufferedEncryptedStream`, `CompressedBufferedEncryptedStream`... you'd need a new subclass for every combination of behaviors. Decorator instead lets you compose independent wrappers at construction time.</p>
+<pre><code>interface DataSource { void write(String data); String read(); }
+
+class FileDataSource implements DataSource { ... }
+
+class EncryptionDecorator implements DataSource {
+    private final DataSource wrapped;
+    EncryptionDecorator(DataSource wrapped) { this.wrapped = wrapped; }
+    public void write(String data) { wrapped.write(encrypt(data)); }
+    public String read() { return decrypt(wrapped.read()); }
+}
+
+class CompressionDecorator implements DataSource {
+    private final DataSource wrapped;
+    CompressionDecorator(DataSource wrapped) { this.wrapped = wrapped; }
+    public void write(String data) { wrapped.write(compress(data)); }
+    public String read() { return decompress(wrapped.read()); }
+}
+
+// Compose freely at the call site — no new class needed for this combination:
+DataSource source = new EncryptionDecorator(new CompressionDecorator(new FileDataSource()));</code></pre>
+<p>Java's own I/O library is the canonical real-world instance of this pattern: <code>new BufferedReader(new InputStreamReader(new FileInputStream(file)))</code> wraps a raw byte stream first with character-decoding behavior, then with buffering behavior, each layer implementing the same <code>Reader</code>/<code>InputStream</code> surface as the layer it wraps. This is precisely why the constructor chaining looks nested rather than flat — you're stacking decorators, not calling a single constructor with many arguments.</p>
+
+<h2>8. Behavioral Patterns: Coordinating Runtime Interactions</h2>
+<h3>Strategy</h3>
+<p>Strategy encapsulates a family of interchangeable algorithms behind one interface and lets the caller select (or be configured with) whichever implementation applies, without the caller's code branching on type. This is the direct mechanical implementation of the <a href="#/spring-core-mechanics">Open/Closed Principle</a> described in section 2 — the <code>PaymentMethod</code> refactor earlier in this page <em>is</em> the Strategy pattern; OCP is the principle, Strategy is the reusable shape that satisfies it.</p>
+<pre><code>interface DiscountStrategy { double apply(double price); }
+class NoDiscount implements DiscountStrategy { public double apply(double p) { return p; } }
+class PercentageDiscount implements DiscountStrategy {
+    private final double pct;
+    PercentageDiscount(double pct) { this.pct = pct; }
+    public double apply(double p) { return p * (1 - pct); }
+}
+
+class Cart {
+    private DiscountStrategy strategy;   // swappable at runtime
+    void setStrategy(DiscountStrategy s) { this.strategy = s; }
+    double checkoutTotal(double subtotal) { return strategy.apply(subtotal); }
+}</code></pre>
+<p>The signal for Strategy specifically (versus Factory) is that you're choosing <em>behavior</em>, potentially swapping it more than once during an object's lifetime, rather than choosing which concrete object to construct once. In Spring, this shows up constantly as multiple beans implementing one interface, injected as a <code>List&lt;DiscountStrategy&gt;</code> or selected via a <code>@Qualifier</code>.</p>
+
+<h3>Observer</h3>
+<p>Observer decouples a subject (the thing whose state changes) from the objects that need to react to those changes, so the subject never needs to know the concrete types — or even the number — of things watching it.</p>
+<pre><code>interface OrderListener { void onOrderPlaced(Order order); }
+
+class OrderSubject {
+    private final List&lt;OrderListener&gt; listeners = new ArrayList&lt;&gt;();
+    void subscribe(OrderListener l) { listeners.add(l); }
+    void placeOrder(Order order) {
+        // ... persist order ...
+        for (OrderListener l : listeners) l.onOrderPlaced(order);  // subject doesn't know or care who's listening
+    }
+}
+
+class EmailNotifier implements OrderListener {
+    public void onOrderPlaced(Order order) { /* send confirmation email */ }
+}
+class InventoryUpdater implements OrderListener {
+    public void onOrderPlaced(Order order) { /* decrement stock */ }
+}</code></pre>
+<p>Adding a new reaction to "order placed" (say, triggering a fraud check) means writing a new <code>OrderListener</code> and subscribing it — <code>OrderSubject</code> itself never changes, which is Observer and OCP reinforcing each other. This is the same shape underlying Java's own event listener interfaces (<code>ActionListener</code>, <code>PropertyChangeListener</code>), Spring's <code>ApplicationEventPublisher</code>/<code>@EventListener</code> mechanism, and — at a larger scale — the publish/subscribe model behind message brokers, where the "subject" is a topic and "listeners" are consumer groups that can be added or removed without the producer's code changing at all.</p>
+
+<div class="callout tip">
+<div class="callout-title">Patterns are named shapes, not goals</div>
+<p>None of these patterns are things to apply for their own sake — each one is a named answer to a specific recurring problem shape (unknown-type-until-runtime, one-instance-needed, many-optional-fields, incompatible-interfaces, behavior-composition, algorithm-swapping, decoupled-reaction). The skill worth building is recognizing the problem shape in an unfamiliar codebase and reaching for the matching pattern — not memorizing UML diagrams.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why is "a class should do one thing" a bad restatement of the Single Responsibility Principle?</summary>
+<div class="qa-body">"One thing" is subjective and scales arbitrarily — a class that "parses a file" could be described as doing one thing, yet still mix parsing, validation, and error-formatting concerns that change for different reasons. The precise, actionable test is enumerating the distinct actors or business concerns that could independently trigger a change to the class. If a database schema change and a tax-rule change both require editing the same class, it has two responsibilities regardless of how you'd describe its "one thing" in English. This actor-based framing is also what makes SRP testable in code review: ask "who would ask for this change?" for every method, and group by answer.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why exactly does Square extending Rectangle violate Liskov Substitution, when a square genuinely is a rectangle mathematically?</summary>
+<div class="qa-body">LSP is about behavioral contracts, not set-theoretic truth. Geometrically a square is a rectangle, but the Java <code>Rectangle</code> class as typically implemented carries an implicit contract that width and height can be set independently — code written against <code>Rectangle</code> reasonably assumes calling <code>setWidth</code> doesn't change <code>height</code>. A <code>Square</code> subclass must violate that independence to preserve its own invariant (equal sides), which means any caller relying on the supertype's contract gets wrong answers when handed a <code>Square</code> through a <code>Rectangle</code> reference. The fix isn't to "model reality correctly" — it's to recognize that mutable setters with an independence contract and a subtype with an equal-sides invariant are fundamentally incompatible, and to model both as immutable value types or siblings under a narrower interface instead.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What's the actual difference between Dependency Inversion and Dependency Injection?</summary>
+<div class="qa-body">Dependency Inversion is a design principle: high-level and low-level modules should both depend on an abstraction that the high-level module owns, rather than the high-level module naming a concrete low-level class directly. Dependency Injection is one mechanical technique for supplying an object with its collaborators from outside (via constructor, setter, or field) rather than having it construct them itself. You can do DI without DIP — for example, injecting a concrete <code>MySqlOrderRepository</code> directly into a constructor still satisfies "the object doesn't construct its own dependency," but the high-level class is still coupled to a concrete low-level implementation, so swapping databases still requires editing it. DIP is what makes DI worth doing; DI is just the plumbing.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does the initialization-on-demand holder idiom avoid explicit synchronization, and what guarantee is it relying on?</summary>
+<div class="qa-body">It relies on the JVM's class-initialization semantics defined in the Java Language Specification: a class is initialized at most once, initialization is guaranteed to complete before any thread can observe a static field of that class, and the JVM itself handles the necessary locking during that one-time initialization. By putting the singleton instance in a nested static holder class that isn't referenced anywhere except inside <code>getInstance()</code>, the JVM doesn't load or initialize <code>Holder</code> — and therefore doesn't construct <code>INSTANCE</code> — until the first call to <code>getInstance()</code>. Every subsequent access, from any thread, is a plain static field read with no lock, because the happens-before relationship from class initialization already guarantees visibility of the fully-constructed instance.</div>
+</details>
+
+<details class="concept-qa">
+<summary>How can you tell whether a situation calls for Adapter versus Decorator, since both wrap another object behind an interface?</summary>
+<div class="qa-body">The distinguishing question is whether the interfaces already match. Adapter exists because the wrapped object's interface is incompatible with what the caller expects — the adapter's job is translation between two different shapes, and you typically use exactly one adapter per incompatible class, added once. Decorator exists when the interface already matches perfectly, and the goal is to layer additional behavior (buffering, encryption, compression, logging) onto an object transparently — decorators are designed to be stacked in arbitrary combinations, each one both implementing and wrapping the same interface. If you find yourself asking "how do I make this fit," it's Adapter; if you're asking "how do I add a capability without subclassing," it's Decorator.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is Strategy described as a mechanical implementation of the Open/Closed Principle, rather than just an unrelated pattern that happens to use interfaces?</summary>
+<div class="qa-body">Open/Closed says new behavior should be addable via new code, not edits to existing tested code, and that this is achieved through abstraction and polymorphism. Strategy is precisely that: it defines an interface for a family of algorithms, and adding a new algorithm means writing a new class implementing that interface — nothing about the interface, the caller that invokes it, or the other existing strategies needs to change. The two are not analogous, they are the same mechanism described at two levels: OCP is the principle (what property the design should have), Strategy is the reusable structural pattern that produces that property whenever the "different case" you're handling is a swappable algorithm rather than, say, a swappable object type (which would instead point you toward Factory Method).</div>
+</details>
+
+<details class="concept-qa">
+<summary>Concretely, what goes wrong in production if a fat interface (violating Interface Segregation) is left unaddressed as a system grows?</summary>
+<div class="qa-body">Two compounding problems appear as more implementers and callers accumulate. First, implementers that can't meaningfully support every method end up throwing <code>UnsupportedOperationException</code> or returning silent no-ops, which turns compile-time type safety into a runtime landmine — code compiles cleanly against the interface but fails only when a specific method is actually invoked on a specific implementer. Second, every caller of the fat interface becomes coupled to methods it never calls: adding or changing a method signature anywhere on the interface forces recompilation and re-review of callers that only ever used a different, unrelated method, which slows down otherwise-unrelated changes and increases the blast radius of code review. Splitting into focused interfaces bounds both problems to only the callers and implementers that actually care about each capability.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/spring-core-mechanics'"><div class="rc-title">Spring Core Mechanics</div><div class="rc-sub">Days 26–30 · How the IoC container automates dependency injection once your classes already follow DIP</div></div>
+<div class="related-card" onclick="window.location.hash='/lld-parking-lot'"><div class="rc-title">LLD: Parking Lot</div><div class="rc-sub">Days 36–40 · Applies SRP, Strategy, and Factory together in a full class-design exercise</div></div>
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience & Fault Tolerance</div><div class="rc-sub">Days 46–50 · Circuit breakers and retry policies are commonly implemented as Strategy/Decorator wrappers</div></div>
+<div class="related-card" onclick="window.location.hash='/modern-java-features'"><div class="rc-title">Modern Java Features</div><div class="rc-sub">Days 21–25 · Records and sealed interfaces change how cleanly you can express Strategy and Factory outputs</div></div>
+</div>

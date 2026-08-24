@@ -1,0 +1,230 @@
+<p class="topic-breadcrumb">Phase 2 — Framework Core & Mid-Scale Architecture · Days 26–30 · Spring / LLD</p>
+<h1>Spring Data JPA & Hibernate Internals</h1>
+<div class="topic-tags">
+<span class="tag">Persistence Context</span>
+<span class="tag">Dirty Checking</span>
+<span class="tag">N+1 Queries</span>
+<span class="tag">Lazy Loading</span>
+<span class="tag">@Transactional</span>
+<span class="tag">Write-Behind Flushing</span>
+<span class="tag">Locking</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Almost every confusing Hibernate bug — an update that silently didn't happen, a <code>LazyInitializationException</code> thrown in a view template, a service method that logs "saved" three times because of a hidden N+1 query, or a rollback that erased an audit log you thought was already committed — traces back to one of exactly four mechanisms: the persistence context's identity map, dirty checking, lazy proxy resolution, and transaction propagation boundaries. None of these are exotic; they are direct, load-bearing consequences of how Hibernate and Spring's transaction proxy work together. Once you can trace an entity's state and a transaction's boundary by hand, these bugs stop looking mysterious and start looking inevitable given the code that produced them.</p>
+</div>
+
+<h2>1. The Persistence Context: Identity Map and First-Level Cache</h2>
+<p>A <code>Session</code> (Hibernate) or <code>EntityManager</code> (JPA) is backed by a <strong>persistence context</strong> — a per-transaction (by default) in-memory map from entity identity (entity type + primary key) to a managed Java object. This is not a general-purpose cache in the sense of "reduce database load across requests"; it exists to guarantee a much stricter property: <strong>within one persistence context, there is exactly one Java object representing a given row.</strong></p>
+<p>Concretely: if you call <code>entityManager.find(Order.class, 5L)</code> twice inside the same transaction, the second call does not hit the database at all — it returns the exact same object reference as the first call, verifiable with <code>==</code>. This is called the <strong>identity map</strong> pattern, and it exists to solve a real problem: without it, loading the same row twice would give you two different Java objects, and if you mutated both, whichever got flushed last would silently win, with no way to detect the conflict at the object-graph level. The identity map guarantees that "the same row" and "the same object" are the same statement anywhere within a transaction, which is what lets Hibernate track changes coherently.</p>
+<h3>What actually lives in the persistence context</h3>
+<ul>
+<li>The identity map itself (id → managed entity).</li>
+<li>A snapshot of each managed entity's state <em>as it was when loaded</em> (or last flushed) — this is what dirty checking diffs against.</li>
+<li>A list of pending actions (inserts, updates, deletes) that have not yet been written to the database.</li>
+</ul>
+<div class="callout">
+<div class="callout-title">First-level cache is not optional and not shareable</div>
+<p>Unlike a second-level cache (e.g. Ehcache/Redis configured via <code>@Cacheable</code>), the first-level cache is always on, cannot be disabled, and is strictly scoped to one persistence context — it is never shared across threads or transactions. This is why it doesn't help with cross-request performance; its job is correctness (identity + change tracking) within a unit of work, not throughput.</p>
+</div>
+
+<h2>2. Dirty Checking: How Hibernate Knows What to Write</h2>
+<p>You never call <code>entity.save()</code> on a managed entity to persist a field change. You mutate a setter, and at flush time Hibernate compares the entity's current field values against the snapshot it took when the entity became managed. Any field that differs gets included in an <code>UPDATE</code> statement — this comparison is called <strong>dirty checking</strong>.</p>
+<p>This is why the following works without any explicit save call inside a <code>@Transactional</code> method:</p>
+<pre><code>@Transactional
+public void renameCustomer(Long id, String newName) {
+    Customer c = customerRepository.findById(id).orElseThrow();
+    c.setName(newName); // no save() call
+} // flush happens here, at commit</code></pre>
+<p><code>findById</code> returns a <em>managed</em> entity — one attached to the persistence context. Mutating it marks the context dirty for that entity. At transaction commit, Hibernate flushes: it walks every managed entity, diffs against its stored snapshot, and generates the necessary <code>UPDATE</code> for any entity whose fields changed. If you had instead called a query method that returns a DTO or a detached entity, this would not work — there'd be nothing to dirty-check.</p>
+<div class="callout warn">
+<div class="callout-title">Dirty checking cost scales with entity size and field count</div>
+<p>The snapshot comparison is a field-by-field diff done in Java, not SQL. For entities with many columns or large embedded objects, this has a real, measurable cost when a persistence context holds thousands of managed entities (a common trap in batch jobs that load a huge list and mutate a few of them). This is one reason batch-processing code is usually written to periodically call <code>entityManager.flush()</code> followed by <code>entityManager.clear()</code> — clearing detaches everything and resets the persistence context so it doesn't grow unbounded.</p>
+</div>
+
+<h2>3. Entity Lifecycle States</h2>
+<p>Every JPA entity instance is, at any moment, in exactly one of four states. The state determines what Hibernate will do with it and whether dirty checking applies at all.</p>
+<table>
+<tr><th>State</th><th>Meaning</th><th>How it got there</th><th>Tracked by persistence context?</th></tr>
+<tr><td>Transient</td><td>A plain Java object; Hibernate has never seen it</td><td><code>new Order()</code></td><td>No</td></tr>
+<tr><td>Managed / Persistent</td><td>Has a persistence context tracking it; changes are dirty-checked and flushed</td><td><code>persist()</code>, <code>find()</code>/<code>getReferenceById()</code>, result of a query, or <code>merge()</code>'s return value</td><td>Yes</td></tr>
+<tr><td>Detached</td><td>Has a database identity but is no longer tracked; mutations are silently ignored by Hibernate</td><td>Persistence context closed/cleared, or <code>entityManager.detach(e)</code></td><td>No</td></tr>
+<tr><td>Removed</td><td>Scheduled for deletion at next flush; still tracked until flush executes</td><td><code>entityManager.remove(e)</code> on a managed entity</td><td>Yes (until flushed)</td></tr>
+</table>
+<h3>The transitions, precisely</h3>
+<ul>
+<li><strong>Transient → Managed:</strong> <code>persist(entity)</code>. Assigns the entity to the persistence context; the <code>INSERT</code> is queued, not necessarily executed immediately (see write-behind, below).</li>
+<li><strong>Managed → Detached:</strong> happens implicitly when the persistence context ends (transaction commits and the <code>EntityManager</code> closes, in a typical Spring Data setup where each transaction gets its own context), or explicitly via <code>detach()</code>/<code>clear()</code>.</li>
+<li><strong>Detached → Managed:</strong> <em>never automatically</em>. You must call <code>merge(detachedEntity)</code>, which copies the detached entity's state onto a (possibly newly loaded) managed entity and returns <em>that</em> managed copy — the original detached object you passed in remains detached. Calling a setter on the original object after <code>merge()</code> does nothing.</li>
+<li><strong>Managed → Removed:</strong> <code>remove(entity)</code>; the entity must be managed first (calling <code>remove</code> on a detached entity throws <code>IllegalArgumentException</code>, unless you re-attach via <code>merge</code> first).</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">The classic merge() mistake</div>
+<p>A very common bug: loading an entity in one request, sending it to a client, receiving a modified version back, and then calling <code>repository.save(modifiedEntity)</code> on it. Spring Data's <code>save()</code> delegates to <code>persist()</code> for new entities and <code>merge()</code> for entities with a non-null id that JPA considers "existing." If the incoming object has fields you didn't intend to overwrite (e.g. a stale <code>createdAt</code> or an omitted collection), <code>merge()</code> will happily overwrite the persisted row's columns with whatever came in — there's no partial-update semantics here. This is why DTO-based updates (load the managed entity fresh, apply only the specific field changes) are usually safer than merging a whole detached graph from the wire.</p>
+</div>
+
+<h2>4. The N+1 Query Problem</h2>
+<p>This is the most common Hibernate performance defect in production code, and it is a direct consequence of lazy loading combined with iteration.</p>
+<pre><code>@Entity
+class Department {
+    @Id Long id;
+    @OneToMany(mappedBy = "department", fetch = FetchType.LAZY)
+    List&lt;Employee&gt; employees;
+}
+
+List&lt;Department&gt; depts = departmentRepository.findAll(); // 1 query
+for (Department d : depts) {
+    System.out.println(d.getEmployees().size()); // 1 query PER department
+}</code></pre>
+<p><code>findAll()</code> issues one <code>SELECT * FROM department</code>. Because <code>employees</code> is <code>LAZY</code>, Hibernate populates each <code>Department</code> with a proxy collection that has not been initialized. The moment you call <code>.size()</code> (or iterate it, or call any method that forces initialization), Hibernate issues a fresh <code>SELECT * FROM employee WHERE department_id = ?</code> for <em>that one</em> department. With 50 departments, that's 1 + 50 = 51 queries — the "N+1." The failure mode is insidious precisely because it's invisible in unit tests with small datasets and only becomes a visible latency problem at production scale, where N is in the hundreds or thousands.</p>
+<h3>The fixes, and their trade-offs</h3>
+<table>
+<tr><th>Fix</th><th>Mechanism</th><th>Trade-off</th></tr>
+<tr><td><code>JOIN FETCH</code></td><td>Explicit JPQL that eagerly loads the association in the same query, via a SQL join</td><td>Fast, one round trip; but combining <code>JOIN FETCH</code> with pagination on the "many" side produces incorrect or memory-exploding results (Hibernate warns and, in some cases, paginates in memory) — don't paginate a query that fetch-joins a collection</td></tr>
+<tr><td><code>@EntityGraph</code></td><td>Declarative annotation telling Spring Data which associations to eagerly fetch for a specific repository method, without hand-writing JPQL joins</td><td>Cleaner and composable per-query, but under the hood still generates a join (or a secondary <code>SELECT</code> depending on the graph type), so the same pagination caveat can apply</td></tr>
+<tr><td>Batch fetching (<code>@BatchSize</code> or <code>hibernate.default_batch_fetch_size</code>)</td><td>Instead of one query per parent, Hibernate groups pending lazy initializations and issues one query per batch using <code>WHERE department_id IN (?, ?, ..., ?)</code></td><td>Turns N+1 into roughly N/batchSize+1 queries; doesn't eliminate extra round trips entirely but drastically reduces them, and works fine with pagination since it doesn't change the shape of the original query</td></tr>
+</table>
+<div class="callout tip">
+<div class="callout-title">Picking between them</div>
+<p><code>JOIN FETCH</code> / <code>@EntityGraph</code> are best when you know, for a specific use case, that you always need the association and there's no pagination involved. Batch fetching is the pragmatic default for list-then-paginate screens where you sometimes need the association and can't safely fetch-join. A DTO projection (see below) sidesteps the whole question by never loading the entity graph at all.</p>
+</div>
+
+<h2>5. Lazy vs Eager Loading and LazyInitializationException</h2>
+<p><code>FetchType.LAZY</code> defers loading an association until it's actually accessed; <code>FetchType.EAGER</code> loads it immediately as part of the owning entity's query (via a join or a secondary select). JPA's defaults are easy to get backwards from memory: <code>@ManyToOne</code> and <code>@OneToOne</code> default to <code>EAGER</code>; <code>@OneToMany</code> and <code>@ManyToMany</code> default to <code>LAZY</code>. In practice, almost everyone overrides the defaults to make every association <code>LAZY</code> explicitly, because eager loading composes badly: if entity A eagerly loads B, and B eagerly loads C, fetching a single A can silently pull in a much larger object graph than intended, and that cost is invisible at the call site — nothing in <code>repository.findById(id)</code> tells you how much data is about to come back.</p>
+<p>The cost of choosing <code>LAZY</code> everywhere is the risk of <code>LazyInitializationException</code>: Hibernate represents a lazy association with a proxy object (for <code>@ManyToOne</code>/<code>@OneToOne</code>) or a lazy-loading collection wrapper (for <code>@OneToMany</code>/<code>@ManyToMany</code>). That proxy holds a reference back to the <code>Session</code> that created it. If you try to access the association <em>after</em> that session has closed — which, in a typical Spring Data setup, happens right after your <code>@Transactional</code> method returns — there is no active session left to run the initialization query, and Hibernate throws rather than silently returning null or stale data.</p>
+<pre><code>@Transactional(readOnly = true)
+public Department getDepartment(Long id) {
+    return departmentRepository.findById(id).orElseThrow();
+} // session closes here
+
+// later, in a controller or view:
+department.getEmployees().size(); // LazyInitializationException — no session</code></pre>
+<h3>The standard fixes</h3>
+<ul>
+<li><strong>Fetch joins:</strong> write the query to eagerly bring in exactly the associations the caller needs, scoped to that one use case, rather than changing the mapping's global fetch type.</li>
+<li><strong>DTO projections:</strong> query directly into a flat DTO (via JPQL constructor expressions, Spring Data projections, or a mapping library) so the controller/view never touches a managed entity or its proxies at all. This is generally the most robust fix because it also avoids over-fetching and decouples your API shape from your entity graph.</li>
+<li><strong>Open Session in View (OSIV):</strong> a servlet filter (enabled by default in Spring Boot via <code>spring.jpa.open-in-view=true</code>) that keeps the Hibernate session open for the entire HTTP request, not just the <code>@Transactional</code> method, so lazy associations can still be initialized while rendering a view.</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">Why Open Session in View is controversial</div>
+<p>OSIV makes the symptom disappear without fixing the cause: it hides N+1 problems by moving lazy-initialization queries out of your service layer and into whatever happens to touch the entity later (a JSON serializer, a template engine), where they're harder to see, profile, and reason about. It also holds a database connection checked out from the pool for the full duration of request processing — including view rendering and any slow downstream calls — which under load can exhaust the connection pool much faster than a design where connections are held only for the duration of the actual transaction. Spring Boot ships it enabled by default specifically for developer convenience, and logs a warning about it on startup; most production-hardened setups explicitly disable it and use fetch joins or DTOs instead.</p>
+</div>
+
+<h2>6. @Transactional Mechanics: Proxies, Propagation, and Self-Invocation</h2>
+<p><code>@Transactional</code> is not a language feature — it's implemented the same way as the rest of Spring's declarative behavior, described in <a href="#/spring-core-mechanics">Spring Core Mechanics</a>: an AOP proxy wraps the bean, and the transactional advice runs <em>before the proxy delegates the call to the real method</em>. This has one direct, frequently-surprising consequence: <strong>self-invocation bypasses the proxy.</strong></p>
+<pre><code>@Service
+public class OrderService {
+    public void placeOrder(Order o) {
+        // called directly on 'this' — no proxy involved
+        saveOrder(o); // @Transactional is silently ignored here
+    }
+
+    @Transactional
+    public void saveOrder(Order o) { ... }
+}</code></pre>
+<p>Calling <code>saveOrder</code> from within <code>placeOrder</code> in the same class invokes the method directly on the raw <code>this</code> reference, never passing through the CGLIB/JDK dynamic proxy that Spring created around the bean. The transactional interceptor lives on the proxy, not on the object itself, so it never runs — <code>saveOrder</code> executes with no transaction whatsoever, and if it throws halfway through, whatever it already wrote stays written. The fix is either to call through a self-injected proxy reference, split the method into a separate bean, or use <code>AopContext.currentProxy()</code> (which requires exposing the proxy explicitly).</p>
+
+<h3>Propagation types</h3>
+<p>Propagation controls what happens when a <code>@Transactional</code> method is called while a transaction is already active.</p>
+<table>
+<tr><th>Propagation</th><th>Behavior when a transaction already exists</th><th>Behavior when none exists</th></tr>
+<tr><td>REQUIRED (default)</td><td>Joins the existing transaction — same connection, same commit/rollback unit</td><td>Starts a new one</td></tr>
+<tr><td>REQUIRES_NEW</td><td>Suspends the outer transaction, opens a brand-new, fully independent transaction on a separate connection, commits/rolls it back independently, then resumes the outer one</td><td>Starts a new one (same as REQUIRED in this case)</td></tr>
+<tr><td>NESTED</td><td>Creates a savepoint within the same physical transaction/connection; rolling back the nested part rolls back only to that savepoint, not the whole transaction</td><td>Starts a new one (behaves like REQUIRED)</td></tr>
+</table>
+<p>The distinction between REQUIRES_NEW and NESTED is the one most often blurred, and it matters mechanically: REQUIRES_NEW uses a <em>second physical database connection</em> and a genuinely separate commit — once it commits, that data is durable even if the outer transaction later rolls back completely. NESTED uses the <em>same connection</em> and the same underlying transaction, just with a savepoint marker (via JDBC's <code>Connection.setSavepoint()</code>); if the outer transaction rolls back entirely, everything inside the nested savepoint rolls back with it, because it was never a separate commit — it's still one physical transaction. NESTED also requires a JDBC driver and connection pool that support savepoints (Spring's <code>DataSourceTransactionManager</code> supports it; not all transaction managers do, e.g. JTA-based ones typically don't).</p>
+<div class="callout tip">
+<div class="callout-title">Concrete scenario where the choice matters: audit logging</div>
+<p>Suppose <code>processPayment()</code> calls <code>auditLogService.logAttempt(...)</code> and then does the actual charge, which might throw. You want the audit log entry to survive even if the payment fails and the outer transaction rolls back — for example, to have a durable record that an attempt was made. If <code>logAttempt</code> is <code>REQUIRED</code>, it joins the same transaction as the payment logic; when the payment fails and the outer transaction rolls back, the audit row rolls back with it — you lose exactly the record you needed. Marking <code>logAttempt</code> as <code>REQUIRES_NEW</code> forces it onto an independent transaction that commits on its own as soon as <code>logAttempt</code> returns, so the log entry is durably written regardless of what happens afterward in the caller. This is the standard justification for REQUIRES_NEW: any write that must survive independently of the outer unit of work's outcome.</p>
+</div>
+
+<h3>Isolation levels</h3>
+<p><code>@Transactional(isolation = Isolation.READ_COMMITTED)</code> is a Spring-level request; Spring doesn't implement isolation itself — it sets the isolation level on the underlying JDBC <code>Connection</code> (<code>connection.setTransactionIsolation(...)</code>) before the transaction begins, and the actual guarantees are then enforced entirely by the database engine, as covered in <a href="#/database-architecture">Database Architecture</a>. This means the same <code>Isolation.REPEATABLE_READ</code> annotation can behave differently across database vendors — Postgres's REPEATABLE READ is snapshot-based and prevents phantom reads in practice, while MySQL/InnoDB's REPEATABLE READ (its default) uses next-key locking with somewhat different phantom-read behavior. Spring also can't retroactively raise isolation above what the underlying connection pool or database default allows; if you don't set it explicitly, <code>Isolation.DEFAULT</code> just means "whatever the database's default is," which is READ COMMITTED on Postgres and Oracle but REPEATABLE READ on MySQL.</p>
+
+<h2>7. Write-Behind Flushing: When SQL Actually Runs</h2>
+<p>A very common misconception is that calling a setter, or even calling <code>repository.save()</code>, immediately issues an <code>UPDATE</code>/<code>INSERT</code> to the database. It usually does not. Hibernate uses <strong>write-behind</strong> semantics: it queues pending inserts/updates/deletes in the persistence context's action queue and only actually sends SQL to the database at specific, well-defined flush points:</p>
+<ol>
+<li><strong>Before executing a query</strong> that could be affected by pending changes — Hibernate auto-flushes so the query sees consistent data. For example, if you've modified an entity's <code>status</code> field and then run a JPQL query filtering on <code>status</code>, Hibernate flushes first so the query doesn't return stale results from before your in-memory change.</li>
+<li><strong>At transaction commit</strong> — the most common trigger; everything pending gets flushed right before the underlying JDBC transaction commits.</li>
+<li><strong>On an explicit call to <code>entityManager.flush()</code></strong> — used deliberately, e.g. to get a generated ID back immediately, or in batch processing to periodically push the action queue to the database and then <code>clear()</code> the context.</li>
+</ol>
+<div class="callout">
+<div class="callout-title">Why write-behind exists</div>
+<p>Batching writes lets Hibernate group same-shape statements together (with <code>hibernate.jdbc.batch_size</code> configured, several <code>INSERT</code>s can be sent to the driver as one JDBC batch instead of N round trips), and it lets dirty checking do its job once per entity per transaction rather than issuing an <code>UPDATE</code> on every individual setter call. The cost is exactly the confusion this section addresses: "I called <code>setStatus()</code> — why doesn't the database show the new value yet?" The answer is always: because nothing has forced a flush yet, and the object in memory is already correct even though the row isn't.</p>
+</div>
+<div class="callout warn">
+<div class="callout-title">Auto-flush and native queries</div>
+<p>The auto-flush-before-query behavior applies to JPQL/Criteria queries that Hibernate can statically analyze. It generally does <em>not</em> apply to native SQL queries run via <code>createNativeQuery</code> unless you explicitly configure a <code>FlushModeType</code> or manage it yourself — a frequent source of "I updated the entity, then ran a native query, and it still shows the old value" bugs.</p>
+</div>
+
+<h2>8. Concurrency Control: Optimistic Locking and Pessimistic Locking</h2>
+<p>Both mechanisms solve the same underlying problem — two transactions reading and then writing the same row without either being aware of the other, resulting in a lost update — but they solve it with opposite philosophies about whether conflicts are rare or expected.</p>
+<h3>Optimistic locking via @Version</h3>
+<pre><code>@Entity
+class Account {
+    @Id Long id;
+    BigDecimal balance;
+    @Version
+    Long version;
+}</code></pre>
+<p>Hibernate adds a version column and rewrites every <code>UPDATE</code> for that entity to check-and-increment it atomically:</p>
+<pre><code>UPDATE account SET balance = ?, version = version + 1
+WHERE id = ? AND version = ?  -- the version value read at load time</code></pre>
+<p>If another transaction updated the row (and thus incremented <code>version</code>) between when this transaction read the row and when it tries to write, the <code>WHERE version = ?</code> clause matches zero rows. Hibernate checks the JDBC update count; when it's 0 where 1 was expected, it throws <code>OptimisticLockException</code> (wrapped as <code>ObjectOptimisticLockingFailureException</code> in Spring Data). No row-level database lock is held while the transaction is thinking — the check happens entirely at write time, which is why it's called optimistic: it assumes conflicts are uncommon and pays the cost of detecting them only when they actually occur, rather than paying a locking cost on every read.</p>
+<h3>Pessimistic locking via @Lock(PESSIMISTIC_WRITE)</h3>
+<p>Pessimistic locking instead prevents the conflict from being possible at all, by taking a database row lock at read time:</p>
+<pre><code>@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select a from Account a where a.id = :id")
+Account findByIdForUpdate(@Param("id") Long id);</code></pre>
+<p>This compiles down to <code>SELECT ... FROM account WHERE id = ? FOR UPDATE</code>. The database itself blocks any other transaction that tries to acquire a conflicting lock on that row (another <code>FOR UPDATE</code>, or in some databases even a plain write) until this transaction commits or rolls back. This trades throughput for certainty: it eliminates the race but means every reader-then-writer serializes on that row for the duration of the transaction, which is exactly the kind of contention that causes connection pool exhaustion and timeouts under load if the transaction holding the lock is slow or long-running.</p>
+<table>
+<tr><th></th><th>Optimistic (@Version)</th><th>Pessimistic (SELECT ... FOR UPDATE)</th></tr>
+<tr><td>Where the conflict is caught</td><td>At write time, via a failed <code>WHERE version = ?</code> match</td><td>Never happens — contenders block until the lock is released</td></tr>
+<tr><td>Cost when conflicts are rare</td><td>Very low — no locks held during read</td><td>Unnecessary serialization even when nobody actually collides</td></tr>
+<tr><td>Cost when conflicts are frequent</td><td>High — retries pile up, users see failures</td><td>Predictable, but throughput drops as lock hold time grows</td></tr>
+<tr><td>Failure mode under contention</td><td>Client-visible exception, requires an explicit retry strategy</td><td>Increased latency / potential lock timeouts and deadlocks</td></tr>
+<tr><td>Typical fit</td><td>Web request flows where conflicts are occasional (e.g. two admins editing the same record)</td><td>Short, critical sections where correctness must not depend on a retry (e.g. decrementing finite inventory)</td></tr>
+</table>
+<div class="callout tip">
+<div class="callout-title">Optimistic locking composes with retry, not with silence</div>
+<p><code>@Version</code> only helps if something actually catches <code>OptimisticLockException</code> and retries the read-modify-write cycle (typically with a bounded number of attempts and possibly a backoff, echoing the retry patterns in <a href="#/resilience-fault-tolerance">Resilience & Fault Tolerance</a>). If nothing catches it, the exception just propagates up as a failed request — which is correct behavior (you did prevent a lost update) but is often mistaken for a bug rather than the locking mechanism doing exactly its job.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+<details class="concept-qa">
+<summary>Why does calling find() twice on the same id return the identical object reference, and why does that matter for correctness, not just performance?</summary>
+<div class="qa-body">The persistence context maintains an identity map keyed by (entity type, primary key). The first call loads the row and registers the resulting object in that map. The second call checks the map first, finds an entry, and returns that exact reference without touching the database. This matters beyond avoiding a redundant query: if two calls returned two different objects representing the same row, and code mutated both independently, Hibernate would have no way to know which set of changes should win at flush time, and you could silently lose one side's changes with no error at all. Guaranteeing one object per row within a unit of work makes "the object" and "the row" synonymous for the duration of the transaction, which is what dirty checking and the overall unit-of-work model depend on.</div>
+</details>
+<details class="concept-qa">
+<summary>Why is FetchType.LAZY considered the safer default even though it introduces the risk of LazyInitializationException?</summary>
+<div class="qa-body">EAGER loading's cost is invisible and unbounded at the call site: fetching one entity can transitively pull in an arbitrarily large graph through chained eager associations, and there's no way to tell from `repository.findById(id)` how much data is about to load. That cost shows up as a production slowdown that's hard to trace back to a single annotation. LAZY loading's cost, by contrast, is visible and immediate: accessing an uninitialized association outside a session throws a specific, unambiguous exception at a specific line, which is far easier to diagnose and fix (with a fetch join, an entity graph, or a DTO) than a graph that's simply larger than expected. Failing loudly and immediately is preferable to failing silently and slowly.</div>
+</details>
+<details class="concept-qa">
+<summary>Walk through exactly why calling an @Transactional method from another method in the same class does not start a transaction.</summary>
+<div class="qa-body">Spring implements @Transactional using an AOP proxy — either a JDK dynamic proxy (if the bean implements an interface) or a CGLIB subclass proxy (otherwise) — that wraps the target bean. The transactional interceptor logic lives on that proxy, not inside the target class's bytecode. When Spring wires the bean into other beans, it injects the proxy, so calls arriving from outside the class go through the proxy and trigger the interceptor. But a call made from one method to another *within the same class* is a plain Java method call on `this`, which refers to the raw target object, never the proxy that wraps it. The call bypasses the proxy entirely, so the transactional advice around it never executes, and the method runs with whatever transaction (if any) was already active in the caller — often none.</div>
+</details>
+<details class="concept-qa">
+<summary>What's the mechanical difference between REQUIRES_NEW and NESTED, and why does that difference determine whether an outer rollback can undo the inner work?</summary>
+<div class="qa-body">REQUIRES_NEW suspends the current transaction and opens a second, physically independent transaction on a separate database connection. That inner transaction commits or rolls back completely on its own; once it commits, the data is durable no matter what the outer transaction later does, because there was never a shared commit unit between them. NESTED, by contrast, stays on the same physical connection and the same outer transaction, just marking a savepoint with the JDBC driver. Rolling back to that savepoint undoes only the work after it, but if the outer transaction itself rolls back entirely, everything — including everything inside the nested savepoint — rolls back too, because it was always part of one physical transaction that never separately committed.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does an N+1 query problem often pass unnoticed in tests but cause real latency in production?</summary>
+<div class="qa-body">The number of extra queries scales with the number of parent rows fetched, N. In a unit test or a local demo, N is often 1-5, so the "extra" queries add a few milliseconds nobody notices, and the returned data is correct, so the test passes. In production, N might be in the hundreds or thousands for a busy list endpoint, so the same code pattern turns into hundreds of extra sequential round trips to the database, each paying full network and query-planning latency, easily turning a sub-100ms endpoint into a multi-second one. Nothing about the code's correctness changed between test and production — only the cardinality of the loop that triggers the lazy loads, which is exactly why load or scale testing (not just correctness testing) is what actually surfaces this class of bug.</div>
+</details>
+<details class="concept-qa">
+<summary>If dirty checking automatically detects field changes, why does JPA still provide an explicit merge() method?</summary>
+<div class="qa-body">Dirty checking only works on entities the current persistence context is already tracking as managed. A detached entity — one that arrived from outside the current unit of work, such as an object deserialized from a previous request or held across two separate transactions — has no snapshot in this persistence context to diff against, so mutating its fields does nothing observable to Hibernate. merge() exists to bridge that gap: it takes the detached object's state, loads (or locates) the corresponding managed entity in the current context, copies the detached state onto it, and returns that managed copy. From that point on, ordinary dirty checking applies to the returned object — but critically not to the original detached object you passed in, which is a common source of confusion when code keeps mutating the original reference after calling merge().</div>
+</details>
+<details class="concept-qa">
+<summary>Why does Open Session in View reduce visible LazyInitializationExceptions without actually fixing the underlying performance problem?</summary>
+<div class="qa-body">OSIV keeps a Hibernate session (and the database connection backing it) open for the full duration of an HTTP request rather than closing it when the @Transactional service method returns. This means lazy associations touched later — in a JSON serializer or a template — can still be initialized on demand, because there's still a live session to run the query. It removes the exception, but it does nothing to reduce the number of queries being issued; an N+1 pattern still issues N+1 queries, they've simply moved to wherever serialization happens, outside the boundaries of the transaction and often outside of what gets measured as "the transaction's" cost. It also extends how long a connection is checked out from the pool to cover rendering time, which under concurrent load increases the odds of exhausting the pool — trading a loud, easy-to-find exception for a quieter, harder-to-diagnose throughput problem.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/spring-core-mechanics'"><div class="rc-title">Spring Core Mechanics</div><div class="rc-sub">Days 21–25 · AOP proxies are exactly what makes @Transactional work, and why self-invocation breaks it</div></div>
+<div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">Isolation levels, locking, and MVCC that @Transactional ultimately delegates to</div></div>
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience & Fault Tolerance</div><div class="rc-sub">Retry strategies needed to make optimistic locking failures actually recoverable</div></div>
+<div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Consistency trade-offs that generalize the single-database locking choices here</div></div>
+</div>

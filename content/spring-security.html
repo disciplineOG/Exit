@@ -1,0 +1,262 @@
+<p class="topic-breadcrumb">Phase 3 — Advanced Systems, Security &amp; LLD Machine Coding · Days 41–45 · Security / LLD</p>
+<h1>Spring Security: OAuth2, OIDC, JWT, RBAC</h1>
+<div class="topic-tags">
+<span class="tag">Filter Chain</span>
+<span class="tag">Authentication vs Authorization</span>
+<span class="tag">OAuth2 Authorization Code Flow</span>
+<span class="tag">OIDC &amp; ID Tokens</span>
+<span class="tag">JWT Verification</span>
+<span class="tag">Stateless Auth</span>
+<span class="tag">RBAC / SpEL</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Almost every confusing authentication or authorization bug in a Spring application comes from conflating things that are actually distinct: an access token is not an identity assertion, a 401 is not a 403, and "the token is valid" is not the same claim as "the token was issued by who I think issued it." If you understand the filter chain as an ordered pipeline of single-purpose servlet filters, and you understand exactly what a JWT's signature does and does not prove, you can predict things like why a perfectly well-formed token gets rejected after a key rotation, why revoking a stateless token is fundamentally hard, and why a public client redirecting through a browser cannot safely receive a raw access token the way a confidential server-side client can. None of this is framework trivia — it's the reasoning that lets you design an auth system instead of copying one.</p>
+</div>
+
+<h2>1. The Filter Chain: Where Security Actually Happens</h2>
+<p>Before a request from the network ever reaches a <code>@RestController</code> method, it passes through the servlet container's filter chain — a sequence of <code>javax.servlet.Filter</code> (or <code>jakarta.servlet.Filter</code>) implementations, each of which can inspect the request, reject it, modify it, or pass it along to the next filter by calling <code>chain.doFilter(request, response)</code>. Spring Security's entire model is built as a large, ordered stack of filters registered into this chain through a single entry point: <code>DelegatingFilterProxy</code>, which the servlet container knows about, forwards every request into <code>FilterChainProxy</code> — a Spring-managed bean that owns the actual, configurable list of security filters.</p>
+<p>This design exists because authentication and authorization are cross-cutting concerns that must run <em>before</em> business logic, for every request, regardless of which controller eventually handles it. Doing this with filters (rather than, say, an interceptor invoked from within Spring MVC's dispatch) means unauthenticated or unauthorized requests can be rejected before any Spring MVC machinery — argument resolution, validation, controller invocation — even starts, which is both a performance and a security boundary: nothing downstream of the filter chain should ever need to re-check "is this request authenticated," because the filter chain already guarantees it by the time a controller method runs.</p>
+<h3>1.1 The default filters and their order</h3>
+<p>The exact set of filters is configurable, but a typical chain for a JWT-secured API, in the order they execute, looks like this:</p>
+<pre><code>SecurityContextPersistenceFilter / SecurityContextHolderFilter
+  -> CorsFilter
+  -> CsrfFilter
+  -> (custom) JwtAuthenticationFilter          [your own filter, if using JWTs]
+  -> UsernamePasswordAuthenticationFilter      [form login, if enabled]
+  -> BasicAuthenticationFilter                 [HTTP Basic, if enabled]
+  -> ExceptionTranslationFilter
+  -> FilterSecurityInterceptor / AuthorizationFilter
+  -> ... reaches DispatcherServlet -> Controller</code></pre>
+<ul>
+<li><strong><code>SecurityContextHolderFilter</code></strong> (the modern replacement for <code>SecurityContextPersistenceFilter</code>) runs first and is responsible for loading any existing <code>SecurityContext</code> (from a session, in stateful setups) into <code>SecurityContextHolder</code> for the duration of the request, and clearing it afterward so no state leaks between requests handled on the same thread.</li>
+<li><strong><code>CsrfFilter</code></strong> validates a CSRF token on state-changing requests (POST/PUT/DELETE) for browser-based, cookie-authenticated sessions. It exists because a browser automatically attaches cookies to any request to a domain, including ones triggered by a malicious third-party page — CSRF protection defeats this by requiring a token the attacker's page cannot read or forge. It is normally irrelevant (and disabled) for stateless, header-based JWT APIs, because there's no ambient cookie for a forged cross-site request to ride on in the first place.</li>
+<li><strong>An authentication filter</strong> — <code>UsernamePasswordAuthenticationFilter</code> for form login, <code>BasicAuthenticationFilter</code> for HTTP Basic, or a custom filter such as a <code>JwtAuthenticationFilter</code> you write yourself — is responsible for one job: take credentials off the incoming request (a header, a form body, a cookie), build an unauthenticated <code>Authentication</code> object from them, hand it to an <code>AuthenticationManager</code> to actually verify it, and, on success, populate the <code>SecurityContext</code> with the now-authenticated result.</li>
+<li><strong><code>ExceptionTranslationFilter</code></strong> wraps everything downstream of it in a try/catch. It catches two specific exception types — <code>AuthenticationException</code> (you are not who you claim to be, or you claimed to be no one) and <code>AccessDeniedException</code> (you are known, but not allowed to do this) — and translates them into the correct HTTP response: a 401 with a challenge for the former, a 403 for the latter, or a redirect to a login page in browser-based flows. This is the single place responsible for turning internal Java exceptions into the correct wire-level status code, which is exactly why hand-throwing a raw exception from inside a controller for an auth failure doesn't produce the same behavior as failing during the filter phase.</li>
+<li><strong><code>AuthorizationFilter</code></strong> (the modern replacement for <code>FilterSecurityInterceptor</code>) runs last, right before the request reaches the <code>DispatcherServlet</code>. It consults the configured authorization rules (URL-pattern-based rules from <code>authorizeHttpRequests()</code>) against the current <code>Authentication</code> in the <code>SecurityContext</code> and either lets the request proceed or throws <code>AccessDeniedException</code>, which then propagates back up to <code>ExceptionTranslationFilter</code>.</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">Order is not cosmetic — it's the entire security model</div>
+<p>Filters run in a strict, fixed order, and that order is what makes the whole system sound. Authorization must run after authentication (you can't check permissions on an identity that hasn't been established yet), and exception translation must wrap both, because both can fail and both failures need converting to the correct status code rather than leaking as an unhandled 500. If a custom filter — say, a JWT-validating filter — is registered <em>after</em> <code>AuthorizationFilter</code> instead of before it, authorization runs against an empty, anonymous <code>SecurityContext</code> every time, and every request gets rejected as unauthenticated regardless of whether the token was valid, because the token was never actually read yet at the point authorization ran.</p>
+</div>
+
+<h2>2. Authentication vs Authorization, Modeled Precisely</h2>
+<p>These are two genuinely separate questions, and Spring Security keeps them as separate concerns in its object model rather than conflating them into one "is this request allowed" check:</p>
+<ul>
+<li><strong>Authentication</strong> answers "who are you?" — establishing and verifying an identity.</li>
+<li><strong>Authorization</strong> answers "given that I know who you are, what are you allowed to do?" — a decision made <em>after</em> authentication, against a known identity.</li>
+</ul>
+<p>Conflating them causes a specific, observable bug: returning a 401 when a 403 is correct (or vice versa). A 401 (Unauthorized — a genuinely confusing HTTP name, since it really means "unauthenticated") should mean "I don't know who you are, or your credentials are invalid/missing" — the correct response is for the client to (re-)authenticate. A 403 (Forbidden) should mean "I know exactly who you are, and you are not allowed to do this" — re-authenticating won't help, because the problem isn't identity, it's permission. Getting this wrong misleads clients into retrying an authentication flow that can never succeed, or silently accepting a permission failure as if it were a login problem.</p>
+<h3>2.1 The core objects</h3>
+<table>
+<tr><th>Object</th><th>Holds</th><th>Role</th></tr>
+<tr><td><code>Authentication</code></td><td><strong>principal</strong> (who — typically a <code>UserDetails</code> or a custom object), <strong>credentials</strong> (password/token, usually erased after authentication succeeds), <strong>authorities</strong> (a collection of <code>GrantedAuthority</code>, i.e. what this identity is allowed to do)</td><td>Represents one authentication attempt/result, before <em>and</em> after verification (an unauthenticated <code>Authentication</code> has <code>isAuthenticated() == false</code> until an <code>AuthenticationProvider</code> verifies it)</td></tr>
+<tr><td><code>SecurityContext</code></td><td>A single <code>Authentication</code> object</td><td>The container for "the currently authenticated identity, for this context"</td></tr>
+<tr><td><code>SecurityContextHolder</code></td><td>A <code>SecurityContext</code>, stored in a <strong>ThreadLocal</strong> by default</td><td>The static access point every part of the application uses to ask "who is making this request right now?" — e.g. <code>SecurityContextHolder.getContext().getAuthentication()</code></td></tr>
+</table>
+<p>The <code>ThreadLocal</code> storage strategy is a deliberate, consequential design decision. A servlet container typically handles one request per thread (in the traditional blocking Servlet model), so binding the authenticated identity to the thread means any code anywhere in the call stack — a service, a repository, an AOP aspect — can retrieve "who is calling right now" without that identity being explicitly threaded through every method signature as a parameter. This is convenient, but it has a sharp edge: if application code hands work off to a different thread (an <code>@Async</code> method, a manually spawned thread, a reactive scheduler thread), that new thread has its own, empty <code>ThreadLocal</code>, and <code>SecurityContextHolder.getContext().getAuthentication()</code> on it returns an anonymous, unauthenticated context — not an error, just silently no identity. Spring provides <code>DelegatingSecurityContextExecutor</code> and similar wrappers specifically to propagate the context across such a thread hop; without them, security context does not cross a thread boundary automatically.</p>
+<div class="callout">
+<div class="callout-title">Roles are just authorities with a naming convention</div>
+<p>There is no separate "role" type in the object model. A <code>GrantedAuthority</code> is just a string (e.g. <code>"ROLE_ADMIN"</code>, <code>"SCOPE_read"</code>, <code>"perm:orders:cancel"</code>). "Role-based" access control is a convention layered on top: authorities prefixed <code>ROLE_</code> are treated specially by role-checking helpers like <code>hasRole("ADMIN")</code>, which under the hood just checks for the authority string <code>"ROLE_ADMIN"</code> — the prefix is added for you. Fine-grained permission checks (<code>hasAuthority("perm:orders:cancel")</code>) use the exact same underlying mechanism with no prefix convention. This is worth internalizing because it means RBAC and finer-grained permission systems are not two different mechanisms in Spring Security — they're the same authority-checking mechanism applied to differently-named strings.</p>
+</div>
+
+<h2>3. OAuth2 From First Principles</h2>
+<p>OAuth2 solves one specific problem: letting a third-party application act on a resource owner's behalf against some resource, <strong>without that application ever seeing the resource owner's actual password</strong>. Before OAuth2 existed in practice, the common (bad) pattern was: a third-party app asks the user for their password to some other service directly, stores it, and uses it to log in as the user whenever needed. This is broken for obvious reasons — the third party now permanently holds a credential that can do everything the real password can do, there's no way to grant partial/scoped access, and there's no way to revoke the third party's access without changing the user's actual password everywhere.</p>
+<p>OAuth2 replaces "give the app your password" with "the app gets a scoped, revocable token, issued directly by the service that owns the data, after you approve it — the app never touches your password." This requires distinguishing four roles precisely, because conflating them is where most confusion about OAuth2 comes from:</p>
+<table>
+<tr><th>Role</th><th>Who it is</th></tr>
+<tr><td>Resource Owner</td><td>The user — the person who owns the data/account and can grant access to it</td></tr>
+<tr><td>Client</td><td>The third-party application requesting access (e.g., a web app wanting to read a user's calendar)</td></tr>
+<tr><td>Authorization Server</td><td>The system that authenticates the resource owner and issues tokens after consent (e.g., Google's OAuth endpoint)</td></tr>
+<tr><td>Resource Server</td><td>The API that actually holds the protected data and accepts the token as proof of authorized access (may be the same physical system as the authorization server, or a separate one)</td></tr>
+</table>
+<h3>3.1 The Authorization Code flow, step by step</h3>
+<p>This is the flow used by server-side (confidential) clients — applications that have a backend capable of keeping a secret. It's built specifically to avoid ever putting a usable access token where a browser, a browser history entry, or an HTTP <code>Referer</code> header could leak it.</p>
+<ol>
+<li>The client redirects the user's browser to the authorization server's <code>/authorize</code> endpoint, including its <code>client_id</code>, a <code>redirect_uri</code>, the requested <code>scope</code>, and a <code>state</code> parameter (an opaque, client-generated value used to prevent CSRF against the callback — the client verifies on return that the <code>state</code> it gets back matches what it sent).</li>
+<li>The authorization server authenticates the resource owner (login form) if not already authenticated, and shows a consent screen describing exactly what the client is asking to access.</li>
+<li>If the user approves, the authorization server redirects the browser back to the client's <code>redirect_uri</code> with a short-lived, single-use <strong>authorization code</strong> appended as a query parameter (and the original <code>state</code> echoed back).</li>
+<li>The client's backend — not the browser — makes a direct, server-to-server POST request to the authorization server's <code>/token</code> endpoint, presenting the authorization code along with its <code>client_id</code> and <code>client_secret</code>, and exchanges the code for an <strong>access token</strong> (and typically a <strong>refresh token</strong>).</li>
+<li>The client now calls the resource server's APIs, attaching the access token (normally as <code>Authorization: Bearer &lt;token&gt;</code>).</li>
+</ol>
+<pre><code>Browser                Client backend            Authorization Server        Resource Server
+   |--- GET /authorize?client_id&amp;redirect_uri&amp;scope&amp;state -->|
+   |<---------- login + consent screen -----------------------|
+   |---- user approves -------------------------------------->|
+   |<--- 302 redirect to redirect_uri?code=XYZ&amp;state=... ------|
+   |--- GET redirect_uri?code=XYZ ---->|
+                                       |--- POST /token {code, client_id, client_secret} -->|
+                                       |<--------------- access_token, refresh_token --------|
+                                       |--- GET /resource  Authorization: Bearer &lt;token&gt; -------------------------->|
+                                       |<---------------------------------- protected data ---------------------------|</code></pre>
+<div class="callout tip">
+<div class="callout-title">Why exchange a code instead of returning the token directly in the redirect</div>
+<p>Step 3 could, in principle, skip the code and put the access token directly in the redirect back to the client (this is essentially what the older, now-discouraged Implicit flow did). The reason the Authorization Code flow deliberately adds this indirection is that the redirect in step 3 travels through the browser — and anything that passes through a browser redirect can end up in browser history, in server access logs on the client's own infrastructure, or leaked via the <code>Referer</code> header if the resulting page then loads any third-party resource. A one-time, short-lived authorization code that is useless without also presenting the client's confidential <code>client_secret</code> (known only to the client's backend, never exposed to the browser) can safely pass through the browser, because possessing the code alone is not sufficient to obtain a token — the actual token exchange happens over a direct, unobserved server-to-server channel. This is precisely why the Authorization Code flow is the standard for any client with a backend, and why public clients that cannot hold a secret (mobile apps, single-page apps) use a variant, <strong>Authorization Code with PKCE</strong>, which replaces the static <code>client_secret</code> with a per-request, dynamically generated proof (a <code>code_verifier</code>/<code>code_challenge</code> pair) so the code still can't be redeemed by anyone who merely intercepts it in transit.</p>
+</div>
+
+<h2>4. OIDC: Identity Layered on Top of OAuth2</h2>
+<p>OAuth2, by itself, was never designed to answer "who is this user?" — it was designed to answer "does this bearer of a token have permission to call this API?" An access token is, from the client's point of view, an opaque string; OAuth2 does not standardize what's inside it or require it to say anything about identity at all. Yet in practice, almost every application using OAuth2 for third-party login also needs to know who just logged in — a name, an email, a stable user identifier. OpenID Connect (OIDC) is the standard built directly on top of OAuth2 to answer exactly that, without inventing a parallel authentication protocol.</p>
+<p>OIDC adds one crucial new artifact to the Authorization Code flow: alongside the access token, the token endpoint also returns an <strong>ID Token</strong> — a signed JWT whose entire purpose is to assert facts about the authentication event and the user's identity (who authenticated, when, using what method, and stable identity claims like an email or subject identifier). It is not used to call APIs; the client's backend decodes and verifies it once, right after receiving it, to establish local identity/session, and then generally discards it.</p>
+<table>
+<tr><th></th><th>Access Token</th><th>ID Token</th></tr>
+<tr><td>Purpose</td><td>Authorize calls to a resource server's API</td><td>Assert identity of the user who just authenticated</td></tr>
+<tr><td>Format</td><td>Opaque string or JWT — OAuth2 does not mandate a format</td><td>Always a JWT, per the OIDC spec</td></tr>
+<tr><td>Audience</td><td>The resource server</td><td>The client itself</td></tr>
+<tr><td>Who should read the contents</td><td>The resource server, when the token is presented</td><td>The client, immediately upon receiving it</td></tr>
+<tr><td>Should it be sent to other APIs as a bearer credential?</td><td>Yes, that's its purpose</td><td>No — never</td></tr>
+</table>
+<div class="callout warn">
+<div class="callout-title">Using the ID Token as if it were an access token is the single most common OIDC mistake</div>
+<p>The ID Token proves "this user authenticated with the authorization server just now" — it says nothing about what that user is allowed to do against any particular API, and it was never scoped or intended to be presented to a resource server as a bearer credential. Sending it to an API as if it were an access token conflates "I know who you are" with "you are authorized to do this," which are the exact two concerns section 2 separates for a reason. Correct usage: the client validates the ID Token once to establish who logged in (and typically mints its own session or its own application-specific token from that point forward), and uses the separate access token — scoped explicitly for that purpose — for any calls to a resource server.</p>
+</div>
+
+<h2>5. JWT Structure and Signature Verification</h2>
+<p>A JSON Web Token is three base64url-encoded segments joined by dots: <code>header.payload.signature</code>. Critically, the header and payload are only <em>encoded</em>, not encrypted — anyone who has the token can decode and read both without any key. The signature is the only part that provides a security guarantee, and the guarantee it provides is narrow and specific: <strong>integrity and authenticity</strong> (this exact payload was produced by whoever holds the signing key, and has not been altered since) — not confidentiality. Never put a secret directly in a JWT payload expecting it to be hidden from the token's bearer.</p>
+<pre><code>// header (base64url)
+{ "alg": "RS256", "typ": "JWT", "kid": "2024-08-key" }
+
+// payload (base64url) - the "claims"
+{
+  "sub": "user-8841",        // subject - stable identifier of who this token is about
+  "iss": "https://auth.example.com",  // issuer
+  "aud": "orders-api",       // intended audience - which resource server should accept this
+  "iat": 1756000000,         // issued-at (epoch seconds)
+  "exp": 1756003600,         // expiry (epoch seconds) - token is invalid after this
+  "scope": "orders:read orders:write",
+  "roles": ["ROLE_USER"]
+}
+
+// signature = sign(base64url(header) + "." + base64url(payload), signingKey)</code></pre>
+<h3>5.1 How verification actually works</h3>
+<p>The verifying party (a resource server, or your custom JWT filter) does three separate things, and all three must pass:</p>
+<ol>
+<li><strong>Recompute the signature.</strong> Take the received header and payload, run the exact same signing algorithm named in the header over them using a key, and check the result byte-for-byte matches the signature segment of the token. If even one character of the payload changed (e.g. an attacker edited <code>"roles"</code> from <code>["ROLE_USER"]</code> to <code>["ROLE_ADMIN"]</code> in the decoded JSON and re-encoded it), the recomputed signature will not match, because the signature is a cryptographic function of the exact bytes of header+payload — this is what makes a JWT tamper-evident despite being fully readable.</li>
+<li><strong>Check the registered claims.</strong> Independently of the signature, verify <code>exp</code> has not passed, <code>iat</code> is sane, and — if applicable — that <code>iss</code> matches an expected issuer and <code>aud</code> matches this resource server's expected audience. A validly-signed token issued for a different audience or by a different issuer than expected is not "invalid" cryptographically, but it must still be rejected — the signature only proves who signed it, not that it was meant for you.</li>
+<li><strong>Only then trust the claims</strong> (subject, scopes, roles) to build the application's notion of the authenticated principal and authorities.</li>
+</ol>
+<h3>5.2 Symmetric vs asymmetric signing</h3>
+<table>
+<tr><th></th><th>Symmetric (HMAC, e.g. HS256)</th><th>Asymmetric (RSA/ECDSA, e.g. RS256/ES256)</th></tr>
+<tr><td>Key(s) involved</td><td>One shared secret, used to both sign and verify</td><td>A private key signs; a separate, non-secret public key verifies</td></tr>
+<tr><td>Who can issue valid tokens</td><td>Anyone holding the shared secret</td><td>Only the holder of the private key</td></tr>
+<tr><td>Who can verify tokens</td><td>Anyone holding the same shared secret — and that party could also forge tokens with it</td><td>Anyone holding the public key — which grants no ability to forge tokens</td></tr>
+<tr><td>Multi-service fit</td><td>Every verifying service must be handed the same secret, multiplying the number of places a leak can happen and the blast radius of any single leak</td><td>The private key stays on the authorization server alone; every other service only ever needs the public key, typically fetched from a JWKS (JSON Web Key Set) endpoint the authorization server publishes</td></tr>
+</table>
+<p>This is exactly why asymmetric signing is the standard choice once more than one service needs to verify tokens: with HMAC, distributing the one shared secret to every microservice that needs to validate a token means every one of those services is also, incidentally, capable of minting arbitrary tokens for any user — a compromise of the least-trusted service that only ever needed to verify tokens now compromises the ability to forge tokens across the entire system. With RSA/ECDSA, a resource server fetches the authorization server's public key(s) (commonly via a well-known JWKS URL, keyed by the <code>kid</code> in the token header to support key rotation) and can verify tokens with zero ability to produce a fake one — verification and issuance capability are cleanly separated.</p>
+<div class="callout">
+<div class="callout-title">The "alg": "none" and algorithm-confusion classes of attack</div>
+<p>Because the algorithm is a field inside the (unencrypted, attacker-readable) header, naive verification code that trusts the header's declared algorithm rather than enforcing an expected one is exploitable: an attacker can craft a token with <code>"alg": "none"</code> and no signature at all, or — in a known class of library bugs — take a token meant to be verified with an RSA public key and resubmit it signed with HMAC using that same public key value as the HMAC secret (the public key is, after all, public). Correct verification code pins the expected algorithm(s) explicitly rather than trusting whatever the incoming token's header claims; Spring Security's JWT support (<code>NimbusJwtDecoder</code>) requires the accepted algorithm(s) to be configured rather than inferred purely from the token.</p>
+</div>
+
+<h2>6. Wiring a JWT Filter Into Spring Security</h2>
+<p>For a stateless, token-based API, the authentication filter's job is: pull the token out of the <code>Authorization: Bearer &lt;token&gt;</code> header, verify it using the mechanics above, and — only if it's valid — populate <code>SecurityContextHolder</code> with an authenticated <code>Authentication</code> built from its claims, before the request reaches <code>AuthorizationFilter</code>.</p>
+<pre><code>public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private final JwtDecoder jwtDecoder; // wraps signature + exp/iss/aud verification
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                     HttpServletResponse response,
+                                     FilterChain chain) throws IOException, ServletException {
+        String header = request.getHeader("Authorization");
+        if (header != null &amp;&amp; header.startsWith("Bearer ")) {
+            try {
+                Jwt jwt = jwtDecoder.decode(header.substring(7)); // throws if invalid/expired/bad sig
+                List&lt;GrantedAuthority&gt; authorities = jwt.getClaimAsStringList("roles").stream()
+                        .map(SimpleGrantedAuthority::new)
+                        .collect(Collectors.toList());
+                Authentication auth = new JwtAuthenticationToken(jwt, authorities);
+                SecurityContextHolder.getContext().setAuthentication(auth);
+            } catch (JwtException ex) {
+                // leave context empty; ExceptionTranslationFilter + AuthorizationFilter
+                // will correctly produce 401 for any endpoint that requires auth
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}</code></pre>
+<p><code>OncePerRequestFilter</code> is used, not a raw <code>Filter</code>, specifically to guarantee the logic runs exactly once per request even if the request gets internally forwarded/included within the servlet container — without that guarantee, a forwarded request could re-enter the filter and redundantly re-parse the token. This filter must be registered <em>before</em> <code>AuthorizationFilter</code> in the chain (section 1's ordering point applies directly here) — Spring Security's Java config exposes this via <code>addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)</code> or similar.</p>
+<h3>6.1 The stateless trade-off: no session lookup, but hard revocation</h3>
+<p>A traditional session-based login stores session state server-side (in memory, or in a shared store like Redis) and hands the browser only an opaque session ID; every request requires a lookup against that store to resolve "who is this." A JWT-based scheme is deliberately stateless in comparison — the token itself carries the claims needed to authenticate the request, so a resource server can verify it (a pure cryptographic + local check) without querying any shared state or calling back to the authorization server at all. This is what makes JWTs attractive for distributed systems: verification scales horizontally with zero shared-state coordination between resource server instances.</p>
+<p>The cost is that the token is <em>self-contained and therefore self-validating until it naturally expires</em> — there is no server-side record to delete to instantly invalidate it early. If a token is compromised, or a user's access needs to be revoked immediately (they're terminated, their password was breached, their permissions changed), a purely stateless design has no mechanism to reject that still-unexpired, still-correctly-signed token before <code>exp</code> arrives. The standard mitigations both reintroduce a small amount of state or indirection specifically to bound this risk:</p>
+<table>
+<tr><th>Mitigation</th><th>Mechanism</th><th>Trade-off</th></tr>
+<tr><td>Short-lived access token + refresh token</td><td>Access tokens expire quickly (minutes), limiting the exposure window of a compromised token; a separate, longer-lived refresh token (kept server-side or in a secure, non-JS-accessible cookie) is exchanged for new access tokens without re-authenticating the user each time</td><td>Revocation is only as fast as the access token's expiry; the refresh token itself is a higher-value, longer-lived secret that becomes the actual point of revocation (it can be checked against a server-side store on each refresh)</td></tr>
+<tr><td>Blocklist / denylist of revoked token IDs</td><td>Every issued token carries a unique <code>jti</code> claim; a revoked token's <code>jti</code> is recorded (e.g. in Redis, with a TTL matching the token's remaining lifetime) and the resource server checks the token's <code>jti</code> against this store on every request</td><td>Reintroduces exactly the shared-state lookup per request that stateless JWTs were meant to avoid — though the lookup set is much smaller than a full session store, since only explicitly revoked tokens need an entry</td></tr>
+</table>
+<div class="callout tip">
+<div class="callout-title">There is no free lunch between statelessness and instant revocation</div>
+<p>This trade-off is fundamental, not a Spring Security limitation: any authentication scheme where the token itself is sufficient proof, verifiable without a server round trip, is by construction a scheme where revoking it early requires either shrinking the exposure window (short expiry) or reintroducing a server-side check (a blocklist) — at which point you've partially reintroduced the very statefulness the JWT was meant to eliminate, just for a much smaller, more targeted set of tokens.</p>
+</div>
+
+<h2>7. Role-Based Access Control: Method Security and URL Rules</h2>
+<p>Spring Security offers authorization at two different layers, and they compose rather than compete:</p>
+<ul>
+<li><strong>URL-level (filter-chain) authorization</strong>, configured via <code>authorizeHttpRequests()</code> in a <code>SecurityFilterChain</code> bean — coarse-grained rules matched against the request path and method, evaluated by <code>AuthorizationFilter</code> before the request ever reaches a controller.</li>
+<li><strong>Method-level authorization</strong>, via <code>@PreAuthorize</code>/<code>@PostAuthorize</code>/<code>@Secured</code> annotations on individual service or controller methods — fine-grained rules evaluated per-invocation, implemented (unsurprisingly, given <a href="#/spring-core-mechanics">how AOP works</a>) as proxy-based advice wrapped around the annotated method.</li>
+</ul>
+<pre><code>http.authorizeHttpRequests(auth -> auth
+    .requestMatchers("/api/admin/**").hasRole("ADMIN")
+    .requestMatchers(HttpMethod.GET, "/api/orders/**").hasAnyRole("USER", "ADMIN")
+    .requestMatchers("/api/public/**").permitAll()
+    .anyRequest().authenticated()
+);</code></pre>
+<p>Method security must be explicitly turned on with <code>@EnableMethodSecurity</code> (the modern annotation; older code bases use <code>@EnableGlobalMethodSecurity(prePostEnabled = true)</code>) on a configuration class — it is not active by default, because wrapping every candidate method in an authorization-checking proxy has a cost, and most applications only need it on a subset of service methods.</p>
+<pre><code>@PreAuthorize("hasRole('ADMIN') or #order.ownerId == authentication.principal.id")
+public Order cancelOrder(Order order) { ... }
+
+@PostAuthorize("returnObject.ownerId == authentication.principal.id")
+public Order getOrder(Long id) { ... }</code></pre>
+<p><code>@PreAuthorize</code> evaluates its SpEL expression <em>before</em> the method body runs, and can reference method parameters directly by name (<code>#order</code>) — appropriate when the decision doesn't depend on the method's result. <code>@PostAuthorize</code> evaluates <em>after</em> the method has already executed, with access to <code>returnObject</code> — necessary when the authorization decision depends on data the method itself loads (e.g. "you may view this order only if you own it," where ownership is only known once the order has been fetched). This distinction matters operationally: a <code>@PostAuthorize</code> check that denies access still means the method's side effects (a database write, an external call) already happened — it only blocks the result from being returned to the caller. If a method has side effects, gating access with <code>@PreAuthorize</code> instead is almost always the correct choice, precisely because it can prevent the method body from running at all.</p>
+<div class="callout warn">
+<div class="callout-title">Method security is still proxy-based AOP — the same self-invocation limit applies</div>
+<p>Because <code>@PreAuthorize</code>/<code>@PostAuthorize</code> are implemented as advice on a proxy, calling an <code>@PreAuthorize</code>-annotated method via <code>this.someMethod()</code> from inside the same bean bypasses the check entirely, for exactly the reason described in <a href="#/spring-core-mechanics">Spring's AOP self-invocation trap</a> — the call never passes back out through the proxy that carries the authorization advice. A method-level security rule is not actually enforced unless every call path to that method goes through the bean from outside, or through the bean's own proxy reference.</p>
+</div>
+<h3>7.1 Why both layers, rather than just one</h3>
+<p>URL-level rules are coarse and cheap — they run once per request, before any business logic, and are the right place for broad boundaries ("nothing under <code>/api/admin/**</code> is reachable without the ADMIN role"). But URL patterns can't express decisions that depend on data loaded during the request (like "only the order's owner may cancel it") — that requires the method to actually run far enough to know whose order it is. Method-level security fills that gap. In a well-designed system, URL rules act as a coarse first gate that rejects obviously unauthorized traffic as cheaply as possible, and method-level rules handle the finer-grained, data-dependent decisions that can only be evaluated once you're inside the call — the two layers are deliberately redundant at the boundary (an admin-only URL segment might also double-check the role at the method level) precisely so that a mistake in one configuration doesn't silently become the only line of defense.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why must a custom JWT authentication filter run before AuthorizationFilter in the chain, and what happens if it's registered after it by mistake?</summary>
+<div class="qa-body">AuthorizationFilter makes its allow/deny decision by reading the current Authentication out of SecurityContextHolder — it does not parse the request itself. If the JWT filter that's supposed to populate SecurityContextHolder from the Authorization header runs after AuthorizationFilter, then at the moment AuthorizationFilter runs, the context is still empty/anonymous regardless of whether a valid token was present on the request. Every request requiring authentication gets rejected with a 401/403 even with a perfectly valid token, because the token was never actually read and verified before the authorization decision was made. Filter order isn't a convenience setting — it's what makes the dependency between "establish identity" and "check permission against that identity" actually hold at runtime.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does the OAuth2 Authorization Code flow exchange a code for a token server-to-server instead of just returning the access token in the redirect?</summary>
+<div class="qa-body">The redirect back to the client happens through the user's browser, and anything carried in a browser redirect is exposed to browser history, to any server access logs along that redirect path, and potentially to the Referer header of whatever page loads next. A raw access token sitting in that redirect would be exposed the same way. The authorization code sidesteps this: it's short-lived, single-use, and — critically — useless on its own, because redeeming it for an actual access token requires also presenting the client's confidential client_secret, which is held only on the client's backend and never sent through the browser. The actual token exchange happens over a direct, server-to-server channel that never touches the browser, so even if the code were somehow intercepted in the browser leg, it can't be redeemed by anyone who doesn't also hold the client secret. Public clients that can't hold a secret use Authorization Code with PKCE instead, which substitutes a per-request dynamic proof for the static secret.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What is the actual difference between an OAuth2 access token and an OIDC ID Token, and what goes wrong if they're treated as interchangeable?</summary>
+<div class="qa-body">An access token exists to authorize calls to a resource server's API — it's meant to be presented as a bearer credential to whatever API it was scoped for. An ID Token exists purely to assert facts about an authentication event and the user's identity to the client itself; it's a signed JWT the client validates once, right after login, and is not meant to be sent onward as a credential to any API. Treating the ID Token as if it were an access token conflates "I know who this user is" with "this bearer is authorized to call this API" — two genuinely separate questions. In practice, sending an ID Token to a resource server as a bearer token means presenting a token that was never scoped or intended for that audience, which either fails validation outright (if the resource server checks the audience claim) or, worse, succeeds despite not representing an actual grant of API access.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Precisely what does a JWT signature prove, and what does it not prove?</summary>
+<div class="qa-body">The signature proves two things: the header and payload have not been altered since they were signed (integrity), and whoever produced the signature possesses the signing key associated with the verification key being used (authenticity of origin). It proves nothing about confidentiality — the header and payload are only base64url-encoded, not encrypted, so anyone holding the token can read every claim inside it without any key at all. It also proves nothing about the claims' semantic correctness beyond what verification logic explicitly checks — a validly-signed token with an expired exp, a mismatched aud, or an unexpected iss is still cryptographically valid; those checks are separate, explicit steps a verifier must perform on top of signature verification, not something the signature itself guarantees.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is asymmetric signing (RSA/ECDSA) preferred over HMAC once multiple services need to verify tokens?</summary>
+<div class="qa-body">HMAC uses one shared secret for both signing and verifying, which means any service capable of verifying a token is, by construction, also capable of forging one, since it holds the exact same key used to produce valid signatures. Distributing that one secret to every microservice that needs to check tokens multiplies both the number of places it can leak and the blast radius of any single leak — a compromise of the least-trusted verifying service instantly grants the ability to mint arbitrary valid tokens system-wide. Asymmetric signing separates these capabilities: only the authorization server holds the private key and can issue tokens; every other service only ever needs the public key (typically fetched from a JWKS endpoint) to verify signatures, and possessing a public key grants zero ability to forge a token. This cleanly separates "can verify" from "can issue," which is exactly the property you want once verification is spread across many independently-operated services.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is instant revocation fundamentally hard for stateless JWT-based authentication, and what do the standard mitigations actually trade away?</summary>
+<div class="qa-body">A stateless JWT is designed so that verification requires no server-side lookup — the token's signature and claims are sufficient proof on their own, checked purely locally against a public key and the claims inside it. That's precisely what makes it scale well across many resource server instances with no shared-state coordination. But it also means there is no server-side record whose deletion could invalidate an already-issued, unexpired, correctly-signed token before its exp arrives — the token remains valid purely because it's mathematically well-formed, independent of anything that has since changed about the user's actual permissions. The two standard mitigations both reintroduce some of the state or coordination that statelessness was meant to avoid: short-lived access tokens paired with a refresh token bound the exposure window and move the actual revocation point to the refresh step (which can check server-side state); a blocklist of revoked token IDs reintroduces a per-request server-side lookup, just against a much smaller set than a full session store. Neither restores true instant, zero-cost revocation — that property is structurally incompatible with a token being self-sufficient proof.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does @PostAuthorize sometimes still cause unwanted side effects even when it denies access?</summary>
+<div class="qa-body">@PostAuthorize is proxy-based advice that evaluates its expression only after the underlying method has already fully executed, because the expression is allowed to reference returnObject, which doesn't exist until the method has returned a value. This means any side effect the method performed while producing that return value — a database write, a message published, an external API call — has already happened by the time the authorization check runs and potentially denies the caller the result. The denial only blocks the return value from propagating back to the caller; it does not, and structurally cannot, undo work the method already did. Any method with side effects should be gated by @PreAuthorize instead, since that check runs before the method body executes at all and can prevent it from running in the first place.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/spring-core-mechanics'"><div class="rc-title">Spring Core Mechanics</div><div class="rc-sub">Days 21–25 · method-level security (@PreAuthorize) is proxy-based AOP, and inherits the same self-invocation limitation covered there</div></div>
+<div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Foundational distributed-systems mechanics · stateless JWT verification and its revocation trade-off are a direct instance of the state-vs-coordination tension in distributed design</div></div>
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience &amp; Fault Tolerance</div><div class="rc-sub">Failure-handling patterns · token expiry, refresh flows, and blocklists are resilience/mitigation patterns applied specifically to auth</div></div>
+<div class="related-card" onclick="window.location.hash='/observability-production'"><div class="rc-title">Observability in Production</div><div class="rc-sub">Production operations · diagnosing 401 vs 403 misclassification and key-rotation failures requires tracing requests through the filter chain</div></div>
+</div>

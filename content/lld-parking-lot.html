@@ -1,0 +1,251 @@
+<p class="topic-breadcrumb">Phase 2 — Framework Core & Mid-Scale Architecture · Days 36–40 · LLD Machine Coding</p>
+<h1>LLD #1: Parking Lot System</h1>
+<div class="topic-tags">
+<span class="tag">Requirements Modeling</span>
+<span class="tag">SOLID in Practice</span>
+<span class="tag">Strategy Pattern</span>
+<span class="tag">Factory Pattern</span>
+<span class="tag">Concurrency & Races</span>
+<span class="tag">State Management</span>
+<span class="tag">Extensibility</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>A parking lot looks trivial until two cars arrive at the two remaining compact spots at the same instant through two different gates, or until the business asks you to add electric-vehicle spots with a new pricing model six months after launch. The value of designing this system carefully isn't the parking lot itself — it's that the same three failure modes (a naive read-then-write race on shared state, a design that requires editing five classes to add one new type, and business rules hardcoded where they can't be swapped) show up in booking systems, elevator controllers, and inventory reservation systems everywhere. Working through parking lot design from first principles is really a rehearsal for the entity-modeling and concurrency-safety instincts you need in almost every stateful backend system.</p>
+</div>
+
+<h2>1. Gathering and Stating Requirements Explicitly</h2>
+<p>The single biggest failure mode in low-level design exercises is jumping straight to classes before the requirements are pinned down. Every ambiguity you leave implicit becomes a design decision you make by accident, usually the wrong one. For a parking lot, the requirements worth stating out loud before writing anything are:</p>
+<ul>
+<li><strong>Structure:</strong> the lot has multiple floors; each floor has a fixed number of spots of different types.</li>
+<li><strong>Spot types:</strong> at minimum <code>MOTORCYCLE</code>, <code>COMPACT</code>, <code>LARGE</code>, and <code>HANDICAPPED</code>, each with different physical dimensions and different eligibility rules (a motorcycle can park in a large spot but not vice versa; a handicapped spot requires a permit check).</li>
+<li><strong>Vehicle types:</strong> <code>MOTORCYCLE</code>, <code>CAR</code>, <code>BUS</code>/<code>TRUCK</code> — each vehicle type maps to a set of spot types it's allowed to occupy, not a 1:1 mapping.</li>
+<li><strong>Gates:</strong> multiple physical entry gates and multiple exit gates operate concurrently and independently; each entry gate can issue a ticket, each exit gate can process payment and close a ticket.</li>
+<li><strong>Ticketing:</strong> entering issues a ticket bound to a vehicle, an assigned spot, and an entry timestamp; the ticket is the sole proof of parking and the sole input to the exit flow.</li>
+<li><strong>Pricing and payment:</strong> cost is a function of duration and spot type (or vehicle type), computed at exit, and paid through a pluggable payment mechanism (cash, card, wallet).</li>
+<li><strong>Availability tracking:</strong> the system must answer "is there a free spot of type X" in something close to O(1), not by scanning every spot on every floor on every query — this becomes a real cost at scale with many floors and frequent entry attempts.</li>
+</ul>
+<div class="callout">
+<div class="callout-title">Requirements shape the class boundaries, not the other way around</div>
+<p>Notice that "multiple gates operate concurrently" is a requirement, not an implementation detail you notice later. If you don't write it down up front, it's very easy to design <code>ParkingLot.parkVehicle()</code> as a simple sequential method, get it "working" against a single-threaded test, and only discover the race condition when someone explicitly asks about concurrent entry. Stating concurrency as a first-class requirement up front is what makes you design the spot-allocation path to be atomic from the start rather than retrofitting a lock onto a broken design later.</p>
+</div>
+
+<h2>2. Core Entities and Their Responsibilities</h2>
+<p>The right entity boundary follows the Single Responsibility Principle: each class should have exactly one reason to change. Working backward from the requirements above:</p>
+<table>
+<tr><th>Entity</th><th>Responsibility</th><th>Reason it changes</th></tr>
+<tr><td><code>ParkingLot</code></td><td>Owns the collection of floors; top-level entry point for park/unpark; coordinates gates, spot allocation, and ticketing</td><td>Structural changes to the lot (new floor added, new gate added)</td></tr>
+<tr><td><code>Floor</code></td><td>Owns the spots on that floor; can report per-type availability for itself</td><td>Physical layout of a floor changes</td></tr>
+<tr><td><code>ParkingSpot</code></td><td>Represents one physical spot; holds its <code>SpotType</code> and mutable occupancy state; knows which vehicle (if any) currently occupies it</td><td>What a "spot" tracks about itself (e.g., adding a charging-point flag)</td></tr>
+<tr><td><code>SpotType</code> (enum)</td><td>Enumerates spot categories and, ideally, the size/eligibility rule associated with each</td><td>New categories of physical spot are introduced</td></tr>
+<tr><td><code>Vehicle</code></td><td>Represents a vehicle with a <code>VehicleType</code>, license plate, and (for handicapped flows) a permit flag</td><td>What data a vehicle carries</td></tr>
+<tr><td><code>Ticket</code></td><td>Immutable-ish record binding a vehicle, an assigned spot, an entry gate, and an entry timestamp; later stamped with exit time and fare</td><td>What data a parking transaction needs to record</td></tr>
+<tr><td><code>EntryGate</code></td><td>Orchestrates the entry flow: ask for a spot, create a ticket, hand it to the driver</td><td>How entry is physically processed (ANPR camera, ticket printer, RFID)</td></tr>
+<tr><td><code>ExitGate</code></td><td>Orchestrates the exit flow: look up the ticket, compute fare, collect payment, free the spot</td><td>How exit is physically processed</td></tr>
+<tr><td><code>SpotAllocationStrategy</code></td><td>Given a vehicle type and the lot's floors, picks which specific spot to assign</td><td>The allocation algorithm (nearest-first, most-filled-floor-first, etc.)</td></tr>
+<tr><td><code>PricingStrategy</code></td><td>Given a ticket (spot type, duration), computes a fare</td><td>Business pricing rules</td></tr>
+<tr><td><code>PaymentProcessor</code></td><td>Given an amount, executes payment through some channel</td><td>Payment integrations</td></tr>
+</table>
+<p>Notice the pattern: every class that could plausibly change for a <em>business</em> reason (allocation policy, pricing policy, payment channel) has been pulled out of <code>ParkingLot</code> into its own interface. That separation is not incidental — it's the direct consequence of applying SRP and is what makes the next section's SOLID discussion concrete rather than abstract.</p>
+
+<h2>3. Applying SOLID to the Design</h2>
+<h3>Single Responsibility — why ParkingLot doesn't compute fares</h3>
+<p>If <code>ParkingLot</code> both tracked spots and computed pricing, a change to the pricing model (say, switching from flat-per-hour to a tiered rate) would require editing and re-testing the same class responsible for spot bookkeeping — two unrelated concerns coupled by accident. Splitting pricing into <code>PricingStrategy</code> means a pricing change touches exactly one class, and that class has no idea how spots are laid out.</p>
+<h3>Open/Closed — why allocation and pricing are Strategy objects</h3>
+<p>The requirement "the business may want to change how spots are assigned" (nearest-to-entrance first, largest-fit first, load-balanced across floors) is exactly the situation the <strong>Strategy pattern</strong> exists for. Define:</p>
+<pre><code>interface SpotAllocationStrategy {
+    Optional&lt;ParkingSpot&gt; findSpot(VehicleType type, List&lt;Floor&gt; floors);
+}
+
+class NearestFirstStrategy implements SpotAllocationStrategy { ... }
+class LargestFitStrategy implements SpotAllocationStrategy { ... }
+</code></pre>
+<p><code>ParkingLot</code> holds a reference to a <code>SpotAllocationStrategy</code> (injected at construction, or swappable at runtime) and simply calls <code>strategy.findSpot(...)</code>. Adding "prefer floors closest to the elevator" as a new policy means writing one new class and wiring it in — <code>ParkingLot</code>'s source is never touched. That is precisely what Open/Closed means in practice: open for extension (new strategy classes), closed for modification (the class that uses the strategy doesn't change). The same reasoning applies to <code>PricingStrategy</code> — a "first hour free" promotion is a new class, not an <code>if</code> branch inserted into existing fare logic.</p>
+<h3>Liskov Substitution — why SpotType eligibility must be modeled as data, not type-checking code</h3>
+<p>A tempting but wrong design is to give <code>Vehicle</code> subclasses (<code>Car</code>, <code>Motorcycle</code>, <code>Bus</code>) an overridden method like <code>canParkIn(ParkingSpot spot)</code> with type-specific logic duplicated in each subclass. This risks Liskov violations the moment a new spot type is added, because every vehicle subclass now needs a matching branch, and it's easy for one subclass to enforce a stricter or laxer rule than its siblings in a way that breaks substitutability (code that works correctly for a generic <code>Vehicle</code> should keep working when handed any concrete vehicle). The more robust model is a single compatibility table — a <code>Map&lt;VehicleType, Set&lt;SpotType&gt;&gt;</code> — consulted uniformly regardless of concrete vehicle class, so behavior is data-driven and every vehicle type is checked through the same code path.</p>
+<h3>Interface Segregation — why EntryGate and ExitGate are separate types</h3>
+<p>A single fat <code>Gate</code> interface with both <code>issueTicket()</code> and <code>processPayment()</code> would force every gate implementation to depend on methods it may never use — a purely entry-only turnstile has no business implementing payment logic. Splitting into <code>EntryGate</code> and <code>ExitGate</code> means each concrete gate depends only on the operations it actually performs.</p>
+<h3>Dependency Inversion — why ParkingLot depends on interfaces, not concrete classes</h3>
+<p><code>ParkingLot</code> should hold references typed as <code>SpotAllocationStrategy</code>, <code>PricingStrategy</code>, and (indirectly, through <code>ExitGate</code>) <code>PaymentProcessor</code> — never as concrete classes like <code>NearestFirstStrategy</code>. This is what actually enables Open/Closed to hold in practice: if <code>ParkingLot</code> held a concrete <code>NearestFirstStrategy</code> field, swapping strategies would still require editing <code>ParkingLot</code>'s source. Dependency Inversion is the mechanism; Open/Closed is the payoff. This mirrors the same interface-first thinking covered in <a href="#/solid-design-patterns">SOLID &amp; design patterns</a> generally — the parking lot is simply a concrete vehicle for applying it.</p>
+<h3>Factory — why ParkingSpot construction is centralized</h3>
+<p>Constructing the right concrete spot behavior (a handicapped spot needs a permit check baked into its acceptance logic; a large spot needs to know it can also host motorcycles) is exactly what a <strong>Factory</strong> exists to encapsulate:</p>
+<pre><code>class ParkingSpotFactory {
+    static ParkingSpot create(SpotType type, String spotId, int floorNumber) {
+        switch (type) {
+            case MOTORCYCLE:   return new ParkingSpot(spotId, floorNumber, SpotType.MOTORCYCLE);
+            case COMPACT:      return new ParkingSpot(spotId, floorNumber, SpotType.COMPACT);
+            case LARGE:        return new ParkingSpot(spotId, floorNumber, SpotType.LARGE);
+            case HANDICAPPED:  return new HandicappedSpot(spotId, floorNumber);
+            default: throw new IllegalArgumentException("Unknown spot type: " + type);
+        }
+    }
+}
+</code></pre>
+<p>The benefit is not just "less repeated construction code" — it's that <code>Floor</code>'s constructor and anything else building out the lot's layout never needs to know about the existence of <code>HandicappedSpot</code> as a distinct class; it only asks the factory for a <code>SpotType.HANDICAPPED</code> and gets back something that satisfies the <code>ParkingSpot</code> contract.</p>
+
+<h2>4. Concurrency: The Real Problem This Design Must Solve</h2>
+<h3>Where the race condition actually lives</h3>
+<p>Assume the lot has exactly one free <code>COMPACT</code> spot left. Two cars arrive at two different entry gates within milliseconds of each other. Both entry threads execute logic that looks, at first glance, completely reasonable:</p>
+<pre><code>// BROKEN — check-then-act is not atomic
+ParkingSpot spot = findFirstAvailable(SpotType.COMPACT);  // both threads read the SAME free spot
+if (spot != null) {
+    spot.setOccupied(true);      // both threads write true — no conflict detected here!
+    spot.setVehicle(vehicle);    // second write silently overwrites the first
+    issueTicket(vehicle, spot);  // BOTH gates issue a ticket for the SAME physical spot
+}
+</code></pre>
+<p>This is the canonical <strong>check-then-act</strong> race: "check availability" and "act on it" are two separate operations with a window between them, and nothing prevents a second thread from performing its own check before the first thread's act has taken effect. The visible symptom in production would be two vehicles physically directed to the same spot, or — just as bad — a spot that gets marked occupied by thread B's write clobbering thread A's ticket reference, leaving one ticket pointing at a spot with no reliable owner. This is exactly the same shape of bug covered generally in <a href="#/concurrency-multithreading">multithreading &amp; concurrency</a>: visibility and atomicity are two separate guarantees, and neither a plain boolean field nor even a `volatile` one gives you atomicity for a read-modify-write sequence.</p>
+<h3>Why "make the field volatile" does not fix this</h3>
+<p><code>volatile</code> only guarantees that a write becomes visible to subsequent reads — it says nothing about two threads performing a read-check-write sequence without interleaving. Both gate threads can each observe <code>occupied == false</code> (a perfectly valid, up-to-date read) before either has written <code>true</code>. The fix has to make the entire "check and claim" sequence a single indivisible operation.</p>
+<h3>Fix 1 — a lock per spot</h3>
+<pre><code>class ParkingSpot {
+    private final ReentrantLock lock = new ReentrantLock();
+    private volatile boolean occupied = false;
+    private Vehicle vehicle;
+
+    boolean tryOccupy(Vehicle v) {
+        lock.lock();
+        try {
+            if (occupied) return false;
+            occupied = true;
+            vehicle = v;
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+</code></pre>
+<p>Now the allocation strategy must call <code>tryOccupy()</code> — not just check a getter — and treat a <code>false</code> return as "this spot was taken between when I found it and when I tried to claim it; look for the next candidate." This turns allocation into a retry loop rather than a single check-then-assign step, but it makes each individual claim atomic. A lock per spot (rather than one lock guarding the entire floor or lot) is the right granularity because it lets two unrelated spots be claimed concurrently with zero contention between them — coarse-grained locking (a single lock around the whole <code>ParkingLot</code>) would work correctly too, but would serialize every entry attempt across the entire building even when they're targeting spots on different floors, which becomes a real throughput bottleneck as gate count grows.</p>
+<h3>Fix 2 — atomic compare-and-swap on spot state</h3>
+<p>An alternative that avoids blocking entirely: model spot state as an <code>AtomicReference&lt;SpotState&gt;</code> (or an <code>AtomicBoolean</code> for occupied/free) and claim a spot with <code>compareAndSet(FREE, OCCUPIED)</code>. If the CAS fails, another thread won the race for that exact spot, and the caller moves on to the next candidate spot without ever blocking on a lock. This is preferable under high contention because failed CAS attempts are cheap (no OS-level thread suspension), whereas a contended <code>ReentrantLock</code> can eventually escalate to actual thread parking. For a resource with many interchangeable candidates (many compact spots, not one bottleneck resource), CAS-with-retry across candidates tends to scale better than locking, because contention is naturally spread across many independent atomic references rather than funneled through one shared lock.</p>
+<div class="callout warn">
+<div class="callout-title">Locking order still matters even with per-spot locks</div>
+<p>Per-spot locks solve the race on a single spot, but if any code path ever needs to hold locks on two spots at once (for example, a "swap this vehicle to a better spot" feature), acquiring them in inconsistent order across threads reintroduces deadlock risk — thread A locks spot 12 then wants spot 47, while thread B locks spot 47 then wants spot 12. The general fix, as elsewhere, is to always acquire multiple locks in a single global order (e.g., by spot ID) regardless of which spot a given operation "starts" from.</p>
+</div>
+<h3>Availability counters need the same discipline</h3>
+<p>Requirement 1 asked for near-O(1) availability queries, which implies maintaining a running count per spot type (e.g., <code>Map&lt;SpotType, AtomicInteger&gt;</code> on each <code>Floor</code>) rather than scanning all spots. That counter must be decremented as part of the same atomic claim, not as a separate subsequent step — otherwise you reintroduce a race between "spot marked occupied" and "counter updated," which would let the availability query return a stale nonzero count for a type that is actually full, sending a gate down a dead-end search.</p>
+
+<h2>5. Extensibility: Adding Without Modifying</h2>
+<h3>Adding a new vehicle type</h3>
+<p>Because vehicle-to-spot eligibility is data (a compatibility map) rather than per-subclass logic, adding <code>VehicleType.EV_CAR</code> means: add the enum constant, add its row to the compatibility map, and optionally add a new spot type (<code>SpotType.EV_CHARGING</code>) via the existing factory. No existing <code>SpotAllocationStrategy</code> implementation, no existing <code>ParkingSpot</code> subclass, and no existing gate class needs to change. If eligibility had instead been encoded as a chain of <code>instanceof</code> checks scattered through the allocation code, this same change would require hunting down and editing every such check.</p>
+<h3>Adding a new pricing model</h3>
+<p>A promotional "first 30 minutes free, then hourly" scheme is a new class implementing <code>PricingStrategy</code>, wired into <code>ExitGate</code> (or into <code>ParkingLot</code>, whichever owns the reference) via configuration or dependency injection. Because <code>ExitGate</code> depends on the <code>PricingStrategy</code> interface, not a concrete class, this is a pure addition — a textbook demonstration of Open/Closed paying off at the point where a real business request ("run a launch promotion next month") arrives.</p>
+<h3>Adding a new gate type or payment channel</h3>
+<p>A UPI or wallet-based <code>PaymentProcessor</code> implementation, or an automated ANPR-camera-based <code>EntryGate</code> implementation, plugs in the same way: implement the interface, wire it in, existing code untouched. The pattern repeating across every extension point is deliberate — it's what "designed for change" concretely looks like, as opposed to a design that merely happens to work for the requirements known at the time it was written.</p>
+
+<h2>6. Class Diagram and Collaboration Flows (Prose Form)</h2>
+<pre><code>ParkingLot
+  - floors: List&lt;Floor&gt;
+  - allocationStrategy: SpotAllocationStrategy
+  - pricingStrategy: PricingStrategy
+  - activeTickets: Map&lt;String ticketId, Ticket&gt;
+  + parkVehicle(Vehicle v, EntryGate gate): Ticket
+  + unparkVehicle(String ticketId, ExitGate gate): Receipt
+
+Floor
+  - floorNumber: int
+  - spots: List&lt;ParkingSpot&gt;
+  - freeCountByType: Map&lt;SpotType, AtomicInteger&gt;
+  + findAvailableSpots(SpotType type): List&lt;ParkingSpot&gt;
+
+ParkingSpot
+  - id: String
+  - floorNumber: int
+  - type: SpotType
+  - occupied: boolean (mutated only via tryOccupy/release)
+  - currentVehicle: Vehicle
+  + tryOccupy(Vehicle v): boolean     // atomic claim
+  + release(): void                  // atomic free
+
+HandicappedSpot extends ParkingSpot
+  + tryOccupy(Vehicle v): boolean    // overridden: also checks v.hasPermit()
+
+Vehicle
+  - licensePlate: String
+  - type: VehicleType
+
+Ticket
+  - id: String
+  - vehicle: Vehicle
+  - spot: ParkingSpot
+  - entryTime: Instant
+  - exitTime: Instant (set at exit)
+  - entryGateId, exitGateId: String
+
+EntryGate
+  + issueTicket(Vehicle v, ParkingLot lot): Ticket
+
+ExitGate
+  + processExit(String ticketId, ParkingLot lot, PaymentProcessor payments): Receipt
+
+SpotAllocationStrategy (interface)
+  + findSpot(VehicleType type, List&lt;Floor&gt; floors): Optional&lt;ParkingSpot&gt;
+
+PricingStrategy (interface)
+  + calculateFare(Ticket ticket): BigDecimal
+
+PaymentProcessor (interface)
+  + charge(BigDecimal amount, PaymentMethod method): PaymentResult
+</code></pre>
+<h3>Flow: a vehicle enters and receives a ticket</h3>
+<ol>
+<li>Driver approaches an <code>EntryGate</code>; the gate calls <code>lot.parkVehicle(vehicle, this)</code>.</li>
+<li><code>ParkingLot</code> delegates to <code>allocationStrategy.findSpot(vehicle.getType(), floors)</code>, which consults the vehicle-to-spot compatibility rules and the per-floor <code>freeCountByType</code> to shortlist candidate floors/spots without scanning everything.</li>
+<li>For the first candidate spot returned, the lot calls <code>spot.tryOccupy(vehicle)</code>. If it returns <code>false</code> (another gate won the race), the lot asks the strategy for the next candidate and retries — this retry loop is what makes the overall allocation correct under concurrent entry, not just the atomicity of a single <code>tryOccupy</code> call.</li>
+<li>Once a claim succeeds, the lot decrements that spot type's counter atomically as part of the same critical section, constructs a <code>Ticket</code> with entry timestamp and gate ID, stores it in <code>activeTickets</code>, and returns it to the gate, which hands it to the driver (printed, or as a mobile pass).</li>
+</ol>
+<h3>Flow: a vehicle exits and pays</h3>
+<ol>
+<li>Driver presents the ticket at an <code>ExitGate</code>; the gate calls <code>lot.unparkVehicle(ticketId, this)</code>.</li>
+<li>The lot looks up the <code>Ticket</code> by ID from <code>activeTickets</code> (a missing or already-closed ticket is rejected here — this is also where a lost-ticket policy, typically a flat maximum-stay charge, is applied).</li>
+<li>The lot stamps <code>exitTime</code> and calls <code>pricingStrategy.calculateFare(ticket)</code>, which computes duration from <code>entryTime</code> to <code>exitTime</code> and applies whatever rate rules that strategy encodes for the ticket's spot type.</li>
+<li><code>ExitGate</code> calls <code>paymentProcessor.charge(fare, method)</code>; only on a successful result does the flow proceed to release the spot — this ordering matters, because releasing the spot before payment succeeds would let a car leave (or a new car be assigned that spot) before the transaction is confirmed.</li>
+<li>On successful payment, the lot calls <code>spot.release()</code> (atomically clearing occupancy and incrementing the free-count for that type), removes the ticket from <code>activeTickets</code>, and returns a <code>Receipt</code> to the gate.</li>
+</ol>
+
+<h2>7. State Management: Who Is Allowed to Mutate a Spot</h2>
+<p>A <code>ParkingSpot</code>'s occupancy has exactly two legal transitions: <code>FREE → OCCUPIED</code> via a successful <code>tryOccupy(vehicle)</code>, and <code>OCCUPIED → FREE</code> via <code>release()</code>. The design decision worth being deliberate about is that <strong>no other class ever sets these fields directly</strong> — not <code>ParkingLot</code>, not <code>Floor</code>, not the gates. Both mutating methods live on <code>ParkingSpot</code> itself and are the only entry points, which means the atomicity guarantee (the lock or CAS discussed in Section 4) is enforced in exactly one place and cannot be bypassed by a caller that forgets to synchronize. This is encapsulation doing real work, not just hiding fields for style: if <code>occupied</code> had a public setter, any future caller — including one written by someone unfamiliar with the concurrency requirement — could perform an unsynchronized read-modify-write and silently reintroduce the exact race Section 4 fixed.</p>
+<div class="callout tip">
+<div class="callout-title">Model spot state as an enum, not a boolean, once real systems get involved</div>
+<p>A plain boolean quickly becomes insufficient once you add reservations (a spot held for a pre-booked vehicle, not yet occupied), maintenance holds (a spot taken out of service), and out-of-order arrivals. A <code>SpotState</code> enum — <code>FREE</code>, <code>RESERVED</code>, <code>OCCUPIED</code>, <code>OUT_OF_SERVICE</code> — with an explicit transition table makes illegal transitions (e.g., releasing a spot that was never occupied, or occupying one that's under maintenance) detectable in one place instead of scattered boolean-logic bugs. This same "state as an explicit enum with a transition table" habit is worth carrying into designs like <a href="#/lld-elevator-bookmyshow">elevator and seat-booking systems</a>, where the number of legal states is larger and the cost of an illegal transition (double-booking a seat) is just as real.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+<details class="concept-qa">
+<summary>Why does making ParkingLot depend on a SpotAllocationStrategy interface (instead of a concrete NearestFirstStrategy) actually change what "adding a new allocation policy" costs?</summary>
+<div class="qa-body">If <code>ParkingLot</code> held a field typed as the concrete class <code>NearestFirstStrategy</code>, then introducing a second policy would require either adding a conditional inside <code>ParkingLot</code> to pick between concrete classes, or replacing the field's type — either way, <code>ParkingLot</code>'s source has to change and be re-tested. By typing the field as the <code>SpotAllocationStrategy</code> interface and injecting a concrete implementation from outside (constructor injection, a configuration bean, or a factory), <code>ParkingLot</code>'s code path is fixed once and for all: it calls <code>strategy.findSpot(...)</code> and never needs to know which concrete strategy that is. New policies are then purely additive — new classes that implement the existing interface — which is what "closed for modification, open for extension" means operationally rather than as a slogan.</div>
+</details>
+<details class="concept-qa">
+<summary>Walk through exactly why "check if a spot is free, then assign it" is broken even if the occupied field is volatile.</summary>
+<div class="qa-body">Volatile guarantees that once a value is written, subsequent reads observe it (and don't see a stale cached copy) — that's a visibility guarantee. It says nothing about the composite operation of reading a value and then, based on that read, performing a write, because two threads can both perform their read before either performs their write. Concretely: thread A reads <code>occupied == false</code>. Before A gets to write <code>occupied = true</code>, thread B also reads <code>occupied == false</code> (a completely valid, non-stale read, since A hasn't written anything yet). Both threads now believe they've found a free spot and both proceed to assign it. The bug is not about visibility of writes — it's that "read" and "write" need to happen as one indivisible unit (a lock, or a CAS operation) so that once one thread's write has happened, the other thread's read is forced to see the new value before it decides anything.</div>
+</details>
+<details class="concept-qa">
+<summary>Why is a lock per ParkingSpot preferable to a single lock guarding the entire ParkingLot?</summary>
+<div class="qa-body">Correctness-wise, both approaches prevent the double-assignment race — a single global lock trivially serializes all mutation, so no two threads can ever race on the same spot. The difference is throughput: a single lot-wide lock means only one entry attempt across the entire building can proceed at a time, even when two cars are headed to spots on completely unrelated floors that share no state. Per-spot locks let unrelated claims proceed fully in parallel and only force threads to actually contend when they are genuinely racing for the same physical spot, which is the only situation where serialization is actually necessary. The general principle is to size the lock to the actual unit of contention — locking more than that unit serializes work that didn't need to be serialized.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does releasing a spot only after payment succeeds (not before) matter operationally?</summary>
+<div class="qa-body">If the spot were released as soon as the exit process began — before payment was confirmed — two problems open up. First, another entry gate could immediately assign that "free" spot to a new vehicle while the original vehicle is still physically parked in it, because the system's model of reality has diverged from physical reality. Second, if the payment step then fails or times out, there is no clean way to reconcile a ticket that has been closed and a spot that has been reassigned but is still physically occupied. Ordering the release strictly after a successful payment result keeps the system's state consistent with the physical world at every intermediate step, and makes failure handling straightforward: a failed payment simply means the ticket stays open and the spot stays occupied, exactly matching reality.</div>
+</details>
+<details class="concept-qa">
+<summary>Why should spot occupancy be modeled as an enum with an explicit transition table instead of a boolean, once reservations or maintenance holds exist?</summary>
+<div class="qa-body">A boolean can only represent two states, but a real system needs to distinguish "free and assignable," "reserved for a specific upcoming vehicle but not yet occupied," "physically occupied," and "deliberately taken out of service," and each of these has different legal next-states (a reserved spot shouldn't be claimed by a different vehicle's <code>tryOccupy</code>; an out-of-service spot shouldn't be assignable at all even though it's technically "free"). Cramming this into a boolean forces the extra states to live as separate flags or as implicit conventions in calling code, which is exactly how illegal-state bugs slip in — nothing stops a caller from calling <code>release()</code> on a spot that was never occupied to begin with. An enum with an explicit, enforced transition table makes every legal transition visible in one place and every illegal one a rejected call rather than silently-corrupted state.</div>
+</details>
+<details class="concept-qa">
+<summary>How does a Factory for ParkingSpot construction relate to the Open/Closed principle applied elsewhere in this design?</summary>
+<div class="qa-body">The Factory pattern and the Strategy pattern are solving the same underlying problem from two different angles: both let calling code depend on an abstraction (a <code>ParkingSpot</code> reference, a <code>SpotAllocationStrategy</code> reference) while the decision of exactly which concrete implementation to use is made in one centralized place. For the factory, that decision point is "given a <code>SpotType</code>, which concrete subclass do I instantiate" — centralizing it means that adding <code>HandicappedSpot</code> or a future <code>EvChargingSpot</code> only requires touching the factory's switch/mapping, not every place in the codebase that currently constructs spots. It's the construction-time analog of what Strategy does for behavior-time decisions.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does the vehicle-to-spot compatibility rule belong in a data structure (a map) rather than as logic on Vehicle subclasses?</summary>
+<div class="qa-body">If each <code>Vehicle</code> subclass implements its own <code>canParkIn(spot)</code> method, then every time a new spot type is introduced, every existing vehicle subclass's method needs to be revisited to decide whether it should now return true for that type — an addition to one axis (spot types) forces edits across an unrelated axis (every vehicle class). Representing compatibility as a single <code>Map&lt;VehicleType, Set&lt;SpotType&gt;&gt;</code> consulted through one shared code path means adding a new spot type or vehicle type is a data change (add a row, or add entries to existing rows), not a code change scattered across N classes, and it also removes any risk of one subclass's method silently diverging from the intended eligibility rule.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/solid-design-patterns'"><div class="rc-title">SOLID &amp; Design Patterns</div><div class="rc-sub">Phase 2 · the principles this design applies concretely — Strategy, Factory, DIP</div></div>
+<div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Multithreading, Concurrency &amp; Virtual Threads</div><div class="rc-sub">Days 16–20 · the JMM and locking primitives behind the spot-allocation race fix</div></div>
+<div class="related-card" onclick="window.location.hash='/lld-elevator-bookmyshow'"><div class="rc-title">LLD: Elevator &amp; BookMyShow</div><div class="rc-sub">Phase 2 · same entity-modeling and state-machine discipline applied to booking and dispatch</div></div>
+<div class="related-card" onclick="window.location.hash='/lld-rate-limiter-cache'"><div class="rc-title">LLD: Rate Limiter &amp; Cache</div><div class="rc-sub">Phase 2 · another design where atomic check-and-act under concurrency is the central problem</div></div>
+</div>

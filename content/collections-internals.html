@@ -1,0 +1,242 @@
+<p class="topic-breadcrumb">Phase 1 — Foundation &amp; Low-Level Mastery · Days 06–10 · Java / LLD</p>
+<h1>Java Collections Framework Internals</h1>
+<div class="topic-tags">
+<span class="tag">ArrayList vs LinkedList</span>
+<span class="tag">HashMap Internals</span>
+<span class="tag">Treeification</span>
+<span class="tag">ConcurrentHashMap</span>
+<span class="tag">TreeMap / Red-Black Tree</span>
+<span class="tag">PriorityQueue / Heaps</span>
+<span class="tag">Fail-Fast Iterators</span>
+<span class="tag">Stream Collectors</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Every backend service is, underneath its business logic, a machine for moving data between arrays, linked structures, hash tables, and trees. If you don't know that a <code>HashMap</code> resize rehashes every entry, you won't understand why a service that inserts a million entries into a freshly-constructed map without a sized constructor spends a visible chunk of its startup time in <code>resize()</code>. If you don't know that <code>HashMap</code> iteration order is a function of bucket index rather than insertion order, you'll write a test that passes today and fails after a JDK upgrade changes the hash spreading function. This page builds the mental model — array vs. pointer-chasing trade-offs, hashing, balanced trees, heaps — that explains why the framework's classes behave the way they do, not just what methods they expose.</p>
+</div>
+
+<h2>1. Arrays vs. Linked Structures: The Foundation of Every Trade-off</h2>
+<p>Almost every design decision in the collections framework traces back to one physical fact: an array is a single contiguous block of memory, and a linked structure is a set of separately-allocated nodes connected by references. Everything else — complexity numbers, cache behavior, resize costs — falls out of that.</p>
+
+<h3>ArrayList: contiguous, index-addressable storage</h3>
+<p><code>ArrayList</code> wraps a plain <code>Object[]</code>. Because the array is contiguous, the address of element <code>i</code> is computed directly as <code>baseAddress + i * elementSize</code> — no traversal needed. That gives:</p>
+<ul>
+<li><strong>get(i) / set(i, v):</strong> O(1) — one arithmetic computation, one memory read.</li>
+<li><strong>add at the end:</strong> amortized O(1). The backing array grows by 50% (via <code>Arrays.copyOf</code>, <code>newCapacity = oldCapacity + (oldCapacity >> 1)</code>) when full, and that growth is <em>amortized</em> because most inserts don't trigger it — the cost of an occasional O(n) copy is spread across the n cheap inserts that preceded it.</li>
+<li><strong>insert/remove at an arbitrary index:</strong> O(n) — every element after the index has to be shifted one slot via <code>System.arraycopy</code>, because the array's contiguity requires that there be no gaps.</li>
+</ul>
+
+<h3>LinkedList: pointer-chasing storage</h3>
+<p><code>LinkedList</code> is a doubly-linked list of <code>Node</code> objects, each holding <code>item</code>, <code>prev</code>, and <code>next</code>. Insertion or removal at a <em>known</em> node is O(1) — you just relink three pointers. But that's the theoretical claim that misleads people: to remove element at index <code>k</code> you first have to <em>find</code> it, and finding it means walking the list from whichever end is closer, which is O(n). So both structures are O(n) for "delete the element at index k" — <code>ArrayList</code> pays with a shift, <code>LinkedList</code> pays with a walk.</p>
+
+<div class="callout warn">
+<div class="callout-title">Why ArrayList wins in practice despite LinkedList's "O(1) insert"</div>
+<p>The O(1) insert claim for <code>LinkedList</code> only holds if you already have a reference to the node (e.g., via a <code>ListIterator</code> mid-traversal). For ordinary usage — <code>list.add(index, value)</code> — you pay O(n) to locate the node either way. And even when both are O(n), <code>ArrayList</code>'s O(n) is a tight loop over contiguous memory that the CPU prefetches efficiently (cache-friendly, no pointer indirection), while <code>LinkedList</code>'s O(n) walk chases pointers scattered across the heap, each dereference a potential cache miss. In measured workloads this often makes <code>ArrayList</code> faster even for "insert in the middle" patterns unless the list is huge and you're holding an iterator. <code>LinkedList</code> also pays ~16 bytes of object header + 2 references per node in overhead that a plain array simply doesn't have. This is why <code><a href="#/concurrency-multithreading">ArrayDeque</a></code> has effectively replaced both <code>Stack</code> and <code>LinkedList</code> as the default queue/deque implementation.</p>
+</div>
+
+<table>
+<tr><th>Operation</th><th>ArrayList</th><th>LinkedList</th></tr>
+<tr><td>get(index)</td><td>O(1)</td><td>O(n)</td></tr>
+<tr><td>add at end</td><td>amortized O(1)</td><td>O(1)</td></tr>
+<tr><td>add/remove at index</td><td>O(n) (shift)</td><td>O(n) (walk) + O(1) relink</td></tr>
+<tr><td>add/remove at known iterator position</td><td>O(n) shift</td><td>O(1)</td></tr>
+<tr><td>memory overhead</td><td>low (array + unused capacity)</td><td>high (node object per element)</td></tr>
+<tr><td>cache locality</td><td>excellent</td><td>poor</td></tr>
+</table>
+
+<h2>2. HashMap Internals: The Core Mechanism</h2>
+<p><code>HashMap</code> is the single most load-bearing class in the framework, and its internals explain a large fraction of subtle production bugs. The structure is an array of buckets, <code>Node&lt;K,V&gt;[] table</code>, where each slot holds either nothing, a linked list of colliding entries, or (since Java 8) a red-black tree of colliding entries.</p>
+
+<h3>The hash() function and why it spreads bits</h3>
+<p>You do not use <code>key.hashCode()</code> directly as the bucket index. <code>HashMap.hash(key)</code> does:</p>
+<pre><code>static final int hash(Object key) {
+    int h;
+    return (key == null) ? 0 : (h = key.hashCode()) ^ (h >>> 16);
+}</code></pre>
+<p>This XORs the top 16 bits of the hash code into the bottom 16 bits. Why? Because the bucket index is computed as <code>(n - 1) &amp; hash</code>, where <code>n</code> is the table length (always a power of two). Masking with <code>(n-1)</code> only ever looks at the <em>low</em> bits of the hash — for a table of size 16, only the low 4 bits matter. If a key's <code>hashCode()</code> implementation produces good entropy in the high bits but the low bits are mostly constant (a genuinely common pattern — e.g., hash codes built by shifting fields into different byte ranges), every key would collide into the same handful of buckets despite having "good" hash codes overall. XOR-folding the high 16 bits into the low 16 bits mixes that high-order entropy down into the bits that actually decide the bucket, at the cost of only two cheap operations. This is a deliberate, cheap defense against a specific, otherwise-invisible class of hash-quality bug.</p>
+
+<h3>Index calculation: (n − 1) &amp; hash</h3>
+<p>Because table length <code>n</code> is always a power of two, <code>n - 1</code> is a bitmask of all 1s (e.g., 15 = <code>0b1111</code> for n=16). <code>hash &amp; (n-1)</code> is exactly equivalent to <code>hash % n</code> for a power-of-two <code>n</code>, but a bitwise AND is far cheaper than a modulo (division) instruction — this is why the table size is forced to be a power of two (via <code>tableSizeFor</code>, which rounds any requested capacity up to the next power of two).</p>
+
+<h3>Collision handling: chaining, then treeification</h3>
+<p>When two keys hash to the same bucket, Java 8+ first stores them as a singly-linked chain of <code>Node</code> objects (append at the tail). If that chain grows past <code>TREEIFY_THRESHOLD</code> (8) <em>and</em> the table itself has at least <code>MIN_TREEIFY_CAPACITY</code> (64) buckets, the bucket is converted from a linked list into a red-black tree of <code>TreeNode</code>s, which are ordered by hash code (and, as a tiebreaker, by a class-name comparison or identity hash).</p>
+<div class="callout">
+<div class="callout-title">Why treeify only past 8 AND only when the table has ≥ 64 buckets</div>
+<p>A linked-list bucket lookup is O(k) for k colliding entries; a red-black tree bucket lookup is O(log k). For small k (say, 8), the constant-factor overhead of tree operations (more pointers, rebalancing) isn't worth it over a simple linear scan — 8 comparisons is nothing. Treeification exists as a defense against pathological hash collisions (accidental or, worse, adversarially crafted hash-flooding input, e.g., attacker-controlled map keys from HTTP request parameters designed to all hash to one bucket) that would otherwise degrade a bucket to O(n) linear search, turning an O(1) amortized map into an O(n) one under attack. The 64-bucket minimum exists because if the <em>table</em> is still small, the real fix is simply to resize the table (spreading entries into more buckets) rather than pay tree overhead — <code>resize()</code> is tried first via <code>treeifyBin</code>, which resizes instead of treeifying if capacity is under 64.</p>
+</div>
+
+<h3>Load factor and resizing</h3>
+<p>The table resizes when <code>size &gt; capacity * loadFactor</code>. The default load factor is <strong>0.75</strong>. This is a deliberate space/time trade-off: a lower load factor (say 0.5) wastes half the array on empty slots but keeps chains short and lookups fast; a higher load factor (say 0.9) packs the array tightly but lets chains grow, degrading average lookup time. 0.75 is the empirically-chosen point where, for a table following the Poisson distribution of random hashing, the expected bucket occupancy stays low (mostly 0 or 1 entries per bucket) while keeping memory reasonably dense.</p>
+<p>Resizing doubles the table capacity (<code>newCap = oldCap &lt;&lt; 1</code>) and then <strong>rehashes every existing entry</strong> into the new table — this is the expensive part people underestimate. Because capacity is always a power of two, Java 8 optimized this: instead of recomputing <code>hash &amp; (newCap - 1)</code> from scratch for every entry, it observes that in the new (doubled) table, each old bucket's entries split into exactly two new buckets — the original index, or the original index + oldCapacity — depending on whether the newly-relevant bit of the hash is 0 or 1. This lets resize split each bucket's chain into a "low" and "high" list in one pass without recomputing full hashes.</p>
+
+<div class="callout warn">
+<div class="callout-title">Resize cost in practice</div>
+<p>Constructing a <code>HashMap</code> with the no-arg constructor and then inserting a million entries triggers roughly 17 resize operations (16 → 32 → 64 → ... → ~1.4M), each one rehashing everything inserted so far. This is entirely avoidable: if you know the approximate final size up front, construct with <code>new HashMap&lt;&gt;(expectedSize)</code> (or better, account for load factor: capacity should be <code>expectedSize / 0.75</code> rounded up) to allocate the right-sized table once. This is a real, measurable startup-latency fix in services that bulk-load caches or lookup tables at boot.</p>
+</div>
+
+<h3>put() and get() step by step</h3>
+<ol>
+<li><strong>put(key, value):</strong> compute <code>hash(key)</code>; compute bucket index <code>i = (n-1) &amp; hash</code>; if the bucket is empty, insert a new <code>Node</code> there; if not, walk the chain (or tree) comparing <code>hash</code> first (cheap int comparison) and then <code>equals()</code> (only if hashes match) to find an existing key to overwrite, otherwise append; if the chain length after append hits the treeify threshold, treeify; finally check if <code>size &gt; threshold</code> and resize if so.</li>
+<li><strong>get(key):</strong> compute <code>hash(key)</code>, compute bucket index, then scan the bucket's chain or tree comparing hash and <code>equals()</code> until found or exhausted.</li>
+</ol>
+
+<h2>3. Ordered and Sorted Variants: LinkedHashMap and TreeMap</h2>
+
+<h3>LinkedHashMap: threading a list through the hash table</h3>
+<p><code>LinkedHashMap</code> extends <code>HashMap</code> and adds a second data structure on top: a doubly-linked list threading through all entries via <code>before</code>/<code>after</code> pointers on each node (its <code>Entry</code> subclasses <code>HashMap.Node</code>). This costs two extra references per entry but buys predictable iteration order. By default that order is <em>insertion</em> order; passing <code>accessOrder = true</code> to the constructor switches it to <em>access</em> order, where every <code>get()</code> moves the accessed entry to the end of the linked list.</p>
+<p>Access-order mode plus one override is exactly how you build an LRU cache from a general-purpose map:</p>
+<pre><code>class LruCache&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+    private final int capacity;
+    LruCache(int capacity) {
+        super(16, 0.75f, true); // accessOrder = true
+        this.capacity = capacity;
+    }
+    @Override
+    protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) {
+        return size() &gt; capacity;
+    }
+}</code></pre>
+<p><code>removeEldestEntry</code> is called by <code>put()</code>/<code>putAll()</code> right after insertion; returning <code>true</code> evicts the head of the linked list — the least-recently-used entry, because access-order mode keeps moving recently-touched entries to the tail. This is the textbook building block behind <a href="#/caching-strategies">bounded in-memory caches</a>, though production caches (Caffeine, Guava) use more sophisticated eviction (window-TinyLFU, segmented LRU) for better hit rates under skewed access patterns.</p>
+
+<h3>TreeMap: red-black tree backing</h3>
+<p><code>TreeMap</code> is backed by a red-black tree — a self-balancing binary search tree that guarantees O(log n) for get/put/remove by maintaining an invariant (no root-to-leaf path is more than twice as long as any other) via node recoloring and rotations on insert/delete. Unlike <code>HashMap</code>, there is no hashing at all: ordering is determined entirely by the keys' natural ordering (they must implement <code>Comparable</code>) or by a <code>Comparator</code> supplied at construction. This ordering is what buys you the navigation methods <code>HashMap</code> cannot offer:</p>
+<ul>
+<li><code>floorKey(k)</code> — greatest key ≤ k</li>
+<li><code>ceilingKey(k)</code> — smallest key ≥ k</li>
+<li><code>lowerKey(k)</code> — greatest key strictly &lt; k</li>
+<li><code>higherKey(k)</code> — smallest key strictly &gt; k</li>
+<li><code>firstKey()</code>/<code>lastKey()</code>, and range views via <code>subMap</code>, <code>headMap</code>, <code>tailMap</code></li>
+</ul>
+<p>These make <code>TreeMap</code> the right tool whenever you need range queries or "nearest key" lookups — e.g., mapping timestamps to events and finding the event active at a given time — something a hash table structurally cannot do, because hashing intentionally destroys any relationship between key ordering and storage location.</p>
+
+<h2>4. ConcurrentHashMap: Concurrency Without a Global Lock</h2>
+<p>Pre-Java-8, <code>ConcurrentHashMap</code> partitioned the table into a fixed number of <em>segments</em>, each with its own lock — a writer only blocked other writers touching the same segment. Java 8 redesigned this entirely around per-bucket, per-node concurrency primitives, eliminating segments:</p>
+<ul>
+<li><strong>Inserting into an empty bucket</strong> uses a CAS (compare-and-swap) operation (<code>Unsafe.compareAndSwapObject</code> / <code>VarHandle</code> in later versions) to atomically set the bucket's head node — no lock at all if the bucket was empty.</li>
+<li><strong>Inserting into a non-empty bucket</strong> (a collision, or a treeified bucket) synchronizes only on that specific bucket's head node — <code>synchronized(node)</code> — so writers to <em>different</em> buckets never contend with each other. This is much finer-grained than segment locking: contention only happens between two threads writing to the exact same bucket at the exact same time.</li>
+<li><strong>Resizing</strong> is cooperative: multiple threads can help move nodes from the old table to the new one concurrently (via <code>transfer()</code>), each claiming a range of buckets to migrate, using a <code>ForwardingNode</code> marker to tell concurrent readers/writers "this bucket has already moved, look in the new table."</li>
+<li><strong><code>size()</code></strong> doesn't lock anything — it sums a set of striped <code>LongAdder</code>-style counters (<code>CounterCell[]</code>) that are updated with low contention during puts/removes, then combined on demand. This trades perfect accuracy for the ability to never block.</li>
+<li><strong>Iteration</strong> walks the table directly without copying it and without blocking writers, meaning a structural change during iteration is possible and visible mid-traversal.</li>
+</ul>
+
+<div class="callout tip">
+<div class="callout-title">Weakly consistent, not "wrong"</div>
+<p>Because there is no global lock and no snapshot taken, <code>ConcurrentHashMap</code> iterators and bulk operations (<code>size()</code>, <code>isEmpty()</code>, <code>forEach</code>) are <em>weakly consistent</em>: they reflect the state of the map at some point during the operation, are guaranteed to traverse each element that was present for the entire duration at most once, but may or may not see elements inserted or removed concurrently, and never throw <code>ConcurrentModificationException</code>. This is a deliberate trade-off — you give up "exactly what did the map look like at instant T" in exchange for never blocking readers behind writers and never blocking writers behind readers. Contrast this with a synchronized <code>HashMap</code> wrapped by <code>Collections.synchronizedMap</code>, where you get a single consistent view at any instant but pay for it with a single lock serializing every access. See <a href="#/concurrency-multithreading">concurrency fundamentals</a> for how CAS and <code>synchronized</code> interact with the Java Memory Model to make this safe.</p>
+</div>
+
+<h2>5. Fail-Fast vs. Weakly Consistent Iterators</h2>
+<p>The non-concurrent collections (<code>ArrayList</code>, <code>HashMap</code>, <code>HashSet</code>, etc.) use a <strong>fail-fast</strong> iteration strategy built on a <code>modCount</code> field — an integer incremented every time the collection is structurally modified (add/remove; a plain <code>set()</code> doesn't count as structural). When you create an iterator, it captures the current <code>modCount</code> as <code>expectedModCount</code>. Every call to <code>next()</code> checks <code>modCount == expectedModCount</code>, and throws <code>ConcurrentModificationException</code> if they diverge.</p>
+<div class="callout warn">
+<div class="callout-title">Fail-fast is a bug detector, not a concurrency control</div>
+<p><code>ConcurrentModificationException</code> is not thrown to keep your data safe during concurrent access — it's a best-effort debugging aid that catches the common mistake of mutating a collection while iterating it, typically on a <em>single thread</em> (e.g., calling <code>list.remove(x)</code> inside a for-each loop over <code>list</code>). It offers no real guarantee: the JavaDoc explicitly states it should never be used for correctness, only to detect bugs, because a modification can, in rare cases, go undetected if timing happens to leave <code>modCount</code> unchanged in the way the check expects. The correct way to remove during iteration is <code>Iterator.remove()</code> (which updates <code>expectedModCount</code> to match) or <code>Collection.removeIf()</code>.</p>
+</div>
+<p>The concurrent collections (<code>ConcurrentHashMap</code>, <code>CopyOnWriteArrayList</code>, <code>ConcurrentSkipListMap</code>) instead use <strong>weakly consistent</strong> iteration, as described above — no exception is ever thrown, because the whole point of these classes is to support concurrent structural modification during traversal as a normal, expected use case, not a bug.</p>
+
+<h2>6. PriorityQueue: The Binary Heap</h2>
+<p><code>PriorityQueue</code> is backed by a binary heap stored in a plain array (<code>Object[] queue</code>), not by actual tree nodes. The heap property (min-heap by default: every parent ≤ its children) is maintained implicitly through index arithmetic: for a node at index <code>i</code>, its children live at <code>2i + 1</code> and <code>2i + 2</code>, and its parent lives at <code>(i - 1) / 2</code>. This array-as-tree encoding avoids pointer overhead entirely.</p>
+<ul>
+<li><strong>offer(e)</strong> (insert): append the element at the end of the array, then <strong>sift up</strong> — repeatedly compare it to its parent and swap if it's smaller (for a min-heap), until the heap property holds or it reaches the root. O(log n).</li>
+<li><strong>poll()</strong> (remove min): the root (index 0) is the minimum and is what's returned. Move the <em>last</em> element in the array into index 0, shrink the array, then <strong>sift down</strong> — repeatedly compare it to its smaller child and swap if the child is smaller, until the heap property holds. O(log n).</li>
+<li><strong>peek()</strong>: return index 0 directly. O(1).</li>
+</ul>
+<p>Passing a <code>Comparator</code> to the constructor simply changes the comparison used during sift-up/sift-down — a <code>Comparator.reverseOrder()</code> turns it into a max-heap without changing any of the underlying mechanics. <code>PriorityQueue</code> is explicitly <strong>not synchronized</strong>; the concurrent equivalent is <code>PriorityBlockingQueue</code>, which wraps the same heap logic in a single lock plus a <code>Condition</code> for blocking consumers when the queue is empty.</p>
+
+<h2>7. Copy-on-Write and Wrapper Collections</h2>
+
+<h3>CopyOnWriteArrayList</h3>
+<p>Every mutating operation (<code>add</code>, <code>set</code>, <code>remove</code>) allocates an entirely new backing array, copies the existing elements into it, applies the change, and then atomically swaps the volatile array reference. Readers always operate on whatever array reference they observed at the start of their operation (typically captured by the iterator at creation time), so reads never block and never see a torn or partially-updated array. This is only appropriate for <strong>read-heavy, write-rare</strong> workloads — e.g., a list of listeners that's iterated constantly but modified only at startup/shutdown — because every single write is O(n) in both time (full array copy) and space (a full duplicate array is allocated and the old one becomes garbage). Under frequent writes this produces significant allocation pressure and GC churn, potentially triggering more young-generation collections; see <a href="#/jvm-architecture">how the JVM heap and garbage collector handle allocation-heavy workloads</a>.</p>
+
+<h3>HashSet, TreeSet, LinkedHashSet: thin wrappers</h3>
+<p>All three <code>Set</code> implementations are, internally, just a <code>Map</code> whose keys are your elements and whose values are all a shared dummy constant (<code>private static final Object PRESENT = new Object();</code>). <code>HashSet.add(e)</code> literally calls <code>map.put(e, PRESENT)</code> under the hood. <code>TreeSet</code> wraps a <code>TreeMap</code>, giving it the same sorted-order and navigation guarantees (red-black tree, O(log n)). <code>LinkedHashSet</code> wraps a <code>LinkedHashMap</code>, giving it predictable insertion-order iteration. Understanding this collapses "three data structures" into "one data structure applied three times with different backing maps."</p>
+
+<h3>ArrayDeque as the Stack/Queue replacement</h3>
+<p><code>ArrayDeque</code> is a resizable circular array (a ring buffer) with head and tail indices that wrap around using modulo arithmetic. It supports O(1) amortized insertion/removal at both ends, making it strictly better than the legacy <code>Stack</code> class (which extends the antiquated, needlessly-synchronized <code>Vector</code>) for stack usage, and generally faster than <code>LinkedList</code> for queue usage because, again, contiguous-array access beats pointer-chasing. The JDK documentation itself recommends <code>ArrayDeque</code> over both <code>Stack</code> and <code>LinkedList</code> for stack/queue use cases.</p>
+
+<h2>8. The equals()/hashCode() Contract</h2>
+<p>Every hash-based collection depends on a strict contract: if <code>a.equals(b)</code> is <code>true</code>, then <code>a.hashCode() == b.hashCode()</code> must also be true. The reverse is not required — different objects may share a hash code (that's just a collision, handled by chaining). The reason this contract exists is entirely mechanical: <code>HashMap.get(key)</code> first computes <code>hash(key)</code> to jump straight to a bucket, then uses <code>equals()</code> only to disambiguate among entries <em>within that bucket</em>. If two equal objects produced different hash codes, they could land in different buckets, and a lookup for one would never find an entry stored under the other — silently, with no exception, just a wrong answer.</p>
+<div class="callout warn">
+<div class="callout-title">A mutable key silently corrupts a HashMap</div>
+<p>A closely related, extremely common bug: using a mutable object as a <code>HashMap</code> key and then mutating a field that participates in <code>hashCode()</code> after insertion. The entry is stored in the bucket matching the <em>old</em> hash code. After mutation, <code>map.get(key)</code> recomputes the <em>new</code> hash code, looks in the wrong bucket, and reports the key as absent — even though <code>containsKey</code> and iteration will still show the entry sitting there if you walk the whole table. The fix is to only use immutable objects (or objects whose equality fields never change post-insertion) as map keys and set members.</p>
+</div>
+<p>Also worth internalizing: if you override <code>equals()</code> without overriding <code>hashCode()</code>, you inherit <code>Object</code>'s identity-based hash code, which breaks the contract immediately — two "equal" objects will almost certainly hash differently, and a <code>HashSet</code> will happily store duplicates that your <code>equals()</code> considers the same.</p>
+
+<h2>9. Collectors: Building Collections from Streams</h2>
+<p>The <code>Collectors</code> utility class (used with <a href="#/streams-functional">Stream.collect()</a>) is fundamentally a set of recipes for assembling the collections covered above out of a stream of elements. Understanding the collections underneath makes these far less mysterious.</p>
+
+<h3>groupingBy — building a Map&lt;K, List&lt;V&gt;&gt;</h3>
+<p>Single-level grouping produces a <code>HashMap</code> keyed by your classifier function, with each value being a <code>List</code> (by default, an <code>ArrayList</code>) of all elements that mapped to that key — internally, this is implemented as a repeated <code>computeIfAbsent(key, k -> new ArrayList&lt;&gt;()).add(element)</code>.</p>
+<pre><code>Map&lt;Department, List&lt;Employee&gt;&gt; byDept =
+    employees.stream().collect(Collectors.groupingBy(Employee::getDepartment));</code></pre>
+<p>Multi-level grouping nests a downstream <code>groupingBy</code> inside the outer one, producing a <code>Map&lt;K1, Map&lt;K2, List&lt;V&gt;&gt;&gt;</code>:</p>
+<pre><code>Map&lt;Department, Map&lt;Boolean, List&lt;Employee&gt;&gt;&gt; byDeptThenRemote =
+    employees.stream().collect(
+        Collectors.groupingBy(Employee::getDepartment,
+            Collectors.groupingBy(Employee::isRemote)));</code></pre>
+<p>Any downstream collector can replace the implicit <code>toList()</code> — <code>counting()</code> to get group sizes, <code>summingInt()</code> to sum a field per group, or another <code>Collectors.mapping(...)</code> to transform elements before collecting them.</p>
+
+<h3>partitioningBy — a specialized binary groupingBy</h3>
+<p><code>partitioningBy(predicate)</code> always produces exactly two entries, keyed by <code>Boolean.TRUE</code>/<code>Boolean.FALSE</code>, backed internally by a dedicated lightweight map implementation rather than a general <code>HashMap</code> — because the key space is known to have exactly two values, there's no need for hashing at all.</p>
+
+<h3>mapping — transforming elements within a downstream collection</h3>
+<p><code>mapping(function, downstream)</code> applies a transformation to each element before it reaches a downstream collector — most useful nested inside <code>groupingBy</code> when you want, say, only employee names grouped by department rather than full <code>Employee</code> objects:</p>
+<pre><code>Map&lt;Department, List&lt;String&gt;&gt; namesByDept =
+    employees.stream().collect(Collectors.groupingBy(
+        Employee::getDepartment,
+        Collectors.mapping(Employee::getName, Collectors.toList())));</code></pre>
+
+<h3>toMap — building a Map directly, and the merge-function trap</h3>
+<p><code>Collectors.toMap(keyFn, valueFn)</code> builds a <code>HashMap</code> by applying both functions to each element. If two elements produce the same key, this throws <code>IllegalStateException: Duplicate key</code> by default — because without a merge strategy, silently overwriting one value with another would hide a correctness bug. The three-argument overload takes a <code>BinaryOperator&lt;V&gt;</code> merge function to resolve collisions explicitly:</p>
+<pre><code>Map&lt;Department, Double&gt; totalSalaryByDept =
+    employees.stream().collect(Collectors.toMap(
+        Employee::getDepartment,
+        Employee::getSalary,
+        Double::sum));</code></pre>
+
+<h3>joining — StringBuilder under the hood</h3>
+<p><code>Collectors.joining(delimiter, prefix, suffix)</code> is effectively a <code>StringBuilder</code> accumulator that appends each element (with the delimiter between elements) and wraps the result in the given prefix/suffix at the end — the collections-and-Big-O analogue here is trivial (O(n) total, same as manual string building), but it's worth knowing it avoids the O(n²) trap of repeated naive <code>String</code> concatenation (<code>+=</code> in a loop) precisely because it defers to a single mutable buffer, the same reason <code>ArrayList</code>'s amortized growth beats repeatedly reallocating a fixed array by hand.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does HashMap XOR the hash code's upper 16 bits into the lower 16 bits instead of using hashCode() directly?</summary>
+<div class="qa-body">Because the bucket index is computed as <code>(n-1) &amp; hash</code>, which for a power-of-two table size only ever examines the low-order bits of the hash. Many hashCode() implementations concentrate their entropy in higher-order bits (e.g., fields combined via multiplication and shifting), so using the raw hash code directly could send many distinct keys into a small number of buckets even though the hash codes look well-distributed overall. XOR-folding <code>h ^ (h &gt;&gt;&gt; 16)</code> mixes the high bits down into the low bits that actually decide bucket placement, spreading collisions more evenly across the table for the cost of one shift and one XOR — cheap insurance against a whole class of bad-hash-code bucket clustering.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Walk through exactly what happens, step by step, when a HashMap resizes.</summary>
+<div class="qa-body">Once <code>size</code> exceeds <code>capacity * loadFactor</code> (default 0.75) after an insert, <code>resize()</code> runs: it allocates a new array of double the old capacity (capacity always stays a power of two), then migrates every existing entry. Because the new capacity is double the old one, migrating a bucket at old index <code>i</code> only ever sends its entries to one of two places in the new table: index <code>i</code>, or index <code>i + oldCapacity</code> — determined by checking whether the bit at position <code>oldCapacity</code> (in binary) of each entry's stored hash is 0 or 1. This lets the JDK split each old bucket's chain into a "low" list and a "high" list in a single pass without recomputing hashes from scratch, then place the low list at index i and the high list at index i+oldCapacity in the new table. If a bucket had been treeified, the same split happens on the tree, and if the resulting split makes either resulting group small enough, it's un-treeified back into a plain list.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does ConcurrentHashMap not need a single global lock the way early synchronized Maps did?</summary>
+<div class="qa-body">Because concurrent access to different buckets doesn't actually conflict — two threads writing to key A and key B only need to coordinate if A and B happen to hash into the same bucket. Java 8's ConcurrentHashMap exploits this by using CAS to place the first node in an empty bucket lock-free, and a `synchronized` block scoped to only that bucket's head node when appending to a non-empty bucket or during a resize migration of that bucket. This means the only threads that ever actually block each other are two threads simultaneously touching the exact same bucket — everything else proceeds in parallel. Reads never take any lock at all; they rely on the fields being `volatile` so a freshly-written node is guaranteed visible to a subsequent reader.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does removing an element from a List while iterating it with a for-each loop throw ConcurrentModificationException, and what's the correct way to do it?</summary>
+<div class="qa-body">A for-each loop desugars to using the list's Iterator. `ArrayList` maintains a `modCount` counter incremented on every structural change; the iterator snapshots that count when created and checks it on every `next()` call. Calling `list.remove(x)` directly (rather than through the iterator) bumps `modCount` without informing the iterator, so the next `next()` call sees a mismatch and throws — this is a deliberate fail-fast check meant to surface a likely bug rather than let the iterator silently skip an element or throw an IndexOutOfBoundsException later. The correct approaches are to call `Iterator.remove()` (which updates the iterator's own expected count), use `ListIterator` if you need to add during traversal, or use `Collection.removeIf(predicate)`, which handles the removal internally without exposing you to the hazard at all.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is 0.75 the default load factor for HashMap, and what would change if it were 0.5 or 1.0?</summary>
+<div class="qa-body">Load factor controls the density of the table before a resize is triggered. At 0.5, half the array slots are always empty, wasting memory but keeping the expected number of entries per bucket very low (mostly 0 or 1), which keeps lookups close to true O(1). At 1.0, the table isn't resized until it's completely full, which saves memory but lets the expected bucket occupancy climb, increasing the average number of comparisons per lookup. 0.75 is the empirically chosen middle ground: for hash codes that spread roughly uniformly (a reasonable assumption under Poisson distribution modeling), it keeps the probability of any bucket having many entries low while not wasting an excessive fraction of the array as permanently unused capacity.</div>
+</details>
+
+<details class="concept-qa">
+<summary>How does LinkedHashMap's removeEldestEntry hook let you build an LRU cache with no custom eviction logic?</summary>
+<div class="qa-body">LinkedHashMap already maintains a doubly-linked list through all its entries; constructing it with `accessOrder = true` makes every `get()` (and `put()` on an existing key) move that entry to the tail of the list, so the head of the list is always the least-recently-used entry. `removeEldestEntry(eldest)` is invoked automatically by `put()`/`putAll()` right after a new entry is added, passed the current head (eldest) entry, and if it returns true, that head entry is removed immediately. Overriding it to return `size() > capacity` turns the map into a fixed-capacity cache that evicts the least-recently-used entry every time a new insertion would push it over capacity — no separate tracking structure required, because the linked list ordering already encodes recency.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why are HashSet, TreeSet, and LinkedHashSet described as "thin wrappers," and what does that actually buy you as a reader of the source?</summary>
+<div class="qa-body">Each of these Set implementations holds an internal Map instance (HashMap, TreeMap, and LinkedHashMap respectively) and stores your set elements as that map's keys, with every value pointing to the same shared dummy object. `add(e)` is literally `map.put(e, PRESENT) == null`. This means all the complexity, ordering behavior, and complexity guarantees you already understand for the Map side apply directly and unchanged to the Set side — TreeSet's O(log n) navigation methods and sorted iteration come purely from TreeMap's red-black tree, and LinkedHashSet's predictable iteration order comes purely from LinkedHashMap's threaded list. There isn't a second, separate implementation to learn.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/jvm-architecture'"><div class="rc-title">JVM Architecture</div><div class="rc-sub">Days 01–05 · heap allocation, GC pressure from resizing and copy-on-write, object header overhead</div></div>
+<div class="related-card" onclick="window.location.hash='/streams-functional'"><div class="rc-title">Streams &amp; Functional Style</div><div class="rc-sub">Days 06–10 · Collectors are stream-to-collection recipes built on the structures covered here</div></div>
+<div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Concurrency &amp; Multithreading</div><div class="rc-sub">Days 11–15 · CAS, synchronized, and the Java Memory Model underneath ConcurrentHashMap</div></div>
+<div class="related-card" onclick="window.location.hash='/caching-strategies'"><div class="rc-title">Caching Strategies</div><div class="rc-sub">Days 16–20 · LRU via LinkedHashMap is the entry point into real eviction policy design</div></div>
+</div>

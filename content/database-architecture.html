@@ -1,0 +1,330 @@
+<p class="topic-breadcrumb">Phase 1 — Foundation &amp; Low-Level Mastery · Days 11–15 · HLD</p>
+<h1>Database Architecture: SQL/NoSQL, Indexing, Sharding</h1>
+
+<div class="topic-tags">
+  <span class="tag">SQL vs NoSQL</span>
+  <span class="tag">B-Trees</span>
+  <span class="tag">LSM-Trees</span>
+  <span class="tag">Composite Indexes</span>
+  <span class="tag">Replication</span>
+  <span class="tag">Sharding</span>
+  <span class="tag">Locking</span>
+</div>
+
+<div class="callout tip">
+  <div class="callout-title">Why this matters</div>
+  <p>Almost every "the database is slow" incident traces back to one of a handful of mechanical facts: an index that doesn't match the query's sort order, a write-heavy table backed by the wrong storage engine, a replica that's minutes behind primary, or two transactions racing on the same row. None of these are exotic — they are direct, predictable consequences of how B-Trees, LSM-Trees, replication logs, and locks actually work. If you understand the mechanics in this page, you can look at a slow query plan or a stale-read bug report and know exactly which structural choice caused it, rather than guessing and adding indexes until something sticks.</p>
+</div>
+
+<h2>1. SQL vs NoSQL Is a Spectrum, Not a Binary Choice</h2>
+<p>The framing "SQL for structured data, NoSQL for unstructured data" is misleading. Every database — relational or not — makes a set of engineering trade-offs along several independent axes. Understanding those axes lets you place any database (Postgres, MongoDB, Cassandra, DynamoDB, Neo4j) on a map instead of memorizing a category.</p>
+
+<h3>The axes</h3>
+<ul>
+  <li><strong>Schema rigidity vs flexibility.</strong> A relational table enforces a schema at write time: every row has the same columns with the same types, checked by the engine before the write commits. This catches bugs early (you cannot accidentally write a string into an integer column) but makes evolving the schema across a large table an operational event (though modern engines like Postgres and MySQL 8 support fast metadata-only <code>ADD COLUMN</code> in most cases). Document stores defer that validation to the application: a `users` collection in MongoDB can have documents with wildly different shapes, which is powerful for rapidly evolving domains but pushes correctness checking into your code.</li>
+  <li><strong>Join support.</strong> Relational engines implement joins natively and optimize them (hash joins, merge joins, nested loop joins with index lookups) because normalization assumes you'll reassemble related data at query time. Most NoSQL stores either don't support joins at all or support them poorly, because their scaling model assumes data for one logical entity lives on one node — a join across shards would mean fanning a query out across the network, which the engine avoids by design, not by oversight.</li>
+  <li><strong>Horizontal scalability.</strong> A single-leader relational database scales reads via replicas but scales writes only by getting a bigger machine (vertical scaling) unless you add manual sharding on top. Many NoSQL systems (Cassandra, DynamoDB, MongoDB with sharding) build horizontal partitioning into the core engine from day one, because they were designed after teams had already been burned trying to bolt sharding onto MySQL.</li>
+  <li><strong>Consistency guarantees.</strong> Relational databases default to strong consistency: a committed write is immediately visible to the next read on that node, and transactions give you atomicity across multiple rows. Many distributed NoSQL stores trade this for availability and partition tolerance (the CAP theorem trade-off), offering tunable or eventual consistency instead — see <a href="#/distributed-systems-core">distributed-systems-core</a> for why this trade-off is forced, not optional, once you replicate across nodes.</li>
+</ul>
+
+<div class="callout">
+  <div class="callout-title">A more useful question than "SQL or NoSQL?"</div>
+  <p>Ask instead: does my access pattern need multi-row transactions and ad-hoc joins (favor relational), is my data naturally a self-contained document that's always read/written as a whole (favor document store), do I need sub-millisecond lookups by a single key at massive scale (favor key-value), do I need to write huge volumes of time-ordered or wide-row data (favor column-family), or is the domain itself a graph of relationships I need to traverse (favor graph)? The category follows from the access pattern, not the reverse.</p>
+</div>
+
+<h3>The major NoSQL categories and the concrete problem each one solves</h3>
+<table>
+  <tr><th>Category</th><th>Examples</th><th>Concrete reason it exists</th></tr>
+  <tr>
+    <td>Document</td>
+    <td>MongoDB, Couchbase</td>
+    <td>Application objects are naturally nested (an order with line items, a user profile with addresses). Storing that as a single JSON-like document avoids the object-relational impedance mismatch of splitting it into five normalized tables and rejoining them on every read.</td>
+  </tr>
+  <tr>
+    <td>Key-value</td>
+    <td>Redis, DynamoDB, Riak</td>
+    <td>When the access pattern is purely "give me the value for this key," you don't need a query planner, joins, or a schema at all — you need the absolute minimum indirection between a hash lookup and the bytes on disk/memory, which is what makes these the fastest tier for point lookups.</td>
+  </tr>
+  <tr>
+    <td>Column-family (wide-column)</td>
+    <td>Cassandra, HBase, Bigtable</td>
+    <td>Built for workloads that write huge volumes of rows keyed by a partition key plus a sortable clustering key (time-series metrics, event logs) where you need very high write throughput and range scans within a partition, but never need cross-partition joins.</td>
+  </tr>
+  <tr>
+    <td>Graph</td>
+    <td>Neo4j, Amazon Neptune</td>
+    <td>When the query itself is "traverse relationships N hops deep" (friend-of-a-friend, fraud rings, recommendation paths), a relational engine has to do N nested joins that get combinatorially expensive; a graph engine stores adjacency directly so traversal is a pointer walk, not a join.</td>
+  </tr>
+</table>
+
+<h2>2. B-Tree Indexes: The Default for Disk-Backed Storage</h2>
+<p>An index exists to avoid scanning every row to answer a query. The interesting engineering question is: what data structure should back that index, given that the data lives on disk (or, more precisely, is read in fixed-size pages, typically 4KB–16KB, and each page read is orders of magnitude slower than an in-memory pointer dereference)?</p>
+
+<h3>Why not a binary search tree?</h3>
+<p>A balanced binary search tree gives you O(log₂ n) comparisons, which sounds fine until you account for what each "comparison" costs. If each node lives on its own disk page, then a tree over one billion rows needs about log₂(10⁹) ≈ 30 levels, meaning up to 30 random disk seeks per lookup. On a spinning disk (~10ms seek) that's 300ms for one lookup — unusable. Even on SSDs, random reads are far slower than sequential ones and you still pay 30 page faults per query.</p>
+
+<h3>The B-Tree fix: maximize fanout, minimize height</h3>
+<p>A B-Tree (specifically, databases use B+Trees, where all values live in leaf nodes and internal nodes hold only routing keys) restructures the problem: instead of 2 children per node, each node holds hundreds to thousands of keys and pointers, sized so that one node fits exactly in one disk page. This gives a very high branching factor (fanout), often 100–1000, which means the tree height for a billion rows drops from ~30 to 3–4. Since each level is one disk page read, a lookup that used to cost 30 seeks now costs 3–4 — and because the top 2–3 levels are almost always cached in the buffer pool (see <a href="#/caching-strategies">caching-strategies</a>), a real lookup often costs a single physical disk read.</p>
+
+<pre><code>Root page (fanout ~500): [ 10 | 800 | 4200 | ... ]
+        |          |            |
+   points to   points to    points to
+   child page  child page   child page
+   for keys    for keys     for keys
+   &lt; 800       800-4200     &gt; 4200
+
+Leaf pages (sorted, linked list):
+[1..799] &lt;-&gt; [800..4199] &lt;-&gt; [4200..9999] &lt;-&gt; ...
+   each leaf holds the actual row pointer (or the row itself, clustered index)
+</code></pre>
+
+<h3>Why this helps both equality and range queries</h3>
+<p>Because keys within a node are sorted, and leaf nodes are additionally linked together as a doubly-linked list, a B+Tree serves two access patterns well with the same structure:</p>
+<ul>
+  <li><strong>Equality lookup</strong> (<code>WHERE id = 4201</code>): walk down from root to leaf using binary search within each page, ~3-4 page reads total.</li>
+  <li><strong>Range query</strong> (<code>WHERE id BETWEEN 4200 AND 4300</code>): walk down to the starting leaf once, then walk sideways along the linked leaf pages until the range is exhausted — no need to revisit the root for each row.</li>
+</ul>
+<p>This dual capability is precisely why B-Trees remain the standard index structure in Postgres, MySQL/InnoDB, Oracle, and SQL Server: a hash index could theoretically beat a B-Tree on pure equality lookups (O(1) vs O(log n)), but it provides no ordering, so it cannot serve range scans, <code>ORDER BY</code>, or prefix matches at all.</p>
+
+<div class="callout warn">
+  <div class="callout-title">Every write touches the tree, not just the row</div>
+  <p>An index is not free storage on the side — it is a second (or third, or tenth) data structure that must stay consistent with the table. Every <code>INSERT</code>, <code>UPDATE</code> of an indexed column, or <code>DELETE</code> has to also locate and modify the corresponding B-Tree leaf, potentially triggering a page split if the leaf is full. This is why tables with many indexes have measurably slower write throughput than the same table with fewer indexes — you're paying a write-amplification cost proportional to the number of indexed columns, not just the number of rows.</p>
+</div>
+
+<h2>3. LSM-Trees: Optimizing for Write Throughput</h2>
+<p>B-Trees are excellent for read-heavy, range-query-heavy workloads, but they have an inherent weakness for writes: an in-place update to a B-Tree leaf means a random write to a random disk location, and if that leaf is full, a page split that rewrites and re-links multiple pages. For workloads dominated by very high write volume (event logging, metrics ingestion, write-heavy feeds), this random-write cost becomes the bottleneck. The Log-Structured Merge Tree (LSM-Tree) is the structural answer, used by Cassandra, RocksDB, LevelDB, HBase, and as an optional storage engine in some MySQL forks (MyRocks).</p>
+
+<h3>The structure: memtable + immutable SSTables</h3>
+<ol>
+  <li><strong>Writes go to an in-memory sorted structure (the memtable)</strong> — typically a skip list or balanced tree — and are simultaneously appended to a write-ahead log on disk for durability. Because the write-ahead log write is a sequential append (not a random write to a specific offset), it's extremely fast even on spinning disks, and near-optimal on SSDs.</li>
+  <li><strong>When the memtable reaches a size threshold, it is flushed to disk as an SSTable</strong> (Sorted String Table) — an immutable, sorted file. "Immutable" is the key word: once written, an SSTable is never modified in place, only read, merged, or deleted wholesale.</li>
+  <li><strong>Reads must check the memtable first, then each SSTable</strong>, typically from newest to oldest, until the key is found (or confirmed absent). To avoid checking every SSTable on disk for every read, engines use Bloom filters — a probabilistic structure that can say "definitely not in this SSTable" cheaply, skipping most files, at the cost of occasional false positives (never false negatives).</li>
+</ol>
+
+<pre><code>Write path:
+  client write -> append to WAL (sequential disk write, durable)
+              -> insert into memtable (in-memory sorted structure)
+              -> [memtable full] -> flush as new immutable SSTable on disk
+
+Read path:
+  check memtable -> check Bloom filter of SSTable_N (newest)
+                 -> if maybe-present, check SSTable_N
+                 -> else check SSTable_N-1 ... until found or all exhausted
+</code></pre>
+
+<h3>Why writes are fast: no in-place update, ever</h3>
+<p>The entire performance advantage of LSM-Trees comes from converting random writes into sequential ones. A B-Tree write means "find the right page, possibly on disk, and mutate it in place." An LSM-Tree write means "append to a log and insert into an in-memory structure" — no disk seek is on the critical path of the write at all. This is why LSM-backed engines can sustain dramatically higher write throughput than B-Tree engines under heavy insert load.</p>
+
+<h3>Compaction: the bill that comes due later</h3>
+<p>Because SSTables are immutable and accumulate over time, the same key can exist in multiple SSTables (an insert, then a later update, then a delete — represented as a "tombstone" marker rather than an actual removal). Left unchecked, this means: reads get progressively slower (more files to check), and disk usage grows even though the logical dataset hasn't. <strong>Compaction</strong> is a background process that merges multiple SSTables into fewer, larger ones, discarding overwritten values and resolving tombstones. It's the mechanism that pays back the cost deferred at write time — the LSM-Tree strategy is fundamentally "defer and batch the expensive part."</p>
+
+<div class="callout warn">
+  <div class="callout-title">Compaction is not optional maintenance — it's load-bearing</div>
+  <p>If compaction falls behind write volume (common when a write spike coincides with compaction being CPU/IO-throttled), read latency degrades because queries must check more and more SSTables, and disk usage climbs. This is the most common operational failure mode of LSM-backed systems like Cassandra: "compaction is falling behind" is a first-class alert, not a curiosity, because it directly predicts an oncoming read-latency and disk-space crisis.</p>
+</div>
+
+<h3>The three amplification metrics: how to actually compare B-Tree vs LSM-Tree</h3>
+<table>
+  <tr><th>Metric</th><th>Definition</th><th>B-Tree</th><th>LSM-Tree</th></tr>
+  <tr>
+    <td>Write amplification</td>
+    <td>Bytes actually written to disk per logical byte written by the application</td>
+    <td>Moderate — in-place updates plus occasional page splits</td>
+    <td>Higher — the same data is rewritten repeatedly across compaction levels</td>
+  </tr>
+  <tr>
+    <td>Read amplification</td>
+    <td>Number of disk reads needed to answer one logical read</td>
+    <td>Low and predictable — bounded by tree height (~3-4)</td>
+    <td>Higher and more variable — may need to check memtable plus several SSTables unless compaction keeps file count low</td>
+  </tr>
+  <tr>
+    <td>Space amplification</td>
+    <td>Disk space used relative to the logical size of the data</td>
+    <td>Low — one copy per row, plus index overhead</td>
+    <td>Higher until compaction runs — obsolete versions and tombstones accumulate</td>
+  </tr>
+</table>
+
+<div class="callout tip">
+  <div class="callout-title">The one-line summary to internalize</div>
+  <p>B-Trees pay a small, consistent cost on every write to keep reads uniformly fast. LSM-Trees pay almost nothing on the write itself and defer the cost to a background compaction process, trading some read latency and disk space for dramatically higher write throughput. Choose B-Tree-backed engines (Postgres, MySQL/InnoDB) for read-heavy or range-query-heavy workloads; choose LSM-backed engines (Cassandra, RocksDB) for write-heavy, append-mostly workloads like event ingestion or time-series data.</p>
+</div>
+
+<h2>4. Composite Indexes, the Leftmost-Prefix Rule, and Covering Indexes</h2>
+<h3>Composite indexes and leftmost-prefix</h3>
+<p>A composite (multi-column) index, e.g. <code>CREATE INDEX idx ON orders (customer_id, status, created_at)</code>, is physically one B-Tree where the sort key is the concatenation of the columns in the order they were declared — first sorted by <code>customer_id</code>, then within each <code>customer_id</code> group sorted by <code>status</code>, then within each of those groups sorted by <code>created_at</code>. This has a direct and non-obvious consequence: the index can only be used efficiently for queries that filter on a <em>left-to-right prefix</em> of the declared columns.</p>
+<ul>
+  <li><code>WHERE customer_id = ?</code> — uses the index (prefix of length 1).</li>
+  <li><code>WHERE customer_id = ? AND status = ?</code> — uses the index fully (prefix of length 2).</li>
+  <li><code>WHERE customer_id = ? AND created_at > ?</code> — uses the index only for the <code>customer_id</code> part; it cannot skip to arbitrary <code>created_at</code> values without also filtering by <code>status</code>, because <code>created_at</code> is not sorted independently of <code>status</code> within the tree.</li>
+  <li><code>WHERE status = ?</code> alone — cannot use this index at all, because without knowing <code>customer_id</code> first, the matching rows are scattered arbitrarily throughout the tree.</li>
+</ul>
+
+<div class="callout">
+  <div class="callout-title">The general rule for composite indexes</div>
+  <p>Order columns by: (1) columns used in equality filters first, (2) then at most one column used for a range filter or sort, since a range filter breaks the sorted contiguity for any column after it. If you commonly query by both <code>(customer_id, status)</code> and <code>(customer_id, created_at)</code> independently, you likely need two separate indexes, not one composite index reused cleverly — trying to force one index to serve both access patterns usually means one of the two queries falls back to a much less selective scan.</p>
+</div>
+
+<h3>Covering indexes</h3>
+<p>A covering index is one that contains every column a query needs — both the filter columns and the selected columns — so the engine can answer the query directly from the index's leaf pages without a second lookup back to the full row (called a "bookmark lookup" or "table access by rowid"). For example, if you frequently run <code>SELECT status FROM orders WHERE customer_id = ?</code>, an index on <code>(customer_id, status)</code> covers the query entirely: both the filter and the selected column live in the index leaf, so the engine never touches the underlying table's heap/clustered structure. This can turn a query that costs one index read plus one row read per matching row into a query that costs only the index read, which matters enormously when a query matches thousands of rows.</p>
+
+<h3>When an index hurts</h3>
+<p>Indexes are not free wins; each one is a trade of write cost and storage for read speed, and that trade isn't always worth it.</p>
+<ul>
+  <li><strong>Write amplification per indexed column.</strong> Each additional index on a table means each <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> must also update that index's B-Tree, so a table with eight indexes pays roughly eight times the index-maintenance cost of a table with one index, on every write.</li>
+  <li><strong>Index bloat.</strong> Frequent updates and deletes leave behind dead entries in B-Tree leaves (particularly visible in Postgres, where an <code>UPDATE</code> is implemented as a delete-plus-insert due to MVCC, leaving old row versions that must be vacuumed). An un-vacuumed, bloated index can become larger than the table itself and paradoxically slower than a full table scan.</li>
+  <li><strong>Low-selectivity columns rarely earn their cost.</strong> An index on a boolean column or a column with three possible values doesn't narrow the search space enough to be worth the write and storage overhead — the planner will often ignore it and scan the table anyway.</li>
+</ul>
+
+<h2>5. Replication: Leader-Follower, Sync vs Async, and Replication Lag</h2>
+<p>Replication exists to solve two separate problems that are easy to conflate: durability/availability (if one node dies, another has the data) and read scalability (spread read load across multiple copies). The dominant pattern in relational systems is leader-follower (primary-replica): all writes go to a single leader, which then streams a log of changes (the write-ahead log, or a logical replication stream) to one or more followers, which replay it to stay in sync.</p>
+
+<h3>Synchronous vs asynchronous replication</h3>
+<table>
+  <tr><th></th><th>Synchronous</th><th>Asynchronous</th></tr>
+  <tr>
+    <td>How it works</td>
+    <td>Leader waits for at least one follower to confirm it received (and often applied) the write before acknowledging the client</td>
+    <td>Leader acknowledges the client immediately after committing locally, and ships the change to followers in the background</td>
+  </tr>
+  <tr>
+    <td>Durability guarantee</td>
+    <td>A confirmed write cannot be lost even if the leader dies immediately after, since a follower already has it</td>
+    <td>A leader crash between local commit and replication can lose the last few writes</td>
+  </tr>
+  <tr>
+    <td>Latency cost</td>
+    <td>Every write pays the network round-trip to the follower(s), which is why fully synchronous replication to a geographically distant follower can add tens to hundreds of milliseconds per write</td>
+    <td>Writes are as fast as the local commit; replication is fully off the write's critical path</td>
+  </tr>
+  <tr>
+    <td>Common deployment</td>
+    <td>Semi-synchronous — one nearby follower is synchronous for durability, the rest are asynchronous for reach</td>
+    <td>Most read replicas in typical deployments (e.g., MySQL/Postgres read replicas used purely for scaling read traffic)</td>
+  </tr>
+</table>
+
+<h3>Replication lag and read-after-write consistency</h3>
+<p>Replication lag is simply the delay between a write committing on the leader and that write becoming visible on a given follower. It is not a bug — it's the direct, unavoidable cost of asynchronous replication, and it's why "read your own writes" is a named consistency problem rather than an assumed default: a user who updates their profile and is then immediately routed to a lagging read replica will see their old data, because the replica genuinely hasn't received the update yet.</p>
+<div class="callout warn">
+  <div class="callout-title">Concrete failure mode: the phantom revert</div>
+  <p>A user submits a form, the write succeeds on the leader, the page reloads and issues a read that's load-balanced to a replica still 200ms behind. The user sees their old data and, reasonably, assumes the save failed and resubmits — sometimes creating duplicate records. The fix is architectural, not a bigger box: route the read-after-write case to the leader (or a replica the application can verify has caught up, e.g., via a monotonic sequence/LSN check), or accept eventual consistency explicitly in the UI ("your changes may take a moment to appear").</p>
+</div>
+
+<h2>6. Sharding: Horizontal Partitioning and Its Costs</h2>
+<p>Replication copies the same data onto multiple nodes to scale reads and provide redundancy; it does nothing for write scalability because every write still has to go through the single leader. Sharding (horizontal partitioning) solves a different problem: splitting the dataset itself across multiple nodes so that no single node holds all of it, letting both storage and write throughput scale by adding nodes.</p>
+
+<h3>Choosing a sharding key</h3>
+<p>The sharding key determines which shard a given row lives on, and this single decision dominates the entire system's behavior. A poorly chosen key creates a <strong>hot shard</strong>: if you shard a multi-tenant system by <code>tenant_id</code> and one tenant is 100x larger than the others, that tenant's shard absorbs a disproportionate share of load while other shards sit idle — you've added machines but not actually distributed the work.</p>
+
+<h3>Sharding strategies</h3>
+<table>
+  <tr><th>Strategy</th><th>How it works</th><th>Trade-off</th></tr>
+  <tr>
+    <td>Range-based</td>
+    <td>Each shard owns a contiguous range of key values (e.g., user IDs 1–1M, 1M–2M)</td>
+    <td>Efficient range queries within a shard, but new data (e.g., always-increasing IDs or timestamps) piles onto the newest shard, creating a hot shard for write-heavy, append-style workloads</td>
+  </tr>
+  <tr>
+    <td>Hash-based</td>
+    <td>A hash function maps each key to a shard, spreading keys uniformly regardless of their natural ordering</td>
+    <td>Excellent write distribution, but range queries (e.g., "all orders from last week") must fan out to every shard, since consecutive keys are deliberately scattered</td>
+  </tr>
+  <tr>
+    <td>Directory-based</td>
+    <td>A separate lookup service/table maps each key (or key range) to a specific shard explicitly</td>
+    <td>Maximum flexibility — you can rebalance by moving individual entries in the directory — but the directory itself becomes a critical, latency-sensitive dependency and potential single point of failure</td>
+  </tr>
+</table>
+
+<h3>Resharding pain and consistent hashing</h3>
+<p>With naive hash-based sharding (<code>shard = hash(key) % N</code>), adding or removing a single node changes <code>N</code>, which changes the modulus result for nearly every key — in practice, close to 100% of keys map to a different shard. That means a full data reshuffle just to add one machine, which is operationally unacceptable at scale. <strong>Consistent hashing</strong> fixes this by mapping both shards and keys onto a fixed hash ring (e.g., 0 to 2³²−1); each key belongs to the first shard found walking clockwise from its hash position. Adding or removing one shard now only affects the keys between that shard and its immediate neighbor on the ring — roughly <code>1/N</code> of all keys move, not nearly all of them. Virtual nodes (each physical shard is assigned many points on the ring) further smooth the distribution so that one shard doesn't end up owning a disproportionate arc just by chance.</p>
+
+<h3>Cross-shard queries and transactions: the fundamental cost</h3>
+<p>Sharding's core trade-off is this: anything that needs to touch data across more than one shard becomes dramatically harder. A query that filtered on the sharding key becomes a single targeted lookup; a query that doesn't (or an aggregate like "total revenue across all customers") has to scatter-gather across every shard and merge results in the application or a coordinating layer, paying the latency of the slowest shard and losing the ability to push sorting/filtering fully down to one engine. Transactions are worse: a relational transaction's ACID guarantees are native within one node's engine, but a transaction that must atomically update rows on two different shards requires a distributed transaction protocol (e.g., two-phase commit) or a compensating-transaction/saga pattern, both of which trade simplicity and latency for cross-shard atomicity. This is precisely why schema design for a sharded system usually starts from "what needs to be transactional together" and picks a sharding key that keeps those things co-located, rather than picking a key first and discovering the transactional boundaries don't fit — see <a href="#/distributed-systems-core">distributed-systems-core</a> for the deeper mechanics of distributed transactions and consensus.</p>
+
+<h2>7. Optimistic vs Pessimistic Locking</h2>
+<p>Both strategies solve the same problem — preventing two concurrent transactions from corrupting each other's updates to the same row (a lost update) — but they make opposite bets about how often conflicts actually happen.</p>
+
+<h3>Pessimistic locking</h3>
+<p>Pessimistic locking assumes conflicts are likely, so it prevents them upfront by acquiring an exclusive lock before reading data it intends to modify, typically via <code>SELECT ... FOR UPDATE</code>. Any other transaction that tries to read (for update) or write that same row blocks until the lock holder commits or rolls back.</p>
+<div class="callout">
+  <div class="callout-title">Concrete scenario: seat reservation</div>
+  <p>Two customers try to book the last seat on a flight at nearly the same instant. With pessimistic locking, the first transaction runs <code>SELECT * FROM seats WHERE id = ? FOR UPDATE</code>, which locks that row; the second transaction's identical query blocks and waits. Once the first transaction commits (marking the seat booked) and releases the lock, the second transaction proceeds, re-reads the now-updated row, and correctly sees the seat is taken — no double-booking is possible because the second transaction was never allowed to read stale state while a conflicting write was in flight.</p>
+</div>
+<p>The cost is contention: every transaction that wants the locked row must wait, and if lock acquisition order isn't carefully controlled across multiple tables, you risk deadlocks (transaction A holds lock 1 and waits for lock 2, while transaction B holds lock 2 and waits for lock 1), which the database eventually detects and resolves by forcibly aborting one of the transactions.</p>
+
+<h3>Optimistic locking</h3>
+<p>Optimistic locking assumes conflicts are rare, so it lets transactions proceed without locking and instead checks, at commit time, whether the data changed since it was read. The standard mechanism is a version column (or a timestamp) on the row: read the row along with its current <code>version</code>, and when writing, issue <code>UPDATE t SET data = ?, version = version + 1 WHERE id = ? AND version = ?</code> using the version value you originally read. If no other transaction modified the row in between, the <code>WHERE</code> clause matches and the update succeeds, incrementing the version. If another transaction won the race and already updated the row, the version no longer matches, zero rows are affected, and the application detects this and retries (typically by re-reading and reapplying the change, or surfacing a conflict to the user).</p>
+<div class="callout">
+  <div class="callout-title">Concrete scenario: editing a shared document field</div>
+  <p>Two team members open the same task record and both edit its description. With optimistic locking, both reads succeed immediately with no blocking. Whoever saves first succeeds and bumps the version. When the second person saves, their <code>UPDATE ... WHERE version = 3</code> matches zero rows because the version is now 4, so the application detects the conflict and either re-fetches the latest version for the user to merge manually, or in low-contention cases simply retries with the new data. Because conflicts here are genuinely rare (two people editing the exact same record within seconds is uncommon), paying an occasional retry is far cheaper than pessimistically locking the row on every single read.</p>
+</div>
+
+<table>
+  <tr><th></th><th>Optimistic (version/CAS)</th><th>Pessimistic (<code>SELECT ... FOR UPDATE</code>)</th></tr>
+  <tr><td>Best when</td><td>Conflicts are rare; contention is low; retries are cheap</td><td>Conflicts are frequent or the cost of a failed/retried operation is high (e.g., financial postings)</td></tr>
+  <tr><td>Cost model</td><td>No blocking, but wasted work and a retry loop on conflict</td><td>No wasted work, but transactions queue up waiting for locks</td></tr>
+  <tr><td>Failure mode under high contention</td><td>Repeated retry storms — throughput can collapse as most attempts fail</td><td>Lock queues grow, latency spikes, deadlocks become more likely</td></tr>
+  <tr><td>Typical mechanism</td><td>Version column / compare-and-swap in the <code>WHERE</code> clause</td><td><code>SELECT ... FOR UPDATE</code>, row-level or table-level locks</td></tr>
+</table>
+
+<p>This same choice reappears at the application layer whenever an ORM manages entity state — Hibernate's <code>@Version</code> annotation implements exactly this optimistic pattern natively, throwing <code>OptimisticLockException</code> on a version mismatch, which is worth understanding alongside how Hibernate tracks entity state more broadly in <a href="#/jpa-hibernate">jpa-hibernate</a>.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+  <summary>Why does a B-Tree's high branching factor matter more than its being "balanced"?</summary>
+  <div class="qa-body">Balance alone (as in a red-black tree) guarantees O(log₂ n) height, but the base of that logarithm is what matters when each level costs a disk seek. A binary tree over a billion rows needs ~30 levels; a B-Tree with a branching factor of 500 needs only ~4 levels for the same billion rows, because each level does far more work (a sorted scan through hundreds of keys in one page, which is cheap once that page is already in memory) in exchange for needing far fewer levels. The entire design is shaped around the fact that a disk/page read costs orders of magnitude more than an in-memory comparison, so the right strategy is to do more comparisons per page fetched, not fewer levels of anything.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>If LSM-Trees make writes so much faster, why doesn't every database use them by default?</summary>
+  <div class="qa-body">Because the write speedup is paid for with read cost and operational complexity. A read might have to check the memtable plus several SSTables before it can be sure a key doesn't exist (mitigated but not eliminated by Bloom filters), and this variability is worse for latency-sensitive, read-heavy or range-scan-heavy workloads than a B-Tree's predictable, bounded-height lookup. Compaction also consumes background CPU and I/O that competes with foreground traffic, and if it falls behind, both read latency and disk usage degrade simultaneously. Postgres and MySQL/InnoDB default to B-Trees because most application workloads (CRUD apps, dashboards, anything with meaningful read/range-query volume) are better served by predictable reads than by maximum write throughput.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Why can't a composite index on (a, b, c) serve a query that filters only on b?</summary>
+  <div class="qa-body">The index is one physical B-Tree sorted first by a, then by b within each a group, then by c within each b group. Rows with a given b value are scattered across every a group rather than being contiguous anywhere in the tree, so there is no way to jump directly to "all rows where b = x" without effectively examining every a group — which is no better than scanning the whole table. This is why the leftmost-prefix rule isn't an arbitrary restriction imposed by the database, it's a direct geometric consequence of how the keys are physically ordered on disk.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Why does asynchronous replication make "read-after-write" a real design problem instead of an edge case?</summary>
+  <div class="qa-body">Asynchronous replication acknowledges the client as soon as the leader commits locally, before any follower has necessarily received the change. The replication stream then applies on its own schedule, which can lag by milliseconds to seconds depending on network conditions and follower load. If the very next read from that same client is routed to a lagging follower — which is likely in any system that load-balances reads across replicas for scalability — it will see stale data. This isn't a rare timing coincidence; it's the expected behavior any time a write and a subsequent read happen close together and land on different nodes, so systems that need read-your-own-writes semantics have to explicitly route those specific reads to the leader or a caught-up replica rather than relying on luck.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Why does sharding by a naive hash-and-modulo scheme cause a full data reshuffle when you add one node?</summary>
+  <div class="qa-body">With shard = hash(key) % N, the shard assignment for almost every key depends on the exact value of N. Changing N from, say, 4 to 5 changes the modulo result for the vast majority of keys, not just the ones that "should" move to balance the new node — because the formula has no structural relationship between old and new assignments. Consistent hashing avoids this by placing shards and keys on a fixed-size ring independent of the node count; adding a shard only reassigns the keys in the arc between that shard and its neighbor, leaving every other key's assignment untouched.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>In what situation would optimistic locking actually perform worse than pessimistic locking?</summary>
+  <div class="qa-body">When contention on the same row is high and frequent — for example, a single hot counter row being updated by thousands of concurrent transactions per second. Optimistic locking would cause the vast majority of updates to fail their version check and retry, and under enough concurrency, the retry storm itself can consume more work and produce lower effective throughput than simply queuing transactions with a lock would have. Optimistic locking's advantage (no blocking) is only a win when conflicts are the exception rather than the norm; once conflicts become common, pessimistic locking's queuing behavior is actually more work-efficient because it doesn't throw away completed work on a failed compare-and-swap.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Why is a covering index sometimes a bigger performance win than just "having an index" at all?</summary>
+  <div class="qa-body">A non-covering index still requires, for every matching row, a second lookup from the index's leaf entry back to the actual row in the table's heap or clustered structure (a bookmark lookup) to fetch any column not present in the index. That second lookup is effectively a separate, often random, page read per row. A covering index eliminates that step entirely because every column the query needs — filter and select — already lives in the index's own leaf pages, so the engine can answer the query by reading only the index, cutting the number of page accesses roughly in half or more for queries returning many rows.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+  <div class="related-card" onclick="window.location.hash='/distributed-systems-core'">
+    <div class="rc-title">Distributed Systems Core</div>
+    <div class="rc-sub">Days vary · CAP trade-offs, consensus, and distributed transactions underlie replication and sharding</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/caching-strategies'">
+    <div class="rc-title">Caching Strategies</div>
+    <div class="rc-sub">Days vary · Buffer pools, cache invalidation, and read-through patterns that sit in front of the database</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/jpa-hibernate'">
+    <div class="rc-title">JPA &amp; Hibernate</div>
+    <div class="rc-sub">Days vary · How optimistic locking, indexing, and query generation surface through an ORM</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/collections-internals'">
+    <div class="rc-title">Collections Internals</div>
+    <div class="rc-sub">Days vary · The same tree and hashing structures (skip lists, hash tables) reappear as in-memory building blocks</div>
+  </div>
+</div>

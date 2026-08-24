@@ -1,0 +1,241 @@
+<p class="topic-breadcrumb">Phase 2 — Framework Core & Mid-Scale Architecture · Days 31–35 · Microservices / HLD</p>
+<h1>Resilience: Circuit Breakers, Bulkhead, Rate Limiting</h1>
+<div class="topic-tags">
+  <span class="tag">Circuit Breaker</span>
+  <span class="tag">Bulkhead</span>
+  <span class="tag">Retry & Backoff</span>
+  <span class="tag">Timeouts</span>
+  <span class="tag">Rate Limiting</span>
+  <span class="tag">Cascading Failure</span>
+  <span class="tag">Redis</span>
+</div>
+
+<div class="callout tip">
+  <div class="callout-title">Why this matters</div>
+  <p>In a monolith, a slow function call just makes one request slow. In a microservice mesh, a slow <em>network</em> call ties up a thread, a connection, and a chunk of memory in the caller — and if enough callers pile up waiting on the same struggling downstream, the caller's own thread pool saturates and it starts rejecting requests from clients that have nothing to do with the failing dependency. This is how a single database running slow queries in one service takes down five unrelated services an hour later. Circuit breakers, bulkheads, retries, timeouts, and rate limiting are not defensive decoration — they are the specific mechanisms that stop local failure from becoming systemic failure, and each one closes a distinct hole in the failure chain.</p>
+</div>
+
+<h2>1. Why Resilience Patterns Exist: Cascading Failure</h2>
+<p>Consider a checkout service that calls an inventory service over HTTP. Under normal conditions the inventory service responds in 20ms. Now suppose the inventory database starts running a slow migration and response times climb to 30 seconds. Nothing has crashed — the inventory service is technically "up." But here is what happens to the checkout service if nothing is in place to stop it:</p>
+<ul>
+  <li>Every incoming checkout request opens a connection to inventory and blocks a thread waiting for a response.</li>
+  <li>Checkout's HTTP server (say, Tomcat with a 200-thread pool) fills up within seconds, because threads that used to return in 20ms now hold on for 30 seconds — a 1500x increase in occupancy time per request.</li>
+  <li>Once all 200 threads are blocked on inventory calls, checkout can no longer accept <em>any</em> new request — including requests that don't even touch inventory, like "get my order history."</li>
+  <li>Upstream of checkout, whatever calls checkout (an API gateway, a UI backend-for-frontend) now sees checkout itself as slow/unresponsive, and the same thread-exhaustion pattern repeats one layer up.</li>
+</ul>
+<p>This is <strong>cascading failure</strong>: a localized, partial degradation in one node propagates outward and amplifies, because the resource that failure consumes (threads, connections, memory) is shared with unrelated work. The single most important mental model in this whole topic is that resilience patterns exist to protect a service's <em>own</em> finite resources from being consumed by someone else's problem — not to fix the downstream service. Nothing here makes inventory faster; everything here is about containing the blast radius in checkout.</p>
+<p>The four mechanisms in this page attack four different points in that chain: <strong>timeouts</strong> bound how long a thread can be held hostage; <strong>circuit breakers</strong> stop sending requests to a downstream that is already failing, so threads stop queuing up at all; <strong>bulkheads</strong> make sure that even if one dependency's pool is fully consumed, other dependencies keep working; and <strong>rate limiting</strong> protects a service from being overwhelmed by callers (including well-behaved ones retrying) in the first place. This composes directly with <a href="#/microservice-patterns">microservice-patterns</a>, since the whole reason these mechanisms are load-bearing is that a call graph now crosses process and network boundaries instead of staying in-process.</p>
+
+<h2>2. Timeouts: The Primitive Everything Else Builds On</h2>
+<p>A network call without an explicit timeout is a call that can block forever — or, more precisely, until the underlying TCP stack or OS gives up, which can be minutes. Most HTTP clients (Apache HttpClient, OkHttp, Java's <code>HttpClient</code>, Spring's <code>RestTemplate</code>/<code>WebClient</code>) default to <em>no timeout</em> or an extremely long one unless you set it explicitly. That default exists because a generic library can't know what a reasonable wait is for your use case — but it means "no timeout" is the actual behavior unless someone configures otherwise.</p>
+<p>There are two timeouts that matter for every outbound call, and they protect against different failure modes:</p>
+<ul>
+  <li><strong>Connect timeout</strong> — how long to wait to establish the TCP connection (and TLS handshake). Protects against a downstream host that is unreachable or a network partition where SYN packets vanish. Typically short: 1-3 seconds.</li>
+  <li><strong>Read/response timeout</strong> — how long to wait for the response body once the request has been sent. Protects against a downstream that accepted the connection but is stuck (slow query, deadlock, GC pause). This is the one that matters most for the cascading-failure scenario above.</li>
+</ul>
+<div class="callout warn">
+  <div class="callout-title">Setting a timeout without a plan for what happens after it fires solves half the problem</div>
+  <p>A timeout converts "block forever" into "fail after N seconds" — which is strictly better, but if every retry attempt also waits the full N seconds, and every caller times out and retries at once, you have simply moved the pile-up from "waiting on inventory" to "waiting on inventory, three times per request, synchronized across all callers." Timeouts are necessary but not sufficient; they need to compose with retry policy and circuit breaking, covered in the sections below.</p>
+</div>
+<p>Choosing the value itself is a trade-off, not a constant you can look up: too short and you abort requests that would have succeeded a moment later (turning transient slowness into hard errors); too long and you've only weakened, not solved, thread exhaustion. A common approach is to set the timeout close to a high percentile (p99) of the downstream's normal latency distribution, obtained from <a href="#/observability-production">observability-production</a> data, not guessed.</p>
+
+<h2>3. Circuit Breaker: Fail Fast Instead of Queuing Behind a Dying Dependency</h2>
+<p>A timeout still makes every caller pay the full timeout duration before failing — if inventory is completely down, every request still burns 3 seconds finding that out. Worse, every one of those requests is still landing on inventory, adding load to a system that is already struggling, possibly making its recovery slower. The circuit breaker pattern solves both problems: once it has enough evidence that a dependency is unhealthy, it stops sending requests to it entirely for a while, failing immediately (or falling back) without even attempting the network call.</p>
+<p>The name is a deliberate analogy to an electrical circuit breaker: rather than letting current (requests) keep flowing into a short circuit (a failing dependency) and causing more damage, the breaker trips and cuts the circuit until it's safe to test again.</p>
+
+<h3>The three states and their exact transitions</h3>
+<table>
+  <tr><th>State</th><th>Behavior</th><th>Transition trigger</th></tr>
+  <tr><td><strong>Closed</strong></td><td>Requests flow through normally to the downstream. The breaker tracks outcomes (success/failure) over a rolling window.</td><td>If the failure rate over the window exceeds a configured threshold (e.g. 50% of the last 20 calls failed) → transition to <strong>Open</strong>.</td></tr>
+  <tr><td><strong>Open</strong></td><td>All requests fail immediately without calling the downstream at all — typically by throwing a <code>CallNotPermittedException</code> or invoking a fallback. No load reaches the struggling dependency.</td><td>After a configured <em>wait duration in open state</em> (e.g. 30 seconds) elapses → transition to <strong>Half-Open</strong>.</td></tr>
+  <tr><td><strong>Half-Open</strong></td><td>A small, limited number of trial requests (e.g. 10) are allowed through to test whether the downstream has recovered. All other requests during this state are still rejected.</td><td>If the trial requests' success rate meets the threshold → back to <strong>Closed</strong>. If they still fail at or above the threshold → back to <strong>Open</strong> (and the wait timer restarts).</td></tr>
+</table>
+<p>Note precisely what triggers each transition, because this is where mental models go wrong: Closed→Open is a <em>rate</em> threshold over a rolling window of recent calls, not "the very next failure trips it" (that would make the breaker trip on a single blip) and not a raw count without a window (that would never reset after an old spike). Open→Half-Open is purely <em>time-based</em> — the breaker does not know or care whether the downstream has actually recovered; it just decides enough time has probably passed to check. Half-Open→{Closed,Open} is decided by the outcome of a bounded number of real trial requests — this is the only state where the breaker is actually testing ground truth, and it deliberately limits the blast radius of that test (only a handful of requests are risked, not the full traffic volume).</p>
+
+<div class="callout">
+  <div class="callout-title">What a circuit breaker is actually protecting</div>
+  <p>Two distinct things, easy to conflate: (1) the <em>caller</em>, from wasting threads/connections waiting on timeouts against a dependency that's known to be failing — fast-failing in microseconds instead of blocking for the full timeout window; and (2) the <em>downstream</em>, from being hammered with a full load of retrying callers while it's trying to recover — which, for a database recovering from connection pool exhaustion or a service that's mid-restart, can be the difference between recovering in seconds versus never recovering because it never gets a quiet moment. A circuit breaker without an Open state that actually stops traffic (e.g., one that only logs) protects neither.</p>
+</div>
+
+<h3>Two ways to measure the failure window</h3>
+<ul>
+  <li><strong>Count-based window</strong> — track outcomes of the last N calls (e.g. last 100). Simple, but at low traffic volumes a count-based window can take a long time to fill, delaying detection.</li>
+  <li><strong>Time-based window</strong> — track outcomes within the last N seconds (e.g. last 60 seconds), bucketed for efficient rolling aggregation. Reacts based on wall-clock recency regardless of traffic volume, but needs a minimum-number-of-calls guard so a single failure out of two calls in a quiet period doesn't trip the breaker at 50%.</li>
+</ul>
+<p>Resilience4j (the standard library for this on the JVM, having succeeded Netflix Hystrix) supports both, plus a <em>slow call rate threshold</em> as a second, independent trigger — calls that succeed but exceed a configured duration are counted as failures for breaker purposes, because a downstream that "succeeds" after 25 seconds is operationally just as damaging to the caller's thread pool as one that errors out.</p>
+<pre><code>CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+    .failureRateThreshold(50)                    // trip if >= 50% of calls fail
+    .slowCallRateThreshold(50)                    // also trip if >= 50% of calls are "slow"
+    .slowCallDurationThreshold(Duration.ofSeconds(2))
+    .slidingWindowType(SlidingWindowType.COUNT_BASED)
+    .slidingWindowSize(20)                        // evaluate over the last 20 calls
+    .minimumNumberOfCalls(10)                     // need at least 10 calls before evaluating
+    .waitDurationInOpenState(Duration.ofSeconds(30))
+    .permittedNumberOfCallsInHalfOpenState(5)     // trial requests before deciding
+    .build();
+
+CircuitBreaker breaker = CircuitBreaker.of("inventoryService", config);
+
+Supplier&lt;InventoryResponse&gt; decorated = CircuitBreaker
+    .decorateSupplier(breaker, () -&gt; inventoryClient.checkStock(sku));
+
+InventoryResponse response = Try.ofSupplier(decorated)
+    .recover(CallNotPermittedException.class, ex -&gt; InventoryResponse.assumeAvailable())
+    .get();
+</code></pre>
+<p>That <code>recover</code> step matters as much as the breaker configuration itself: a breaker that's Open and has no fallback just converts one kind of failure (slow timeout) into another (immediate exception) — which is progress for thread exhaustion, but the caller still needs a decision about what to return to <em>its</em> caller. Common fallbacks: return cached/stale data, return a default/degraded response ("assume in stock, reconcile later"), or propagate a fast, clear error rather than a vague timeout.</p>
+
+<h2>4. Bulkhead: Isolating Resource Pools Per Dependency</h2>
+<p>A circuit breaker stops a caller from sending more requests to a dependency that's already been observed failing — but it does nothing to prevent the damage from the requests that were in flight <em>while</em> the breaker was still Closed and the failure rate was climbing toward the threshold. If checkout uses one shared thread pool for calls to inventory, pricing, and shipping, and inventory starts slowing down, the requests to inventory can consume all the threads in that shared pool before the breaker even trips — starving pricing and shipping calls that have nothing wrong with them.</p>
+<p>The bulkhead pattern, named after the watertight compartments that divide a ship's hull so that flooding in one compartment doesn't sink the whole vessel, fixes this by giving each dependency (or each class of work) its own isolated resource pool. If inventory's pool is exhausted, calls to pricing and shipping proceed normally on their own separate pools, because there is no shared resource left to contend over.</p>
+<h3>Two implementations of bulkhead isolation</h3>
+<table>
+  <tr><th>Style</th><th>Mechanism</th><th>Trade-off</th></tr>
+  <tr><td><strong>Thread pool isolation</strong></td><td>Each dependency gets its own dedicated executor/thread pool with a fixed size. Calls run on that pool; if it's full, new calls are rejected immediately (or queued up to a bounded queue).</td><td>Strong isolation — a stuck thread calling inventory literally cannot touch shipping's threads. Costs more memory/context-switch overhead per pool, and requires calls to be dispatched onto another thread if the calling code is otherwise synchronous.</td></tr>
+  <tr><td><strong>Semaphore isolation</strong></td><td>All calls still run on the caller's own thread (e.g. the servlet thread that received the request), but a counting semaphore caps how many concurrent calls to a given dependency are allowed; extra calls are rejected immediately rather than blocking.</td><td>Cheaper (no extra threads), but a slow call still occupies the original calling thread for its full duration — it limits <em>concurrency</em> to the dependency, not the time a caller thread is held.</td></tr>
+</table>
+<pre><code>ThreadPoolBulkheadConfig inventoryPool = ThreadPoolBulkheadConfig.custom()
+    .maxThreadPoolSize(10)
+    .coreThreadPoolSize(5)
+    .queueCapacity(20)
+    .build();
+
+ThreadPoolBulkheadConfig pricingPool = ThreadPoolBulkheadConfig.custom()
+    .maxThreadPoolSize(10)
+    .coreThreadPoolSize(5)
+    .queueCapacity(20)
+    .build();
+// Two independent registries -&gt; inventory saturating its pool
+// cannot delay a single pricing call.
+</code></pre>
+<div class="callout tip">
+  <div class="callout-title">Bulkheads and connection pools need the same treatment</div>
+  <p>The thread pool is only half the resource. If checkout's HTTP client uses one shared connection pool (e.g. one Apache <code>PoolingHttpClientConnectionManager</code>) for all downstreams, a dependency that's slow to respond will hold onto its checked-out connections, starving the connection pool the same way it would starve a thread pool — even if the threads themselves are bulkheaded correctly. Per-dependency connection pools (or at minimum a per-route max-connections cap, which most HTTP clients support) are the connection-level equivalent of a bulkhead.</p>
+</div>
+<p>This composes directly with thread pool sizing and executor design in <a href="#/concurrency-multithreading">concurrency-multithreading</a> — a bulkhead is, mechanically, just a dedicated <code>ExecutorService</code> or semaphore per dependency; the resilience insight is entirely about <em>why</em> you partition them that way, not a new concurrency primitive.</p>
+
+<h2>5. Retries: Necessary, But a Naive Retry Can Turn a Blip Into an Outage</h2>
+<p>Not every failure is worth failing hard on. A single dropped packet, a momentary GC pause, a load balancer routing one request to an instance mid-restart — these are exactly the transient failures that a retry can paper over invisibly. But retrying is not free, and done naively it actively makes things worse in exactly the scenario where it matters most: when the downstream is already under load.</p>
+<h3>Retry storms</h3>
+<p>Suppose 1,000 concurrent requests all hit a downstream that's briefly overloaded and returns errors for a window of 2 seconds. If every caller retries immediately, you now have roughly 2,000 requests hitting the downstream right after the blip — precisely when it's least able to absorb extra load, since it's already the reason for the errors. If those retries also fail and are retried again, the load multiplies again. This is a <strong>retry storm</strong>: retries that were meant to smooth over transient failure instead amplify load at the worst possible moment, and can turn a brief blip into a sustained outage because the downstream never gets a chance to drain its backlog.</p>
+<h3>The standard mitigations</h3>
+<ul>
+  <li><strong>Exponential backoff</strong> — instead of retrying immediately, wait an exponentially increasing interval between attempts (e.g. 100ms, 200ms, 400ms, 800ms...), capped at some maximum. This spreads retries out over time instead of concentrating them right after the failure.</li>
+  <li><strong>Jitter</strong> — add randomness to the backoff interval (e.g. a random value in <code>[0, backoff]</code>, or <code>backoff/2 + random(0, backoff/2)</code>) so that many callers who failed at the same moment don't all retry at the same moment. Without jitter, exponential backoff alone can produce a "thundering herd" that's merely delayed rather than eliminated — 1,000 callers with the exact same backoff schedule all retry in near-perfect sync at t+100ms, t+300ms, etc. AWS's own architecture guidance is explicit that "full jitter" (a fully randomized backoff, not just a randomized offset around a fixed backoff) gives the best reduction in total work done against the downstream.</li>
+  <li><strong>Retry budgets / caps</strong> — a hard limit on total retry attempts (e.g. max 2 retries per request), and often a service-wide budget (e.g. retries may not exceed 10% of total request volume in a given window). A budget prevents the degenerate case where a systemic outage causes every single request to be retried the maximum number of times, multiplying total load by (1 + max_retries) right when capacity is lowest.</li>
+  <li><strong>Retry only on the right failures</strong> — retry on timeouts, connection failures, and 5xx/503 responses; never retry on 4xx client errors (the request is wrong, retrying won't fix it) and never retry non-idempotent operations (a POST that charges a card) unless the operation has been made idempotent via an idempotency key.</li>
+</ul>
+<div class="callout warn">
+  <div class="callout-title">Retries and circuit breakers must be layered in the right order</div>
+  <p>If you configure a circuit breaker per attempt <em>inside</em> a retry loop, each retry re-evaluates the same already-tripped breaker and fails fast correctly. But if you retry <em>around</em> the breaker in the wrong order, or run retries against a breaker with a window so small that a burst of retries alone can trip it, you can get surprising trips that have nothing to do with the downstream's real health. The composition in <a href="#section-7">section 7</a> below (timeout → retry → circuit breaker → bulkhead, outside-in) is the ordering that avoids this: the breaker sits outside the retry loop, seeing the aggregate outcome, and once it's Open, the retry loop itself never fires because the call fails immediately before a retry is even attempted.</p>
+</div>
+
+<h2>6. Rate Limiting: Protecting a Service From Its Callers</h2>
+<p>Everything above protects a caller from a downstream that's failing. Rate limiting inverts the direction: it protects a service from being overwhelmed by its callers, whether that's a client sending too much legitimate traffic, an abusive/misbehaving client, or — notably — a fleet of callers all retrying at once against a service that's trying to recover. A well-designed retry policy and a rate limiter address the same underlying risk (surge amplification) from opposite sides of the connection.</p>
+<h3>Token Bucket</h3>
+<p>A bucket holds up to <em>capacity</em> tokens. Tokens are added at a fixed rate (e.g. 10 tokens/second) up to that capacity; each incoming request consumes one token; if no token is available, the request is rejected (or queued, in some variants). Because tokens can accumulate up to the bucket's capacity during idle periods, a client that's been quiet can burst up to <em>capacity</em> requests instantly before being throttled back to the steady refill rate. This is the algorithm of choice when bounded bursts are acceptable or even desirable (e.g. a user loading a page that fires 15 API calls at once).</p>
+<h3>Leaky Bucket</h3>
+<p>Requests are queued and drained (processed) at a strictly fixed output rate, regardless of how bursty the input was — like a bucket with a hole in the bottom leaking at a constant rate no matter how much water is poured in at once. If the queue (bucket) fills up, new requests are dropped. Unlike token bucket, leaky bucket does not allow bursts to pass through at all; it actively smooths them into a constant rate, which is the right choice when the downstream truly cannot handle any burst (e.g. a fixed-capacity legacy system) rather than merely wanting to cap average throughput.</p>
+<h3>Fixed Window Counter</h3>
+<p>Divide time into fixed windows (e.g. one-minute windows aligned to the clock), keep a counter per window, and reject requests once the counter hits the limit for the current window. Trivial to implement (an atomic counter plus a TTL) but has a well-known boundary problem: a client can send the full limit of requests in the last moment of one window and the full limit again in the first moment of the next window, achieving up to <strong>2x the intended limit</strong> in the short interval spanning the boundary. For example, with a limit of 100 requests/minute, a client could send 100 requests at 0:59.9 and another 100 at 1:00.1 — 200 requests in a 200ms span, despite a "100/minute" limit.</p>
+<h3>Sliding Window Log / Sliding Window Counter</h3>
+<p>The <strong>sliding window log</strong> fixes the boundary problem exactly: store a timestamp for every request in a sorted structure, and on each new request, discard timestamps older than <code>now - window</code> and count what remains; reject if the count is at the limit. This is exact but requires storing a timestamp per request, which is significant state at high request rates. The <strong>sliding window counter</strong> is the practical compromise: keep fixed-window counters as before, but when checking the limit, take a weighted combination of the previous window's count and the current window's count, weighted by how far into the current window you are (e.g. <code>previous_count * (1 - elapsed_fraction) + current_count</code>). This approximates the sliding log's accuracy using only two counters instead of a full timestamp log, at the cost of being an approximation rather than an exact count.</p>
+<table>
+  <tr><th>Algorithm</th><th>Burst behavior</th><th>State required</th><th>Accuracy</th></tr>
+  <tr><td>Token Bucket</td><td>Allows bursts up to bucket capacity</td><td>Token count + last refill timestamp</td><td>Exact</td></tr>
+  <tr><td>Leaky Bucket</td><td>Smooths all bursts to a fixed rate</td><td>Queue of pending requests</td><td>Exact</td></tr>
+  <tr><td>Fixed Window Counter</td><td>Allows up to 2x limit at window boundary</td><td>One counter per window</td><td>Approximate (boundary flaw)</td></tr>
+  <tr><td>Sliding Window Log</td><td>No boundary flaw</td><td>Timestamp per request in window</td><td>Exact</td></tr>
+  <tr><td>Sliding Window Counter</td><td>Boundary flaw greatly reduced, not eliminated</td><td>Two counters (previous + current window)</td><td>Approximate, close to exact</td></tr>
+</table>
+
+<h3>Distributed rate limiting with Redis</h3>
+<p>A single instance can rate limit in-process with a local counter, but any service running more than one instance behind a load balancer needs the counter to be shared — otherwise a limit of "100 requests/minute" becomes "100 requests/minute/instance," silently multiplying the effective limit by the instance count. Redis is the standard choice because it's fast, supports atomic operations, and every instance can reach it.</p>
+<p>The naive approach — <code>GET</code> the counter, check it in application code, then <code>INCR</code> it — has a race: two instances can both <code>GET</code> the same value below the limit, both decide to allow the request, and both <code>INCR</code>, letting the count exceed the limit. The fix is to make the read-check-increment sequence atomic, either by leaning on Redis's own atomic primitives or with a Lua script:</p>
+<pre><code>-- INCR + EXPIRE combined atomically via Lua so the counter's TTL
+-- is only set once, on the first request in a fresh window.
+local current = redis.call("INCR", KEYS[1])
+if tonumber(current) == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])   -- window length in seconds
+end
+if tonumber(current) > tonumber(ARGV[2]) then
+    return 0   -- over the limit, reject
+end
+return 1       -- allowed
+</code></pre>
+<p>Redis executes the entire Lua script as a single atomic operation — no other client's command can interleave in the middle of it — which is exactly what closes the race in the naive version. This pattern implements a fixed window counter distributed across instances; a distributed token bucket or sliding window counter follows the same principle (do the whole check-and-update as one atomic Redis operation, usually via a Lua script or Redis's built-in <code>CL.THROTTLE</code> if the Redis Cell module is available) but tracks a few more fields (last refill time, current token count) instead of a single integer. This is a direct extension of the state-sharing concerns covered in <a href="#/caching-strategies">caching-strategies</a> — same infrastructure, same atomicity concerns, different purpose (throttling instead of avoiding recomputation).</p>
+<div class="callout">
+  <div class="callout-title">Where to enforce the limit changes what it protects</div>
+  <p>A rate limiter at the API gateway protects the whole fleet from a single abusive client and is the right place for per-client/per-API-key quotas. A rate limiter inside a service, guarding calls <em>to</em> a specific downstream, is really acting as a self-imposed throttle to avoid being the source of a retry storm against that downstream — conceptually closer to a bulkhead than to gateway-level throttling, even though the algorithm is identical.</p>
+</div>
+
+<h2 id="section-7">7. How These Patterns Compose in a Real Call Path</h2>
+<p>None of these mechanisms replace each other — a mature outbound call is wrapped by all of them, in a specific nesting order, each one guarding against a different failure mode that the others don't cover:</p>
+<pre><code>Bulkhead
+  └─ Circuit Breaker
+       └─ Retry (with exponential backoff + jitter, bounded by a retry budget)
+            └─ Timeout
+                 └─ the actual network call
+</code></pre>
+<p>Reading from the inside out: the <strong>timeout</strong> bounds a single attempt so it cannot hang forever. The <strong>retry</strong> wraps the timeout, so a single failed/timed-out attempt gets a bounded number of further attempts, spaced out to avoid amplifying load. The <strong>circuit breaker</strong> wraps the whole retry sequence, watching the aggregate success/failure rate across many calls (not just one call's retries) so that once the downstream is reliably failing, subsequent calls skip the retry loop entirely and fail in microseconds instead of spending a full timeout-times-retries budget finding out again. The <strong>bulkhead</strong> is the outermost boundary — it's not really "around" the call in a temporal sense, it's the resource pool (thread pool, semaphore, connection pool) that the entire stack above executes inside, ensuring that whatever this dependency does to its own slice of resources, it cannot spill into calls to a different dependency.</p>
+<p>Concretely, with Resilience4j, this is exactly how the decorators are meant to be stacked (order matters — decorators apply in the reverse order they're composed, so the outermost-registered decorator is the outermost behavior):</p>
+<pre><code>Supplier&lt;Response&gt; call = () -&gt; inventoryClient.checkStock(sku);
+
+Supplier&lt;Response&gt; withTimeout   = TimeLimiter.decorateFutureSupplier(timeLimiter, futureSupplier(call));
+Supplier&lt;Response&gt; withRetry     = Retry.decorateSupplier(retry, withTimeout);
+Supplier&lt;Response&gt; withBreaker   = CircuitBreaker.decorateSupplier(breaker, withRetry);
+Supplier&lt;Response&gt; withBulkhead  = Bulkhead.decorateSupplier(bulkhead, withBreaker);
+
+Response response = withBulkhead.get();
+</code></pre>
+<p>It's worth internalizing why the circuit breaker must sit <em>outside</em> the retry rather than inside it: if the breaker were inside, it would only ever see the outcome of a single attempt within one retry loop and reset its perspective on every new incoming request, never accumulating the cross-request failure signal it needs to actually trip. Sitting outside, the breaker sees "this logical call, after all its retries, succeeded or failed," aggregates that across many logical calls, and once it trips, its Open state causes the entire retry-plus-timeout stack underneath it to be skipped — which is precisely the fast-fail behavior that stops a struggling downstream from being retried into the ground in the first place.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+<details class="concept-qa">
+  <summary>Why does an explicit timeout matter more in a distributed system than in a single-process function call?</summary>
+  <div class="qa-body">In a single process, a slow function call still only occupies the caller's own execution — nothing else is directly starved of a shared, finite resource by it (beyond CPU scheduling). A network call, by contrast, occupies a thread from a bounded thread pool and often a connection from a bounded connection pool for the entire duration of the wait. If that duration is unbounded (no timeout), then a single unresponsive downstream can, given enough concurrent requests, consume the caller's entire thread pool — at which point the caller cannot serve any request, including ones that don't depend on the slow downstream at all. The timeout doesn't fix the downstream; it puts a ceiling on how much of the caller's own capacity any one slow dependency can consume.</div>
+</details>
+<details class="concept-qa">
+  <summary>Walk through exactly what causes a circuit breaker to move from Closed to Open, and why that trigger is rate-based rather than count-based on raw failures.</summary>
+  <div class="qa-body">The breaker tracks outcomes of recent calls in a rolling window (either the last N calls or calls within the last N seconds). It moves from Closed to Open when the proportion of failures (and, if configured, "slow" calls exceeding a duration threshold) within that window meets or exceeds a configured failure-rate threshold, e.g. 50%. It's rate-based rather than "trip on the Kth failure" because a raw count doesn't account for how much successful traffic surrounds those failures — one failure out of 5,000 successful calls is noise, but one failure out of 2 calls is a strong signal, and a rate naturally distinguishes the two. A minimum-number-of-calls guard (e.g. don't evaluate until at least 10 calls have occurred) additionally prevents the breaker from making a high-confidence decision off a statistically tiny sample right after startup or during low traffic.</div>
+</details>
+<details class="concept-qa">
+  <summary>Once a circuit breaker is Open, how does it decide it's safe to try the downstream again, and why is that decision time-based rather than based on any direct health signal?</summary>
+  <div class="qa-body">After a fixed wait duration in the Open state elapses (e.g. 30 seconds), the breaker transitions to Half-Open and permits a small, bounded number of trial requests through. It's time-based because the breaker has no independent channel to observe the downstream's health other than the very calls it's currently refusing to make — it isn't polling a health-check endpoint, it's using the same call path its regular traffic uses. Waiting a fixed duration is simply a bet that "enough time has probably passed for whatever caused the failures to resolve," and the actual verification happens in Half-Open, where the trial requests' real outcomes — not a timer — determine whether the breaker fully closes again or reopens.</div>
+</details>
+<details class="concept-qa">
+  <summary>Why can naive retries make an outage worse instead of better, and what three specific mitigations address that?</summary>
+  <div class="qa-body">A downstream returning errors under load is, by definition, already at or past its capacity. If every failed caller retries immediately, the total request volume hitting that downstream increases right after the failure — precisely when it has the least spare capacity to absorb extra load — which can extend or deepen the outage instead of riding out a transient blip. The three standard mitigations are: exponential backoff, so retries are spread out over increasing intervals instead of concentrated right after failure; jitter, so that many callers who failed at the same moment don't all retry at the same moment (backoff alone still produces synchronized waves without jitter); and retry budgets/caps, which bound the total multiplication of load that retries can cause even in the worst case, e.g. capping total retries to a small multiple or percentage of normal request volume.</div>
+</details>
+<details class="concept-qa">
+  <summary>Explain the token bucket algorithm's mechanics and why it, unlike leaky bucket, permits bursts.</summary>
+  <div class="qa-body">A token bucket holds up to a fixed capacity of tokens. Tokens are added to the bucket at a steady refill rate (e.g. 10 per second) up to that capacity, and every incoming request must consume one token to proceed; if the bucket is empty, the request is rejected. Because tokens accumulate during any period where the client isn't sending requests, a client that has been idle can spend its accumulated tokens all at once — sending up to <em>capacity</em> requests instantly — before being throttled back down to the steady refill rate. Leaky bucket, by contrast, doesn't accumulate any spendable allowance from idle time; it drains a queue of incoming requests at a strictly fixed output rate no matter how the requests arrived, which actively smooths bursts into a constant rate rather than permitting them.</div>
+</details>
+<details class="concept-qa">
+  <summary>What exactly is the boundary problem in a fixed window counter, and how does a sliding window counter reduce it without storing a full log of timestamps?</summary>
+  <div class="qa-body">A fixed window counter resets its count to zero at fixed clock-aligned boundaries (e.g. the top of every minute). A client can send the full limit of requests in the last instant of one window, then send the full limit again in the first instant of the next window — since the counter reset in between, both bursts are individually within the limit, but the two bursts land within a very short real time span, giving the client up to roughly twice the intended limit within that span. A sliding window counter reduces this without storing per-request timestamps by keeping just two counters — the previous window's total and the current window's running total — and computing an estimated count for the sliding window as a weighted blend of the two, weighted by how far the current time is into the current window (e.g. <code>previous_count * (1 - elapsed_fraction) + current_count</code>). This assumes requests in the previous window were spread evenly across it, which is an approximation, but it closes almost all of the boundary gap using only two integers per key instead of a growing list of timestamps.</div>
+</details>
+<details class="concept-qa">
+  <summary>Why must a check-then-increment rate limiter counter be made atomic in Redis, and what specifically goes wrong if it isn't?</summary>
+  <div class="qa-body">If the limiter reads the current counter value with a plain GET, checks it against the limit in application code, and then issues an INCR only if under the limit, there is a window between the GET and the INCR where another instance (or another request on the same instance, if concurrent) can perform the same GET before either has incremented. Both requests can observe a count that is under the limit, both decide to allow the request, and both then INCR — allowing the true count to exceed the configured limit by as many requests as raced through that window. Because Redis executes a Lua script as a single atomic unit with no other command interleaving during its execution, moving the entire read-check-increment sequence into one Lua script (or relying on a single atomic command like INCR combined with a conditional EXPIRE set only on the first request) eliminates the race entirely, since no other client can observe or act on an intermediate state.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+  <div class="related-card" onclick="window.location.hash='/microservice-patterns'">
+    <div class="rc-title">Microservice Patterns</div>
+    <div class="rc-sub">Days 26–30 · Resilience exists because calls now cross process/network boundaries, not in-process ones</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/concurrency-multithreading'">
+    <div class="rc-title">Concurrency & Multithreading</div>
+    <div class="rc-sub">Days 16–20 · Bulkheads are dedicated thread pools/semaphores; understanding pool exhaustion explains why they're needed</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/caching-strategies'">
+    <div class="rc-title">Caching Strategies</div>
+    <div class="rc-sub">Days 21–25 · Distributed rate limiting reuses the same shared-state-in-Redis and atomicity concerns as caching</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/observability-production'">
+    <div class="rc-title">Observability in Production</div>
+    <div class="rc-sub">Days 36–40 · Circuit breaker thresholds and timeout values are only correct if set from real latency/error data</div>
+  </div>
+</div>

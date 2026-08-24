@@ -1,0 +1,204 @@
+<p class="topic-breadcrumb">Phase 2 — Framework Core &amp; Mid-Scale Architecture · Days 26–30 · Microservices / HLD</p>
+<h1>Async Communication: Kafka, RabbitMQ, Outbox Pattern</h1>
+
+<div class="topic-tags">
+  <span class="tag">Kafka Internals</span>
+  <span class="tag">RabbitMQ</span>
+  <span class="tag">Partitioning</span>
+  <span class="tag">Consumer Groups</span>
+  <span class="tag">Outbox Pattern</span>
+  <span class="tag">Event-Driven Architecture</span>
+  <span class="tag">Delivery Guarantees</span>
+</div>
+
+<div class="callout tip">
+  <div class="callout-title">Why this matters</div>
+  <p>A service that updates its own database and then makes a synchronous REST call to notify another service will eventually lose that notification — the process can crash, the network can partition, or the downstream service can be down, and there is no way to make "commit the row" and "send the HTTP request" atomic across two different systems. Understanding why message brokers exist, and precisely what the Outbox Pattern guarantees, is what lets you explain a very real production symptom: "the order was saved but the payment service never found out about it" — and design a system where that class of bug is structurally impossible rather than merely unlikely.</p>
+</div>
+
+<h2>1. Why Asynchronous, Message-Based Communication Exists</h2>
+<p>The synchronous request/response model covered in <a href="#/microservice-patterns">microservice-patterns</a> — a client calls a REST or gRPC endpoint and blocks waiting for a response — couples two services in three dimensions at once: in <strong>time</strong> (both must be running simultaneously), in <strong>availability</strong> (if the callee is down, the caller's request fails immediately), and in <strong>load</strong> (a burst of calls to the caller becomes an identical burst of calls to the callee, with no buffering in between). Asynchronous, message-based communication exists to break these couplings deliberately.</p>
+
+<h3>Decoupling in time and availability</h3>
+<p>When service A publishes a message to a broker instead of calling service B directly, A does not need B to be reachable at that instant. The broker durably stores the message until B is ready to process it. This means B can be redeployed, can crash and restart, or can simply be slower than A, without A's request failing. The two services are coupled only through an agreed message schema and topic/queue name — not through a live network connection at the moment of the event.</p>
+
+<h3>Absorbing load spikes with a buffer</h3>
+<p>A queue or topic acts as an elastic buffer between producers and consumers. If an upstream system produces 50,000 events/second for a 30-second burst but a downstream consumer can only sustainably process 5,000 events/second, a synchronous call chain would either reject most of that traffic or fall over trying to keep up. With a broker in between, the burst is absorbed into the log or queue, and the consumer drains it at its own sustainable rate over the following seconds. This is sometimes framed as "temporal load leveling" — you are trading latency (the consumer sees the event a bit later) for throughput stability and back-pressure safety.</p>
+
+<div class="callout">
+  <p>The trade-off is real, not free: asynchronous processing means the producer generally cannot know, at the moment it publishes, whether or when the consumer actually succeeded. Any workflow that needs an immediate answer (e.g., "is this credit card valid") still needs a synchronous call or a request/response pattern layered on top of messaging (correlation IDs and reply-to queues). Async messaging is the right tool for propagating facts and triggering downstream work, not for interactive request/response flows.</p>
+</div>
+
+<h2>2. Kafka vs RabbitMQ: Two Different Architectural Ideas</h2>
+<p>These two systems are often compared as if they were interchangeable "message queues," but they are built around fundamentally different data structures, and that difference — not benchmark numbers — is what should drive the choice.</p>
+
+<h3>RabbitMQ: a traditional broker built on queues and exchanges</h3>
+<p>RabbitMQ implements the classic message-broker model. A producer publishes a message to an <strong>exchange</strong>, which applies routing logic (direct, topic, fanout, or headers-based routing) to decide which <strong>queue(s)</strong> the message should be copied into. Consumers subscribe to queues and receive messages pushed to them. Once a consumer acknowledges a message, RabbitMQ <strong>deletes it from the queue</strong> — the message is transient by design; it exists only until it has been successfully consumed. This makes RabbitMQ excellent at complex routing topologies (route this message to five different queues based on its type, prioritize certain messages, implement request/reply with correlation IDs) and at low-latency task distribution such as work queues for background jobs.</p>
+
+<h3>Kafka: a distributed, partitioned, append-only commit log</h3>
+<p>Kafka is not a queue at all under the hood. A Kafka <strong>topic</strong> is a durable, append-only log split into <strong>partitions</strong>, and every message written to a partition is retained (for a configured time or size, not deleted on read) at a numbered offset. Consumers do not have messages pushed to them and removed on ack; instead they <strong>pull</strong> from a partition starting at whatever offset they choose, and reading a message never deletes it. This is what makes Kafka replayable — a new consumer, or an existing consumer that needs to reprocess history (say, after a bug fix), can rewind to an earlier offset and read the same messages again, something that is structurally impossible in RabbitMQ once a message has been acknowledged and deleted. Kafka's design center is very high sustained throughput, ordered logs, and multiple independent consumers reading the same stream of facts at their own pace.</p>
+
+<table>
+  <tr><th>Dimension</th><th>Kafka</th><th>RabbitMQ</th></tr>
+  <tr><td>Core abstraction</td><td>Partitioned, append-only commit log</td><td>Queue fed by exchange routing</td></tr>
+  <tr><td>Message lifecycle</td><td>Retained per a retention policy; reading doesn't delete</td><td>Deleted once acknowledged/consumed</td></tr>
+  <tr><td>Consumption model</td><td>Pull-based; consumer tracks its own offset</td><td>Push-based; broker tracks per-message ack state</td></tr>
+  <tr><td>Replay</td><td>Native — rewind offset and reread</td><td>Not native — message is gone after ack</td></tr>
+  <tr><td>Routing complexity</td><td>Simple — topic + partition key</td><td>Rich — direct/topic/fanout/headers exchanges</td></tr>
+  <tr><td>Ordering</td><td>Guaranteed within a partition only</td><td>Guaranteed within a single queue (roughly, with caveats around prefetch/requeue)</td></tr>
+  <tr><td>Best fit</td><td>High-throughput event streams, event sourcing, audit logs, multiple independent consumer groups</td><td>Task queues, RPC-style async patterns, complex routing, priority queues, lower absolute throughput needs</td></tr>
+</table>
+
+<div class="callout tip">
+  <div class="callout-title">Choosing between them</div>
+  <p>A rough heuristic: if you need many different services to independently subscribe to a stream of business facts, potentially replaying history, and you're willing to think in terms of partitions and offsets — reach for Kafka. If you need to distribute discrete units of work to a pool of workers, with flexible routing and messages that should genuinely disappear once handled — reach for RabbitMQ. Plenty of real systems use both: Kafka as the backbone event bus, RabbitMQ (or an in-process work queue) for fine-grained task dispatch within a single service.</p>
+</div>
+
+<h2>3. Kafka Internals</h2>
+
+<h3>Topics and partitions: the unit of parallelism</h3>
+<p>A topic is a logical name (e.g. <code>order.created</code>) that is physically split into some number of partitions, each of which is an independently ordered, append-only log stored on disk. Partitioning exists because a single log file, read and written by a single thread, has a throughput ceiling. By splitting a topic into N partitions, Kafka lets N different consumer threads (across possibly different machines) read from the same topic in parallel, and N different broker disks hold the writes in parallel. <strong>Partition count is therefore the hard upper bound on read parallelism for a topic</strong> — you cannot usefully have more active consumers in a single consumer group than there are partitions, because a partition can only be assigned to one consumer within a group at a time.</p>
+
+<h3>Partition keys and ordering</h3>
+<p>When a producer sends a message, it can supply a <strong>key</strong> (e.g., an order ID or customer ID). Kafka hashes that key to deterministically choose a partition — the same key always maps to the same partition (as long as the partition count doesn't change). This matters enormously for ordering: Kafka only guarantees ordering <em>within a single partition</em>, never across partitions of a topic. So if you need "all events for order #123 to be processed in the order they happened," you must key by order ID, ensuring every event for that order lands in the same partition and is therefore read in write order by whichever single consumer owns that partition. If you send with no key (or a null key), the producer distributes messages round-robin (or via a sticky partitioner) across partitions for better load balance, but you lose any cross-message ordering guarantee entirely.</p>
+
+<div class="callout warn">
+  <p>A common mistake is assuming "Kafka preserves order" as a blanket property of a topic. It preserves order <em>per partition</em> only. If two events for the same entity are produced with different keys, or with no key, they can be read by different consumers and processed in a different order than they were produced — including out-of-order writes to a downstream database. Always key by the entity whose event ordering you actually care about.</p>
+</div>
+
+<h3>Offsets: how consumers track position</h3>
+<p>Every message within a partition has a monotonically increasing integer offset. A consumer's "position" in a partition is just an offset value, stored (by default) in an internal Kafka topic called <code>__consumer_offsets</code>, keyed by consumer group ID and partition. After processing a batch of messages, the consumer commits its offset — either automatically on a timer (<code>enable.auto.commit=true</code>, the default, which risks committing an offset for a message that was fetched but not actually finished processing if the consumer crashes) or manually via <code>commitSync()</code>/<code>commitAsync()</code> after processing completes, which is the safer pattern for at-least-once semantics. Because the offset is just a durable pointer, a consumer (or a replacement instance) can always resume exactly where it left off after a restart, or deliberately seek to an earlier offset to reprocess.</p>
+
+<h3>Consumer groups and partition assignment</h3>
+<p>A <strong>consumer group</strong> is a named set of consumer instances that cooperatively consume a topic, identified by <code>group.id</code>. Kafka guarantees that within one consumer group, each partition is assigned to exactly one consumer instance at a time — this is what gives you both parallelism and non-duplication: with 6 partitions and 3 consumers in a group, each consumer typically owns 2 partitions, and no two consumers in that group will read the same partition concurrently. If you add a 4th consumer, partitions get reassigned so it picks up some. If you have more consumers than partitions, the extras sit idle — this is the practical ceiling mentioned earlier. Critically, <strong>different consumer groups are fully independent</strong>: two separate groups reading the same topic each get their own full copy of every message and track their own offsets, which is how one topic can simultaneously feed, say, a fraud-detection service and an analytics pipeline without either affecting the other.</p>
+
+<h3>Replication for durability</h3>
+<p>Each partition has a configurable replication factor (commonly 3 in production). One broker holds the <strong>leader</strong> replica for a given partition, which handles all reads and writes for it; the other brokers hold <strong>follower</strong> replicas that continuously fetch and replicate the leader's log. If the leader broker fails, one of the in-sync followers (part of the <strong>ISR</strong>, or in-sync replica set) is elected the new leader, and no acknowledged data is lost as long as the producer's <code>acks</code> setting required replication before acknowledging. This is directly analogous to leader-follower replication in <a href="#/distributed-systems-core">distributed-systems-core</a>: the same trade-off between write latency and durability guarantees shows up here via the <code>acks=0|1|all</code> producer setting.</p>
+
+<h3>Retention and compaction</h3>
+<p>Kafka retains messages according to a policy, not "until consumed." <code>log.retention.hours</code> (default 168, i.e. 7 days) or <code>log.retention.bytes</code> deletes old segments regardless of whether every consumer group has read them — this is a common production trap for a consumer group that falls badly behind or is offline for an extended period; it can lose access to data that ages out. An alternative policy, <strong>log compaction</strong> (<code>cleanup.policy=compact</code>), instead of deleting by age, retains only the latest value for each key and discards older values for the same key — used for topics that represent "current state per key" (e.g., a changelog topic backing a KTable) rather than an ordered event history.</p>
+
+<h2>4. Event-Driven Architecture: Events vs Commands</h2>
+<p>Message brokers are the transport; <strong>Event-Driven Architecture (EDA)</strong> is the design pattern built on top of them. The core distinction that makes EDA coherent is between an <strong>event</strong> and a <strong>command</strong>:</p>
+<ul>
+  <li><strong>An event</strong> is a statement of fact about something that already happened — <code>OrderPlaced</code>, <code>PaymentCaptured</code>, <code>InventoryReserved</code>. It is named in the past tense, the publisher has no expectation of what (if anything) happens as a result, and any number of subscribers can react to it or ignore it.</li>
+  <li><strong>A command</strong> is a request that something specific be done — <code>ChargeCard</code>, <code>ReserveInventory</code>. It is named as an imperative, is typically directed at exactly one intended handler, and the sender generally does care whether it succeeds.</li>
+</ul>
+<p>EDA is built around publishing events rather than issuing commands between services. A payments service doesn't tell the inventory service "reserve this item" directly; instead it publishes <code>PaymentCaptured</code>, and the inventory service — which subscribes to that topic because it cares about that fact — reacts on its own. This inverts the dependency: the payments service does not need to know that an inventory service exists at all, let alone how many other services also react to payment events. Services are coupled only to a shared vocabulary of event types, not to each other's APIs or even each other's existence. New subscribers can be added later with zero changes to the publisher — a materially different evolution story than a REST caller that must be explicitly modified to add a new downstream call.</p>
+
+<div class="callout">
+  <p>The cost of this loose coupling is that the overall business process is no longer visible in any one place. A synchronous call chain reads top to bottom in one service's code; an event-driven flow spans N services' event handlers, and tracing "what happens when an order is placed" requires either strong observability (distributed tracing, correlation IDs propagated through message headers) or dedicated tooling. This is a genuine complexity trade-off, not a free upgrade over synchronous calls.</p>
+</div>
+
+<h2>5. The Outbox Pattern</h2>
+
+<h3>The dual-write problem</h3>
+<p>Consider a service that, on placing an order, needs to (a) insert a row into its own <code>orders</code> table and (b) publish an <code>OrderPlaced</code> event to Kafka so other services can react. The naive implementation does these as two separate operations against two separate systems — a relational database and a message broker — which cannot be wrapped in one atomic transaction (they don't share a transaction manager, and two-phase commit across a database and Kafka is not practically supported and is avoided in modern systems for good reason: it requires the broker to participate in a distributed transaction protocol, killing availability and throughput). This leaves four possible interleavings, two of which are broken:</p>
+<ul>
+  <li>DB commit succeeds, then the process crashes (or the network to Kafka fails) before the publish — the order exists, but no downstream service ever finds out. <strong>Silent data inconsistency.</strong></li>
+  <li>The publish succeeds, but the DB transaction then fails or rolls back — downstream services now react to an order that was never actually placed. <strong>Phantom event.</strong></li>
+</ul>
+<p>This is the <strong>dual-write problem</strong>: whenever a change needs to be reflected atomically in two independent systems, and only one of them supports your transaction, a crash at exactly the wrong moment will desynchronize them. This is not a rare edge case in production — it is a guaranteed eventual occurrence at sufficient request volume and deploy frequency, because deploys, pod evictions, and network blips are exactly the events that interrupt a process mid-flow.</p>
+
+<h3>The mechanics of the fix</h3>
+<p>The Outbox Pattern sidesteps the problem by never requiring two systems to be updated atomically. Instead:</p>
+<ol>
+  <li>The service writes the business change (the new <code>orders</code> row) <strong>and</strong> a row describing the event to be published (into an <code>outbox</code> table) <strong>in the same local database transaction</strong>. Since both writes are to the same database, this is an ordinary ACID transaction — either both rows exist, or neither does. There is no window for inconsistency at this step.</li>
+  <li>A separate process — either a polling <strong>relay</strong> that periodically queries <code>SELECT * FROM outbox WHERE published = false</code>, or a <strong>CDC (Change Data Capture) connector</strong> such as Debezium that tails the database's write-ahead/binlog for inserts into the outbox table — reads new outbox rows and publishes them to Kafka or RabbitMQ.</li>
+  <li>Once publish is confirmed, the relay marks the row published (or deletes it, or CDC simply moves its log position forward).</li>
+</ol>
+<pre><code>-- single local transaction, single database, fully ACID
+BEGIN;
+INSERT INTO orders (id, customer_id, status, total)
+  VALUES ('ord_123', 'cust_9', 'PLACED', 4599);
+INSERT INTO outbox (id, aggregate_id, event_type, payload, published)
+  VALUES (gen_uuid(), 'ord_123', 'OrderPlaced', '{"orderId":"ord_123", ...}', false);
+COMMIT;
+
+-- separate relay/CDC process, running independently and asynchronously
+-- polls or streams from outbox and publishes to Kafka, then marks published
+</code></pre>
+
+<h3>Why this guarantees at-least-once delivery, not exactly-once</h3>
+<p>The relay can crash after publishing to Kafka but before marking the outbox row published — on restart it will republish that row, so a downstream consumer may see the same event twice. The pattern therefore guarantees <strong>at-least-once</strong> delivery of every committed business change (nothing is silently lost, because the outbox row only exists if the business transaction committed), at the cost of requiring consumers to handle duplicates — typically via idempotency keys (discussed in section 7). CDC-based relays (Debezium reading the database log directly) are generally preferred over polling relays in production because they don't add read load to the primary table, they pick up changes with lower latency, and they naturally preserve the commit order of the source table.</p>
+
+<div class="callout tip">
+  <p>The Outbox Pattern is often paired with the "Transactional Outbox + CDC" combination specifically because it removes the dual-write problem without ever needing a distributed transaction coordinator. The insight worth internalizing: you don't make two systems consistent by making the write atomic across both — you make one system (the database) the single source of truth for "did this event happen," and let a separate, retryable process handle getting that fact into the second system eventually. The delay between the DB commit and the Kafka publish is usually milliseconds to low seconds, and downstream consumers are already expected to tolerate asynchronous delay by definition.</p>
+</div>
+
+<h2>6. Consumer Group Rebalancing and Its Operational Impact</h2>
+<p>Whenever the set of active consumers in a Kafka consumer group changes — a new instance joins, an existing instance leaves cleanly, or an instance is presumed dead because it stopped sending heartbeats within <code>session.timeout.ms</code> — the group coordinator (a designated broker) triggers a <strong>rebalance</strong>: partitions are redistributed among the currently active consumers so that the assignment invariant (each partition owned by exactly one consumer in the group) is restored.</p>
+<p>The operationally important detail is that, with the classic "eager" rebalancing protocol, <strong>every</strong> consumer in the group must first revoke all of its currently assigned partitions before the new assignment is computed and handed out — meaning the entire group stops consuming for the duration of the rebalance, not just the joining/leaving instance. On a group with many consumers or partitions, or with slow-starting consumers, this "stop-the-world" pause can last from a few hundred milliseconds to tens of seconds, during which throughput on that topic drops to zero for that group. Kafka's newer <strong>cooperative sticky</strong> assignor (<code>partition.assignment.strategy=CooperativeStickyAssignor</code>) improves this by only revoking the specific partitions that need to move, letting unaffected consumers keep processing during the rebalance — this is generally worth enabling explicitly, since older defaults still favor the eager protocol for backward compatibility.</p>
+<p>Common triggers worth recognizing in production: a rolling deploy of a consumer service (each pod restart is a join/leave event — deploying to 10 pods can trigger 10+ rebalances in quick succession), a consumer that takes longer than <code>max.poll.interval.ms</code> to process a batch (it gets treated as dead and evicted even though it's still alive, just slow), and garbage collection pauses long enough to miss heartbeat deadlines. Each rebalance also means some partitions get reassigned to a consumer that has no cached state for them, which particularly matters for stateful stream processing (e.g., Kafka Streams) where the new owner may need to rebuild local state from a changelog topic before it can resume — a much more expensive operation than a stateless consumer simply picking up from the last committed offset.</p>
+
+<h2>7. Delivery Guarantees, Defined Precisely</h2>
+<p>These terms are frequently used loosely; the precise definitions matter because each implies a different obligation on your consumer code.</p>
+<table>
+  <tr><th>Guarantee</th><th>What actually happens</th><th>What it requires of you</th></tr>
+  <tr><td>At-most-once</td><td>Each message is delivered zero or one times — it may be silently lost, but never duplicated. Typically the result of committing the offset <em>before</em> processing.</td><td>Acceptable only when losing a message is cheaper than the complexity of guaranteeing delivery (e.g., non-critical metrics).</td></tr>
+  <tr><td>At-least-once</td><td>Each message is delivered one or more times — never silently lost, but can be redelivered after a crash or retry (e.g., consumer processes the message, then crashes before committing the offset). Committing the offset <em>after</em> successful processing gives you this.</td><td>Consumer logic must be idempotent — processing the same message twice must produce the same end state as processing it once.</td></tr>
+  <tr><td>Effectively-once / exactly-once semantics (EOS)</td><td>The end-to-end effect is as if each message were processed exactly one time, even though the underlying delivery mechanism is still, physically, at-least-once.</td><td>Requires idempotent producers (to dedupe retried sends) <em>and</em> idempotent consumers (to dedupe redelivered/reprocessed messages), or transactional writes spanning the read-offset-commit and the write together.</td></tr>
+</table>
+<p>The crucial thing to internalize: "exactly-once" is not achieved by some magic broker feature that guarantees a message physically arrives exactly one time over an unreliable network — that is provably impossible in general (this is essentially the Two Generals' Problem). What Kafka's <strong>idempotent producer</strong> (<code>enable.idempotence=true</code>, the default since Kafka 3.0) actually does is attach a producer ID and sequence number to each message, so that if a producer retries a send after a timeout (not knowing whether the broker actually received the first attempt), the broker recognizes and discards the duplicate rather than appending it twice. Kafka's <strong>transactions API</strong> extends this so that a consume-process-produce loop (read from topic A, write to topic B, commit offset on A) either fully commits or fully rolls back as one unit, which is what stream-processing frameworks like Kafka Streams rely on for EOS between Kafka topics.</p>
+<p>But none of this covers side effects outside Kafka — if your consumer, on processing a message, calls an external payment API or writes to a separate database, Kafka's transactional guarantees stop at its own topics. Achieving effectively-once behavior for that external effect is on you: typically via an idempotency key derived from the message (e.g., the outbox row's UUID) that the downstream system checks before applying the effect a second time. This is exactly why the Outbox Pattern's "at-least-once, dedupe on the consumer" framing, rather than a promise of true exactly-once delivery, is the realistic and honest way to describe most production event pipelines, and it composes directly with the retry and idempotency mechanisms covered in <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a>.</p>
+
+<div class="callout warn">
+  <p>A subtle failure mode: even with <code>enable.idempotence=true</code> and a transactional producer, if your consumer processes a message, produces a side effect (say, calls a third-party API to charge a card), and then crashes before committing its Kafka offset, the message will be redelivered and the side effect repeated — the card gets charged twice. Kafka's exactly-once machinery protects Kafka-to-Kafka pipelines; it does nothing for a consumer's external side effects unless that consumer independently makes those side effects idempotent.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+  <summary>Why can't you just make the database write and the Kafka publish part of one atomic transaction?</summary>
+  <div class="qa-body">A relational database's transaction manager only controls resources it directly manages (its own tables, via its write-ahead log and commit protocol). Kafka is an entirely separate system with its own commit semantics. To make both atomic you'd need a distributed transaction coordinator implementing something like two-phase commit across both systems — Kafka doesn't support acting as a participant in an external 2PC protocol, and even where similar mechanisms exist elsewhere, they impose serious availability and latency costs (all participants must be reachable and vote before anything commits). The Outbox Pattern avoids the whole problem by keeping the atomic unit entirely inside the database — the business row and the outbox row commit together in one ordinary local transaction — and treating the actual publish to Kafka as a separate, retryable, eventually-consistent step performed by a relay or CDC process.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>If Kafka guarantees ordering, why did two events for the same order get processed out of order?</summary>
+  <div class="qa-body">Kafka only guarantees ordering within a single partition, never across the partitions of a topic. If the two events were produced without a partition key (or with different keys), they were very likely routed to different partitions, and since different partitions can be consumed in parallel by different consumer instances with no coordination between them, there's no guarantee about their relative processing order. The fix is to key every event by the entity whose ordering matters (e.g., the order ID) so all events for that entity are hashed to the same partition and therefore read in write-order by the single consumer that owns that partition at any given time.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>What's the actual difference between a consumer group rebalance under the eager protocol versus the cooperative sticky assignor?</summary>
+  <div class="qa-body">Under the eager protocol, when group membership changes, every consumer in the group revokes all of its partitions and a completely fresh assignment is computed and distributed — consumption on that group halts entirely until the new assignment lands, even for consumers whose partition ownership doesn't actually need to change. The cooperative sticky assignor instead computes an incremental diff: it identifies only the specific partitions that must move to satisfy the new membership, revokes just those, and leaves every other consumer-partition pairing untouched and still actively consuming throughout the rebalance. This matters most for groups with many partitions or consumers, or with slow-starting instances, where an eager rebalance can stall the entire topic's consumption for seconds at a time during routine events like a rolling deploy.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Does "at-least-once delivery" mean my consumer will occasionally see duplicate messages, or does it mean something else?</summary>
+  <div class="qa-body">It specifically means the delivery mechanism will never silently drop a message, but it makes no promise about delivering it only once — a message can and will occasionally be redelivered, most commonly when a consumer finishes processing a message but crashes or is rebalanced away before it commits the corresponding offset, so the next owner of that partition starts from the last committed offset and reprocesses it. This is a deliberate trade-off: eliminating duplicates entirely would require exactly the kind of expensive, low-throughput coordination that Kafka is designed to avoid. The practical implication is that at-least-once is not a lesser guarantee to work around — it is the baseline you should always design consumers against, by making processing idempotent (e.g., upserts keyed by a unique event ID rather than blind inserts).</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Why does log compaction exist as a separate retention policy from time/size-based deletion?</summary>
+  <div class="qa-body">Time- or size-based retention treats a topic as a bounded window of history — useful when the topic is genuinely an event log you want to expire after some period. But some topics represent "the current value of each key" rather than a history of events — for example, a changelog topic backing a KTable that mirrors a key-value store. For that use case, deleting old messages by age would be wrong, because the latest value for a key might be old but still the current, correct state. Log compaction instead keeps scanning the log and discarding all but the most recent message for each key, so the topic always contains at least one (the latest) record per key indefinitely, letting a new consumer rebuild the full current state of that key-value store by reading the compacted log from the start.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>What is actually different between an "event" and a "command" if they're both just messages on a broker?</summary>
+  <div class="qa-body">The difference is not in the transport mechanism — both can be JSON messages published to a topic or queue — but in the intent and coupling they imply. A command names an action to be taken (imperative, e.g. ChargeCard) and is addressed to a specific handler that the sender expects to act on it; the sender typically cares about the outcome. An event names a fact that has already occurred (past tense, e.g. PaymentCaptured) and is published without the publisher knowing or caring who, if anyone, is listening; any number of subscribers can react independently, and new ones can be added without touching the publisher. Designing a system around commands still couples the sender to the existence and contract of a specific receiver, just asynchronously instead of synchronously; designing around events is what actually achieves the loose coupling that event-driven architecture is named for.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Why does adding more consumers than partitions not increase throughput for a Kafka consumer group?</summary>
+  <div class="qa-body">Kafka's core invariant for a consumer group is that any single partition is assigned to at most one consumer instance in that group at a time — this is what prevents two consumers from processing the same partition's messages concurrently and racing each other. Partition count is therefore a hard ceiling on how many consumer instances can be simultaneously doing useful work for that group; if you have 6 partitions and start an 8th consumer, two of those consumers will simply sit idle with no partitions assigned, and any expectation that adding compute would improve throughput fails until you increase the partition count (which itself has consequences for ordering guarantees on any key whose hash bucket changes).</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+  <div class="related-card" onclick="window.location.hash='/microservice-patterns'">
+    <div class="rc-title">Microservice Patterns</div>
+    <div class="rc-sub">Days 21–25 · The synchronous REST/RPC model this async approach is contrasted against</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/distributed-systems-core'">
+    <div class="rc-title">Distributed Systems Core</div>
+    <div class="rc-sub">Days 1–5 · Replication, consensus, and the CAP trade-offs underlying Kafka's broker durability</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'">
+    <div class="rc-title">Resilience &amp; Fault Tolerance</div>
+    <div class="rc-sub">Days 31–35 · Idempotency and retry design that at-least-once delivery depends on</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/hld-distributed-messaging'">
+    <div class="rc-title">HLD: Distributed Messaging</div>
+    <div class="rc-sub">System design applications of message brokers at scale</div>
+  </div>
+</div>

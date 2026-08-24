@@ -1,0 +1,221 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Bonus · Bonus</p>
+<h1>Testing Strategy: JUnit5, Mockito, TestContainers, Contract Tests</h1>
+
+<div class="topic-tags">
+<span class="tag">Testing Pyramid</span>
+<span class="tag">JUnit 5</span>
+<span class="tag">Mockito</span>
+<span class="tag">TestContainers</span>
+<span class="tag">Contract Testing</span>
+<span class="tag">Test Doubles</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>A test suite that is green on every commit but still ships a broken database query is worse than no test suite at all — it manufactures false confidence. Understanding why that happens (usually: mocking a repository interface so thoroughly that the test never touches real SQL, or an inverted pyramid where slow end-to-end tests are the only thing catching real bugs) is what lets you design a suite that actually fails when the system is actually broken, and stays fast enough that people keep running it.</p>
+</div>
+
+<h2>1. The Testing Pyramid: Why Shape Is a Design Decision</h2>
+<p>The testing pyramid is not a rule about proportions for their own sake — it's a statement about a trade-off between three properties that are in tension: <strong>speed</strong>, <strong>isolation</strong>, and <strong>confidence</strong>. Every test you write buys some confidence that the system works, but the cost of that confidence (in execution time, in flakiness, in coupling to infrastructure) rises sharply as the test exercises more of the real system.</p>
+
+<ul>
+<li><strong>Unit tests (base, most numerous):</strong> test a single class or function in isolation, with all collaborators replaced by test doubles. They run in milliseconds because there is no I/O — no network call, no disk write, no JVM class-loading beyond your own code and its immediate dependencies. Because they're isolated, a failure points at almost exactly one place: the unit under test or its direct contract with a collaborator.</li>
+<li><strong>Integration tests (middle, fewer):</strong> verify that two or more real components actually cooperate correctly — your repository code against a real database, your Kafka consumer against a real broker, your HTTP client against a real (or realistically faked) downstream service. These are slower because they involve real I/O and process startup, but they catch a whole category of bug that unit tests are structurally blind to: wrong SQL dialect, wrong Kafka serializer configuration, wrong JSON field name on the wire.</li>
+<li><strong>End-to-end tests (top, fewest):</strong> exercise the deployed system as a whole, often through its public API or UI, across every service boundary. They give the highest confidence that a user-facing flow actually works, but they are slow (seconds to minutes each), brittle (any one of a dozen services being flaky fails the test for reasons unrelated to the thing you're testing), and expensive to debug (a failure could be anywhere in the call graph).</li>
+</ul>
+
+<p>The pyramid shape — many unit tests, a moderate number of integration tests, a small number of end-to-end tests — exists because it maximizes total confidence per unit of feedback latency. If unit tests are cheap and catch most logic bugs, you want as much of your correctness argument carried by them as possible, and you want integration and end-to-end tests to cover only the things unit tests structurally cannot: real protocol behavior, real component wiring, and real cross-service contracts.</p>
+
+<div class="callout warn">
+<div class="callout-title">The inverted pyramid (ice cream cone anti-pattern)</div>
+<p>A common and expensive failure mode is a suite shaped like an inverted pyramid or an "ice cream cone": a handful of unit tests, a thin middle layer, and a huge number of slow end-to-end tests that are treated as the primary safety net. Symptoms: a CI pipeline that takes 45 minutes, a flaky end-to-end suite that people start ignoring ("just rerun it"), and bugs that could have been caught in a 2-millisecond unit test instead surfacing an hour later in a UI test that fails for an unrelated reason (a stale test fixture, a slow container, a timing race). The fix is not to delete the end-to-end tests — it's to push the coverage they're providing down into unit and integration tests wherever the underlying logic doesn't actually require the full system to be running.</p>
+</div>
+
+<h2>2. JUnit 5 Architecture: Jupiter, Lifecycle, and the Extension Model</h2>
+<p>JUnit 5 is not a monolithic library the way JUnit 4 was — it's split into three components: <strong>JUnit Platform</strong> (the engine that discovers and runs tests, and that build tools like Maven Surefire and Gradle talk to), <strong>JUnit Jupiter</strong> (the new programming model and annotations you actually write tests against, such as <code>@Test</code>, <code>@BeforeEach</code>, <code>@ParameterizedTest</code>), and <strong>JUnit Vintage</strong> (a compatibility engine that lets old JUnit 3/4 tests keep running on the Platform during migration). This separation is what lets a single Gradle or Maven run execute a mix of legacy JUnit 4 tests and modern Jupiter tests side by side.</p>
+
+<h3>Lifecycle annotations and why @BeforeAll defaults to static</h3>
+<p>By default, JUnit creates a <strong>new instance of the test class for every test method</strong> (<code>TestInstance.Lifecycle.PER_METHOD</code>). This is deliberate: it prevents state leaking between test methods through instance fields, which is exactly the kind of hidden coupling that makes a test suite's outcome depend on execution order — a serious defect in a supposedly deterministic suite.</p>
+<p>Because a fresh instance is created per test method, there is no single object instance around before the first test method runs to call a <code>@BeforeAll</code> method on. JUnit needs something it can invoke without any instance existing yet, so <code>@BeforeAll</code> (and <code>@AfterAll</code>) methods must be <code>static</code> under the default lifecycle — they run once against the class, not the instance. The same reasoning applies to <code>@AfterAll</code>.</p>
+<p>You can flip this with <code>@TestInstance(TestInstance.Lifecycle.PER_CLASS)</code>, which tells JUnit to create exactly one instance of the test class and reuse it for every test method. Under this mode, <code>@BeforeAll</code>/<code>@AfterAll</code> no longer need to be static, because there is now a persistent instance they can run against. The trade-off is that instance fields now persist across test methods within the class, so you must be deliberate about resetting mutable state in <code>@BeforeEach</code> if you rely on it — otherwise one test's leftover state silently changes the outcome of the next.</p>
+
+<table>
+<tr><th>Annotation</th><th>Runs</th><th>Static required?</th><th>Typical use</th></tr>
+<tr><td><code>@BeforeAll</code></td><td>Once, before any test method in the class</td><td>Yes, unless <code>PER_CLASS</code> lifecycle</td><td>Start a shared, expensive resource (e.g., a TestContainers container)</td></tr>
+<tr><td><code>@BeforeEach</code></td><td>Before every test method</td><td>No</td><td>Reset mocks, create fresh fixtures, open a transaction to roll back</td></tr>
+<tr><td><code>@AfterEach</code></td><td>After every test method</td><td>No</td><td>Close per-test resources, verify no unexpected interactions</td></tr>
+<tr><td><code>@AfterAll</code></td><td>Once, after all test methods</td><td>Yes, unless <code>PER_CLASS</code> lifecycle</td><td>Tear down shared resource</td></tr>
+</table>
+
+<h3>Parameterized tests</h3>
+<p>@ParameterizedTest replaces the JUnit 4 pattern of writing a separate test method per input, or using a Parameterized runner that applied to the whole class. A single method runs once per supplied argument set, keeping the assertion logic in one place while the data varies:</p>
+<pre><code>@ParameterizedTest
+@CsvSource({
+    "1000, 0.05, 1050.00",
+    "0, 0.05, 0.00",
+    "1000, 0, 1000.00"
+})
+void appliesInterestCorrectly(double principal, double rate, double expected) {
+    assertEquals(expected, InterestCalculator.apply(principal, rate), 0.001);
+}
+</code></pre>
+<p>Argument sources include <code>@ValueSource</code> (a single primitive/String array), <code>@CsvSource</code> (inline rows), <code>@MethodSource</code> (a static method supplying a <code>Stream</code> of arguments, for cases too complex for a literal), and <code>@EnumSource</code>. The point of all of them is the same: separate the invariant (what the assertion checks) from the variable (which inputs exercise it), so adding an edge case is a one-line addition, not a new method.</p>
+
+<h3>The extension model</h3>
+<p>JUnit 4 used <strong>Runners</strong> (<code>@RunWith(SpringJUnit4ClassRunner.class)</code>) and <strong>Rules</strong> to hook into test execution, but a test class could only have one runner, which made composing behaviors from multiple libraries awkward. JUnit 5 replaces both with a single unified <strong>Extension</strong> model (<code>@ExtendWith</code>), where extensions implement narrow interfaces like <code>BeforeEachCallback</code>, <code>ParameterResolver</code>, or <code>AfterAllCallback</code>, and any number of extensions can be stacked on one test class. This is the mechanism behind <code>@ExtendWith(MockitoExtension.class)</code> (injects <code>@Mock</code> fields and validates stubs) and <code>@ExtendWith(SpringExtension.class)</code> (wires a Spring <code>ApplicationContext</code> into the test) coexisting on the same class — something that was not cleanly possible with the single-runner model in JUnit 4.</p>
+
+<h2>3. Mockito: Mocks, Spies, and What They Actually Replace</h2>
+
+<h3>Mock vs. spy</h3>
+<p>A <strong>mock</strong>, created with <code>Mockito.mock(SomeType.class)</code> or the <code>@Mock</code> annotation, is a dynamically generated object with <em>no real implementation underneath at all</em>. Every method returns a default value (null, 0, empty collection, or empty <code>Optional</code>) unless you explicitly stub it with <code>when(...).thenReturn(...)</code>. A mock is appropriate when you want to fully control a collaborator's behavior and assert how your code under test interacts with it, without any risk of real logic running.</p>
+<p>A <strong>spy</strong>, created with <code>Mockito.spy(realInstance)</code> or <code>@Spy</code>, wraps an actual, real object. Any method you have not explicitly stubbed executes the <em>real</em> implementation. This matters because it changes the default: with a mock, "unstubbed" means "returns null/0/empty"; with a spy, "unstubbed" means "runs the real code, with real side effects." A spy is useful when you want most of an object's real behavior but need to override one specific method — for example, stubbing a spied service's method that calls an external system while letting its other, purely computational methods run for real.</p>
+
+<div class="callout warn">
+<div class="callout-title">Spy pitfalls: stubbing after construction, and real side effects</div>
+<p>Because a spy runs real code by default, calling a real method during stubbing setup (<code>when(spy.someMethod())</code> instead of the safer <code>doReturn(...).when(spy).someMethod()</code> pattern) can actually execute the real method as a side effect of setting up the stub — surprising when that method talks to a database or throws under certain preconditions. This is why Mockito's own documentation recommends <code>doReturn/doThrow/doAnswer</code> style stubbing for spies. It's also easy to forget that a spy's non-stubbed methods have real side effects at all — if you spy on a service and forget to stub the one method that sends an email, your test will genuinely try to send an email.</p>
+</div>
+
+<h3>verify() vs. assert: behavior verification vs. state verification</h3>
+<p><code>assertEquals</code>/<code>assertThat</code> check <strong>state</strong> — did the method under test return the right value, or leave an object in the right shape? <code>Mockito.verify(mock).someMethod(args)</code> checks <strong>behavior</strong> — was a particular method called on a collaborator, with particular arguments, a particular number of times? Both are legitimate, but they answer different questions, and over-reaching for <code>verify()</code> when a state assertion would do is a common source of brittle tests.</p>
+<p>The problem with excessive behavior verification is that it couples the test to <em>how</em> the code achieves its result, not <em>what</em> result it achieves. If you verify that a service calls <code>repository.findById()</code> exactly once and then refactor the implementation to use a batch <code>findAllById()</code> call instead — a change that preserves the exact same externally observable behavior — the test breaks even though nothing is actually wrong. Reserve <code>verify()</code> for interactions that are the actual point of the test: side effects with no return value to assert on, like "did we publish an event," "did we call the payment gateway exactly once" (calling a payment API twice is a real bug you want caught), or "did we never call the delete method in this code path."</p>
+
+<h3>Argument captors</h3>
+<p>An <code>ArgumentCaptor</code> lets you inspect the actual value passed to a mocked method, rather than just matching that some call happened. This matters when the interaction you care about isn't just "was it called" but "was it called with the right, possibly derived, argument" — e.g., a constructed domain object, not a raw parameter.</p>
+<pre><code>@Test
+void publishesOrderCreatedEventWithCorrectTotal() {
+    orderService.placeOrder(cart);
+
+    ArgumentCaptor&lt;OrderEvent&gt; captor = ArgumentCaptor.forClass(OrderEvent.class);
+    verify(eventPublisher).publish(captor.capture());
+
+    assertEquals(new BigDecimal("59.97"), captor.getValue().total());
+    assertEquals(OrderStatus.CREATED, captor.getValue().status());
+}
+</code></pre>
+
+<h3>Mocking a type you don't own vs. mocking your own boundary</h3>
+<p>A subtle but important discipline: avoid mocking types you don't own — a JDBC <code>Connection</code>, a third-party HTTP client, a Kafka <code>Producer</code>. These types have rich, undocumented-in-the-interface contract behavior (exception timing, resource lifecycle, retry semantics) that a hand-written mock can never faithfully reproduce, and doing so means your test is asserting against your own guess of how the library behaves, not how it actually behaves. When that guess is wrong — and it usually eventually is, after a library upgrade changes some edge-case behavior — the mock keeps passing while production breaks.</p>
+<p>The fix is to introduce your own narrow abstraction (a <code>PaymentGateway</code> interface with exactly the methods your domain needs, implemented by an adapter around the third-party SDK) and mock <em>that</em> in unit tests, while testing the adapter itself — the thin layer that actually talks to the SDK — with an integration test against something real or realistically containerized. You mock the boundary you designed and control; you do not mock the vendor's API surface.</p>
+
+<h2>4. The Over-Mocking Trap and Why It Motivates TestContainers</h2>
+<p>The failure mode that all of the above guidance is trying to prevent is this: a repository class is unit-tested with a mocked <code>EntityManager</code> or a mocked JPA repository interface, every method is stubbed to return exactly what the test expects, and the test passes. But the real, unmocked SQL that Hibernate generates from your query method never runs anywhere in the suite. If the query has a wrong join column, a wrong <code>@Column</code> mapping, or relies on Postgres-specific syntax that doesn't behave the way you assumed, none of that surfaces — every layer above the mock is only checking that your code calls the mock correctly, not that the real underlying technology behaves the way your code assumes.</p>
+<p>This is precisely the gap integration tests exist to close, and it's why an in-memory substitute (H2 standing in for Postgres, a hand-rolled fake message broker standing in for Kafka) is a fragile solution: H2's SQL dialect, type coercion rules, and constraint-enforcement behavior diverge from Postgres's in enough small ways that a query can pass against H2 and fail against real Postgres in production — wrong case-sensitivity handling, different date/time semantics, different handling of NULL in unique constraints. An in-memory fake is a model of the real system, built by the same people who might be wrong about the real system's behavior in the first place, so it tends to reproduce the developer's misconceptions rather than catch them.</p>
+
+<h2>5. TestContainers: Integration Testing Against the Real Thing</h2>
+<p>TestContainers is a Java library that programmatically starts and stops real Docker containers from within a test's lifecycle, giving each test run (or test class) an ephemeral, disposable instance of the actual technology being integrated with — a real PostgreSQL server, a real Kafka broker, a real Redis instance, a real LocalStack standing in for AWS services. The container is created fresh, used for the test run, and destroyed afterward, so there's no shared mutable test database drifting into an inconsistent state across CI runs.</p>
+
+<pre><code>@Testcontainers
+class OrderRepositoryIntegrationTest {
+
+    @Container
+    static PostgreSQLContainer&lt;?&gt; postgres =
+        new PostgreSQLContainer&lt;&gt;("postgres:16")
+            .withDatabaseName("orders_test");
+
+    @DynamicPropertySource
+    static void configureDataSource(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+    }
+
+    @Autowired
+    OrderRepository orderRepository;
+
+    @Test
+    void persistsAndReloadsOrderWithLineItems() {
+        Order saved = orderRepository.save(sampleOrder());
+        Order reloaded = orderRepository.findById(saved.getId()).orElseThrow();
+        assertEquals(2, reloaded.getLineItems().size());
+    }
+}
+</code></pre>
+
+<p>The <code>@Container</code> field being <code>static</code> here matters for the same lifecycle reason discussed in the JUnit 5 section: a static container is started once (via <code>@BeforeAll</code>-equivalent extension callbacks) and shared across all test methods in the class rather than restarted per test, which is what makes a Postgres-container-per-test-class approach fast enough to be practical — restarting a full database container for every single test method would be prohibitively slow. <code>@DynamicPropertySource</code> exists because the container's mapped port is only known at runtime after Docker assigns it, so the JDBC URL can't be a static property in <code>application.yml</code>; it has to be injected into Spring's environment after the container starts but before the context builds the datasource bean.</p>
+
+<div class="callout tip">
+<div class="callout-title">The trade-off is honest, not hidden</div>
+<p>TestContainers tests are slower than pure unit tests — container startup is commonly hundreds of milliseconds to a few seconds depending on the image, plus JVM class-loading and Spring context startup if you're bringing up a full <code>ApplicationContext</code>. This is the correct place on the pyramid for that cost: you're not trying to make every test this slow, you're concentrating this cost into a smaller number of integration tests that verify exactly the things unit tests structurally can't — real dialect behavior, real serialization, real constraint enforcement — while the bulk of your logic remains covered by millisecond-fast unit tests with mocked collaborators.</p>
+</div>
+
+<h2>6. Contract Testing: Verifying Service Boundaries Without a Full Environment</h2>
+<p>In a microservices architecture, a classic integration problem is that no single team can run a true end-to-end test cheaply — verifying that Service A's expectations of Service B's API are actually met would otherwise require spinning up both services (and their transitive dependencies) together, which is slow, requires coordinated versioning, and doesn't scale as the number of services grows past a handful. Contract testing solves a narrower version of that problem: verifying that a consumer's expectations of a provider match the provider's actual behavior, without either side needing the other running.</p>
+
+<h3>The consumer-driven contract flow</h3>
+<ol>
+<li>The <strong>consumer</strong> (the service calling the API) writes a test against a mock of the provider, expressing exactly the requests it will make and the responses it expects — field names, types, status codes. Running this test produces a <strong>contract</strong> (a serialized specification, e.g. a Pact file) capturing those expectations.</li>
+<li>The contract is published to a shared broker (such as a Pact Broker) that both teams can access.</li>
+<li>The <strong>provider</strong>, in its own build pipeline, pulls down every contract published against it and replays each interaction against its real implementation, asserting that the actual response matches what each consumer expects.</li>
+<li>If the provider's pipeline fails this verification, that is the signal — before any deployment — that a proposed change would break a real consumer, without either service ever needing to be deployed alongside the other in a shared environment.</li>
+</ol>
+
+<p>The word "consumer-driven" is precise: the contract originates from what the consumer actually needs, not from the provider's own documentation of what it offers. This avoids a subtle failure mode of schema-only approaches (like just sharing an OpenAPI spec): a provider can be fully compliant with its own documented schema while still breaking a consumer that only ever used a subset of fields in a particular way — the contract only encodes interactions that are actually exercised, which keeps it a precise, living, executable specification of what would actually break someone, not a hypothetical full behavior. This composes directly with a deployment pipeline: contract verification is typically a gate a provider's build must pass before it's allowed to deploy, exactly the kind of check a <a href="#/ci-cd-deployment">pipeline</a> is built to enforce automatically.</p>
+
+<div class="callout">
+<div class="callout-title">Contract tests are not a replacement for integration tests</div>
+<p>Contract testing verifies the shape and semantics of a boundary agreement between two services; it does not verify that either service's internal logic or its interaction with its own database or broker works correctly — that's still the job of that service's own integration tests. The two techniques answer different questions: "does my code work against the real Postgres/Kafka behind it" (TestContainers) versus "does my understanding of a different team's API match what they actually built and will keep building" (contract tests).</p>
+</div>
+
+<h2>7. Test Doubles, Precisely</h2>
+<p>"Mock" is often used loosely to mean "any fake object in a test," but the test-doubles taxonomy (originating with Gerard Meszaros, popularized by Martin Fowler) distinguishes five distinct roles, and Mockito's API blurs some of these together in ways worth untangling deliberately.</p>
+
+<table>
+<tr><th>Double</th><th>Behavior</th><th>Purpose in the test</th><th>Example</th></tr>
+<tr><td>Dummy</td><td>Has no behavior at all; exists only to satisfy a parameter list</td><td>Fill a required argument the test never actually exercises</td><td>A placeholder <code>Locale</code> passed to a constructor whose test never checks localization</td></tr>
+<tr><td>Stub</td><td>Returns pre-programmed answers to calls made during the test</td><td>Supply canned inputs so the unit under test can run</td><td>A repository stub returning a fixed <code>User</code> object for <code>findById</code></td></tr>
+<tr><td>Spy</td><td>Wraps a real object; records calls while typically running real logic for unstubbed methods</td><td>Observe real interactions, or override just one method of otherwise-real behavior</td><td>Mockito <code>@Spy</code> around a real <code>PricingService</code></td></tr>
+<tr><td>Mock</td><td>Pre-programmed with expectations about which calls it should receive, and verified afterward</td><td>Assert that specific interactions happened, with specific arguments, specific number of times</td><td>Mockito <code>@Mock</code> verified with <code>verify(mock).charge(amount)</code></td></tr>
+<tr><td>Fake</td><td>A working, simplified implementation, not a stand-in with canned answers</td><td>Provide realistic behavior without the cost/complexity of the real dependency</td><td>An in-memory <code>Map</code>-backed repository implementing the real repository interface</td></tr>
+</table>
+
+<p>The distinction between stub and mock is really about <em>what the test checks</em>, not how the object is constructed: if you configure an object's canned return values and then only assert on the state that results from using them, you're using it as a stub. If you additionally assert that specific methods were called on it, you're using it as a mock in Meszaros's strict sense — and Mockito's single <code>mock()</code> factory method can produce an object used in either role depending on whether your test ever calls <code>verify()</code> on it. A <strong>fake</strong> is a step up in fidelity from a stub: rather than returning fixed canned data, a fake is a genuinely working alternative implementation — an in-memory repository that actually stores and retrieves objects, enforcing constraints in a real (if simplified) way — which is why a fake occupies a middle ground between a hand-rolled stub and the fully real TestContainers-backed dependency: more realistic than canned answers, cheaper than a real database.</p>
+
+<div class="callout tip">
+<div class="callout-title">Choosing a double is a fidelity/cost decision, not a style preference</div>
+<p>Dummies and stubs are the cheapest, appropriate when the collaborator's behavior is irrelevant to what you're testing. Mocks are appropriate when the interaction itself — not the return value — is the thing under test. Fakes are worth the extra investment when a dependency is used pervasively across many tests and its real behavior (ordering, constraints, state transitions) actually matters, but standing up the real thing in every test would be too slow. Real dependencies via <a href="#/jpa-hibernate">TestContainers</a> are the highest-fidelity, highest-cost option, reserved for the boundary-behavior questions that nothing else can answer honestly.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does an inverted testing pyramid make a system harder to change safely over time, not just slower to test?</summary>
+<div class="qa-body">When most of your confidence comes from slow, brittle end-to-end tests, the feedback loop for a code change lengthens from seconds to potentially tens of minutes, and failures are ambiguous — a failing end-to-end test could indicate a real regression or an unrelated flaky dependency, so people learn to distrust and rerun rather than investigate. That erosion of trust means genuine regressions increasingly slip through because failures are assumed to be noise. Over time, teams become reluctant to refactor or change code at all, because the cost of finding out whether a change broke something is high and the signal is unreliable — the opposite of what a test suite is supposed to enable.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why must @BeforeAll methods be static under JUnit 5's default lifecycle, and what changes if you use PER_CLASS?</summary>
+<div class="qa-body">Under the default PER_METHOD lifecycle, JUnit constructs a brand-new instance of the test class for every test method to prevent state from leaking between tests through instance fields. That means there is no instance in existence yet at the point @BeforeAll needs to run — it executes before the first per-method instance is even created — so it must be a static method invoked against the class itself. Switching to @TestInstance(Lifecycle.PER_CLASS) makes JUnit create a single shared instance for the whole class, so @BeforeAll can now run as an instance method against that one instance; the cost is that instance fields persist across test methods, so you take on responsibility for resetting any mutable state in @BeforeEach to keep tests independent.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What is the practical difference between a mock and a spy in Mockito, and when would using a spy actually be the wrong choice?</summary>
+<div class="qa-body">A mock has zero real implementation underneath — every method returns a default (null/0/empty) unless explicitly stubbed, so you have complete, explicit control over its behavior. A spy wraps a real object, so any method you haven't stubbed executes the real implementation with real side effects. A spy is the wrong choice when the real object's unstubbed methods have expensive or irreversible side effects (network calls, writes, sending notifications) that you didn't intend to trigger just by using the object in a test — in that case a mock, or a fake, is safer because nothing runs unless you explicitly said it should.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does over-using verify() make tests brittle, and how do you decide when behavior verification is actually warranted?</summary>
+<div class="qa-body">verify() asserts on how the code under test achieved its result — which methods it called on which collaborators — rather than on the result itself. Since there are usually many valid implementations that produce the same correct externally observable outcome, a test that verifies implementation details breaks the moment you refactor internals, even when behavior hasn't changed for any caller. Behavior verification is warranted specifically when the interaction itself has no observable return value to assert on and is the actual point of correctness — for example, confirming an event was published exactly once, or that a destructive method was never called on a certain code path — cases where the side effect, not a return value, is the thing that must be right.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is mocking a database driver or third-party SDK directly considered a risky practice, and what should you mock instead?</summary>
+<div class="qa-body">A type you don't own — a JDBC Connection, a Kafka Producer, a payment SDK client — has rich behavioral contracts (timing of exceptions, resource lifecycle, retry and idempotency semantics) that are not fully captured by its Java interface, so a hand-written mock encodes your own guess about how the library behaves. When that guess diverges from reality — often after a library upgrade — the mock keeps passing while production breaks, because the test was never checking against real behavior, just against your assumption of it. The safer approach is to define your own narrow interface expressing exactly what your domain needs, mock that interface in unit tests, and verify the thin adapter that actually calls the third-party SDK with an integration test against something real (or a realistic container), so the risky assumption-laden boundary is tested with real behavior instead of a hand-rolled substitute.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does TestContainers exist when an in-memory database like H2 is faster and easier to set up?</summary>
+<div class="qa-body">An in-memory substitute is a simplified model of the real technology, built with the same assumptions a developer might already be wrong about — H2's SQL dialect, type coercion, and constraint enforcement diverge from Postgres's in specific ways (case sensitivity, date/time handling, NULL semantics in unique constraints), so a query can pass against H2 and still fail against production Postgres. TestContainers runs the actual database or broker in a real, ephemeral Docker container, so the integration test exercises the real engine's real quirks. The cost is slower test startup, which is exactly why these tests sit in the smaller integration layer of the pyramid rather than replacing fast unit tests entirely.</div>
+</details>
+
+<details class="concept-qa">
+<summary>In consumer-driven contract testing, why does the contract originate from the consumer rather than from the provider's published API schema?</summary>
+<div class="qa-body">A provider's own schema documentation describes everything it theoretically offers, but a given consumer typically only relies on a subset of fields and behaviors in specific ways. If contracts were derived purely from the provider's schema, a fully schema-compliant change could still break a consumer that depended on some incidental behavior not captured by the schema, or the schema could go stale relative to what's actually being tested. By having each consumer publish a contract capturing exactly the interactions it actually performs and depends on, the provider verifies against real, current usage rather than a hypothetical full surface area — catching precisely the changes that would break someone, without needing every consumer and provider deployed together to find out.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/ci-cd-deployment'"><div class="rc-title">CI/CD & Deployment</div><div class="rc-sub">Bonus · contract verification and integration test suites are typically gates inside the same pipeline that promotes a build</div></div>
+<div class="related-card" onclick="window.location.hash='/jpa-hibernate'"><div class="rc-title">JPA & Hibernate</div><div class="rc-sub">Bonus · repository and query correctness is exactly what TestContainers-backed integration tests exist to verify against a real database</div></div>
+<div class="related-card" onclick="window.location.hash='/async-messaging'"><div class="rc-title">Async Messaging</div><div class="rc-sub">Bonus · Kafka broker behavior and consumer contracts are prime candidates for containerized integration tests and contract testing</div></div>
+<div class="related-card" onclick="window.location.hash='/spring-core-mechanics'"><div class="rc-title">Spring Core Mechanics</div><div class="rc-sub">Bonus · SpringExtension and @DynamicPropertySource rely on the same context lifecycle and bean wiring covered there</div></div>
+</div>

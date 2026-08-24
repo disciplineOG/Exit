@@ -1,0 +1,203 @@
+<p class="topic-breadcrumb">Phase 1 — Foundation &amp; Low-Level Mastery · Days 06–10 · HLD</p>
+<h1>Caching Strategies &amp; Redis Architecture</h1>
+<div class="topic-tags">
+<span class="tag">Cache-Aside</span>
+<span class="tag">Write-Through/Behind</span>
+<span class="tag">Eviction (LRU/LFU)</span>
+<span class="tag">Invalidation</span>
+<span class="tag">Cache Stampede</span>
+<span class="tag">Redis Internals</span>
+<span class="tag">Replication &amp; Cluster</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>A cache is not "a fast database" — it is a bet that most reads can be answered from a smaller, stale-tolerant copy of the truth, and every caching bug traces back to that bet being violated somewhere. If you don't understand the read/write race in cache-aside, you will ship a service that silently serves a permanently stale value to every user after a single unlucky interleaving of a write and a cache miss — and no amount of retrying will fix it, because the stale value is now the one sitting in the cache. Understanding eviction, invalidation, and Redis's single-threaded execution model is what lets you predict, rather than debug after the fact, why a cache hit ratio suddenly collapsed at 2am during a deploy.</p>
+</div>
+
+<h2>1. Why Caching Exists</h2>
+<p>Every layer of a computer's storage hierarchy trades capacity for speed. A CPU register access takes roughly 1 cycle (~0.3 ns on a 3 GHz core). An L1 cache reference is about 1 ns. Main memory (DRAM) is about 100 ns — already two orders of magnitude slower. A round trip to an SSD is on the order of 100 microseconds, and a round trip across a network to another service or a disk-backed database, including serialization and TCP handling, is typically 1–10 milliseconds even in the same data center. That is roughly <strong>10,000x to 100,000x</strong> slower than a memory access. Caching exists because this gap is structural, not incidental — it comes from physics (signal propagation, seek times, network hops) and cannot be engineered away, only worked around.</p>
+<p>The reason caching works at all — rather than just being a gamble — is the <strong>principle of locality of reference</strong>: real workloads are not uniformly random. A small "working set" of data (a product catalog's top-selling items, a user's own profile, the last hour of a feed) accounts for a disproportionate share of requests at any given moment. If you keep that working set in memory, you convert a large fraction of your traffic from millisecond-scale disk/network operations into sub-millisecond memory operations, without needing to make the underlying database itself faster. This is why cache hit ratio, not raw cache size, is the metric that matters — a cache that captures 95% of traffic in a working set that's 1% of total data is far more valuable than one twice its size with a worse hit ratio.</p>
+<p>Caching also exists for a second, less discussed reason: <strong>cost and blast-radius isolation</strong>. A relational database performing a join under load degrades non-linearly — connection pools exhaust, lock contention rises, query planning slows. Absorbing 95% of read traffic in an in-memory tier means the database only ever sees the harder, less frequent 5%, which keeps it in a regime where it behaves predictably. This is directly related to the read/write scaling arguments in <a href="#/hld-basics-scaling">hld-basics-scaling</a>.</p>
+
+<h2>2. Cache-Aside (Lazy Loading)</h2>
+<p>Cache-aside — also called "lazy loading" — is the pattern used by the overwhelming majority of application-level caches (Redis or Memcached sitting next to a service, with the application code explicitly managing both). The defining trait is that <strong>the cache is dumb and passive</strong>: it never talks to the database itself. The application is the only thing that knows both systems exist, and it is responsible for keeping them roughly consistent.</p>
+
+<h3>The read path</h3>
+<ol>
+<li>Application receives a read request for key <code>K</code>.</li>
+<li>It queries the cache for <code>K</code>.</li>
+<li><strong>Cache hit</strong>: return the cached value directly. Database is never touched.</li>
+<li><strong>Cache miss</strong>: query the database for <code>K</code>, get the value, write it into the cache (usually with a TTL), then return it to the caller.</li>
+</ol>
+
+<h3>The write path</h3>
+<ol>
+<li>Application writes the new value directly to the database.</li>
+<li>Application then <strong>invalidates</strong> (deletes) the corresponding cache key — it does <em>not</em> update the cache with the new value.</li>
+</ol>
+
+<div class="callout warn">
+<div class="callout-title">Why delete instead of update on write?</div>
+<p>It is tempting to write the new value into the cache right after writing the database, to "keep it warm." This is a trap for two reasons. First, if two writers update the same key concurrently, the last cache write to land might not correspond to the last database write to land — you can end up with a cache value that is <em>older</em> than the database value, with no mechanism to ever correct it until the TTL expires. Deleting is idempotent and order-independent: no matter which delete "wins," the next reader simply repopulates from the database. Second, if the value is expensive to compute (a joined, aggregated, or serialized representation) and is rarely read after being written, populating it eagerly wastes work. Deletion defers that cost to the next actual reader, or avoids it entirely if no one reads it before the next write.</p>
+</div>
+
+<h3>The classic race condition</h3>
+<p>Cache-aside has a well-known interleaving hazard between a concurrent read (on miss) and a write:</p>
+<pre><code>Thread A (read, cache miss)         Thread B (write)
+--------------------------         ------------------
+1. GET key -> miss
+                                     2. UPDATE db SET value=v2
+                                     3. DEL cache key   (no-op, already absent)
+4. SELECT value FROM db  -> v1 (STALE, read before step 2 committed...
+   or reads v2 depending on isolation, see below)
+5. SET cache key = (value read in step 4)
+</code></pre>
+<p>The dangerous case is when step 4 reads the <em>old</em> value <code>v1</code> (because it was in flight before the transaction in step 2 committed, or because of read-replica lag) but lands in the cache <em>after</em> step 3's delete. The cache now holds <code>v1</code> forever — or until the TTL expires — even though the database correctly holds <code>v2</code>. No subsequent read will fix this because every subsequent read is a cache hit against the wrong value. This is not a rare, exotic race: under real load with a fast writer and a slow reader (e.g., a reader that queries a replica with replication lag), it happens routinely.</p>
+<div class="callout">
+<div class="callout-title">Mitigations, in increasing order of complexity</div>
+<ul>
+<li><strong>Short TTLs</strong> — bound the damage; the stale entry self-heals within the TTL window. Cheap, but doesn't eliminate the problem, only limits blast radius.</li>
+<li><strong>Delete-after-write with a delay ("double delete")</strong> — invalidate immediately after the write, then invalidate again after a short delay (e.g., 500ms) to catch any read that raced in and repopulated a stale value in between.</li>
+<li><strong>Write-through-style versioning</strong> — store a version number or updated-at timestamp alongside the cached value, and have the writer compare-and-swap so an older read never overwrites a newer cache entry.</li>
+<li><strong>Route reads-after-write to the primary</strong>, avoiding replica lag entirely for the window right after a write (read-your-writes consistency), covered further in <a href="#/distributed-systems-core">distributed-systems-core</a>.</li>
+</ul>
+</div>
+
+<h2>3. Read-Through, Write-Through, and Write-Behind</h2>
+<p>These three patterns differ from cache-aside in one structural way: <strong>the cache itself (or a library/sidecar sitting in front of it) owns the responsibility of talking to the database</strong>, not the application. The application only ever talks to the cache.</p>
+
+<h3>Read-through</h3>
+<p>On a miss, the cache — not the application — is configured with a loader function that fetches from the database, populates itself, and returns the value. Functionally this produces the same outcome as cache-aside's read path, but the population logic lives in one place (the cache layer) instead of being duplicated across every call site in application code. Libraries like Guava's <code>LoadingCache</code> or Caffeine's <code>CacheLoader</code> implement this locally; at the distributed level it requires a caching layer with plugin support (rare for raw Redis, common in ORMs or dedicated caching proxies).</p>
+
+<h3>Write-through</h3>
+<p>Every write goes to the cache first, and the cache synchronously writes it to the database before acknowledging the write to the application. This guarantees the cache and database are never inconsistent (barring the write itself failing), at the cost of every write now paying the full database write latency <em>plus</em> the cache write latency. It solves the cache-aside race condition by construction — there is no window where a stale read can repopulate the cache, because the cache is always updated in the same synchronous path as the database write.</p>
+
+<h3>Write-behind (write-back)</h3>
+<p>Writes go to the cache and are acknowledged to the application immediately; the cache asynchronously flushes the write to the database later, often batched. This gives the lowest possible write latency (client never waits on the database) and can dramatically reduce database write load by coalescing many rapid updates to the same key into one flush. The trade-off is durability: if the cache node crashes before the buffered write is flushed, that write is lost permanently, even though the client already received a success response. This pattern is used where losing a small, bounded window of recent writes is an acceptable trade against write throughput — view counters, telemetry, or rate-limit counters — and essentially never used for anything requiring strict durability (financial ledgers, orders).</p>
+
+<table>
+<tr><th>Pattern</th><th>Who populates cache</th><th>Write latency</th><th>Consistency risk</th></tr>
+<tr><td>Cache-aside</td><td>Application, on miss</td><td>DB write only (cache deleted, not written)</td><td>Miss/write race can strand a stale entry</td></tr>
+<tr><td>Read-through</td><td>Cache loader, on miss</td><td>N/A (read path)</td><td>Same race as cache-aside unless loader is coordinated</td></tr>
+<tr><td>Write-through</td><td>Cache, synchronously</td><td>DB + cache, both synchronous</td><td>None (always consistent by construction)</td></tr>
+<tr><td>Write-behind</td><td>Cache, asynchronously</td><td>Cache only (fastest)</td><td>Data loss on cache crash before flush</td></tr>
+</table>
+
+<h2>4. Eviction Policies</h2>
+<p>A cache has finite memory. When it's full and a new key needs to be inserted, something has to be evicted. The eviction policy is a bet about which entries are least likely to be needed again soon.</p>
+
+<h3>LRU (Least Recently Used)</h3>
+<p>Evict the entry that hasn't been accessed for the longest time, on the assumption that recent access predicts near-future access (temporal locality). The efficient implementation is a combination of a <strong>hash map</strong> (key → node pointer, for O(1) lookup) and a <strong>doubly linked list</strong> ordered by recency (most-recently-used at the head, least-recently-used at the tail):</p>
+<ul>
+<li>On <code>get(key)</code>: look up the node via the hash map in O(1), then unlink it from its current position and re-insert it at the head — O(1) because it's a doubly linked list (you have direct pointers to the node's neighbors, no traversal needed).</li>
+<li>On <code>put(key, value)</code> when full: evict the node at the tail (O(1), you hold a tail pointer), remove its entry from the hash map, then insert the new node at the head.</li>
+</ul>
+<p>This is exactly the internal structure of Java's <code>LinkedHashMap</code> in access-order mode (<code>new LinkedHashMap&lt;&gt;(cap, 0.75f, true)</code>), which is why overriding <code>removeEldestEntry</code> on it is the textbook way to build a bounded LRU cache in five lines — see <a href="#/collections-internals">collections-internals</a> for how that hash map is actually built underneath.</p>
+
+<h3>LFU (Least Frequently Used)</h3>
+<p>Evict the entry with the lowest access count, on the assumption that historically popular items stay popular. The naive implementation (a counter per key) has a serious flaw: an item that was extremely popular yesterday but hasn't been touched today keeps a high count forever and can never be evicted, starving out genuinely new hot items — this is the "cache pollution from old popularity" problem. Real LFU implementations solve this with <strong>aging</strong>: counts decay over time (halved periodically, or decremented on a schedule), so popularity has to be sustained, not just historical, to survive.</p>
+
+<h3>FIFO and TTL</h3>
+<p>FIFO evicts in strict insertion order regardless of access pattern — simple, cheap, but ignores locality entirely, so it's rarely used for general-purpose caches (it's more common in bounded queues). TTL-based expiry isn't really an eviction policy in the "which victim do I pick under memory pressure" sense — it's a correctness mechanism: every entry carries an expiration timestamp and is treated as absent once that time passes, independent of memory pressure. TTL and a capacity-driven eviction policy (LRU/LFU) are typically used together: TTL bounds staleness, eviction bounds memory.</p>
+
+<div class="callout tip">
+<div class="callout-title">How Redis actually approximates LRU</div>
+<p>Exact LRU requires maintaining a globally ordered structure (like the linked list above) that every single access has to touch and reorder. For Redis, which is single-threaded and processes hundreds of thousands of operations per second, adding an O(1)-but-still-real bookkeeping step and extra pointer memory to every single command is real overhead at that scale. Instead, Redis stores an approximate "last accessed" timestamp (a compact clock value) on each key object, and when it needs to evict, it takes a <strong>random sample</strong> of N keys (<code>maxmemory-samples</code>, default 5) and evicts the one with the oldest access time among just that sample — not a global scan. Increasing the sample size gets closer to true LRU at the cost of more CPU per eviction; the default of 5 is deliberately a "good enough" approximation, and Redis's own documentation is explicit that this is not exact LRU. Redis 4.0+ also offers LFU (<code>maxmemory-policy allkeys-lfu</code>), implemented with an 8-bit logarithmic counter per key that increments probabilistically (so it doesn't need 64 bits per key) and decays over time — the aging solution described above, made memory-cheap.</p>
+</div>
+
+<h2>5. Cache Invalidation</h2>
+<p>Phil Karlton's line — "there are only two hard problems in computer science: cache invalidation and naming things" — is not a joke about difficulty for its own sake; it points at something real. Invalidation is hard because it requires the cache to know, at the exact right moment, that a piece of truth it's holding a copy of has changed somewhere else, in a system where "somewhere else" may be a different process, a different node, or a different service entirely, with no shared clock and no atomic way to make "update the source of truth" and "invalidate the copy" happen as one operation.</p>
+<table>
+<tr><th>Strategy</th><th>Mechanism</th><th>Trade-off</th></tr>
+<tr><td>TTL-based</td><td>Every entry expires automatically after N seconds</td><td>Simple, self-healing, but guarantees staleness up to the full TTL window on every entry, always</td></tr>
+<tr><td>Explicit invalidation on write</td><td>Writer deletes/updates the specific cache key it just modified</td><td>Precise and immediate, but requires every write path to know about and correctly touch every cache key derived from that data — easy to miss one</td></tr>
+<tr><td>Event-driven invalidation</td><td>A change-data-capture stream or message bus (e.g., a Debezium feed off the database's write-ahead log, or an application-published event) triggers invalidation in any service holding a cache of that data</td><td>Decouples writers from having to know about every downstream cache, and works across service boundaries, but adds a message bus as a dependency and introduces its own propagation delay</td></tr>
+</table>
+<p>Explicit invalidation is what most cache-aside systems use directly (the delete call in the write path from Section 2). Event-driven invalidation matters once the same underlying data is cached in multiple independent services — a product's price might be cached by the search service, the cart service, and the recommendation service, and none of them can rely on being the one that performed the write.</p>
+
+<h2>6. Thundering Herd / Cache Stampede</h2>
+<p>A stampede happens when a single hot key expires (or is evicted, or the cache node restarts) and a large burst of concurrent requests for that exact key all miss at once. Every one of those requests independently falls through to the database to recompute the same value, and if that computation is expensive (a heavy aggregation query, a slow downstream call), the database or downstream service receives a sudden multiplied spike of identical, redundant load — sometimes enough to fall over, at exactly the moment it's least equipped to handle a spike, because it's already under the same load that made the cache valuable in the first place.</p>
+<ul>
+<li><strong>Locking / single-flight</strong>: the first request to miss acquires a short-lived lock (e.g., <code>SET lock:key NX PX 5000</code> in Redis) and is the only one allowed to query the database and repopulate the cache; every other concurrent request either waits briefly and retries the cache, or is served the last known (possibly slightly stale) value.</li>
+<li><strong>Request coalescing</strong>: at the application layer, concurrent in-flight requests for the same key are collapsed into a single outstanding database call, and all callers subscribe to its result rather than each issuing their own — this is single-flight implemented in-process instead of via a distributed lock.</li>
+<li><strong>Jittered TTLs</strong>: instead of setting every related key to expire at exactly the same TTL (which synchronizes their expiry and guarantees a herd later), add randomized jitter — e.g., <code>TTL = base ± random(0, base * 0.1)</code> — so expirations spread out over time instead of clustering.</li>
+<li><strong>Probabilistic early expiration (early recomputation)</strong>: instead of waiting for a hard expiry, each read has a small, increasing probability of proactively recomputing the value <em>before</em> it actually expires, with the probability rising as the entry approaches its TTL. This means recomputation gets spread across many individual requests ahead of the deadline rather than concentrated into one burst exactly at expiry — the well-known formulation of this is the XFetch / "beta stampede prevention" algorithm.</li>
+</ul>
+
+<h2>7. Redis Architecture Internals</h2>
+
+<h3>Single-threaded event loop</h3>
+<p>Redis executes all commands on a single thread, which sounds like it should be a bottleneck but is in fact central to why it's fast and predictable. The reasoning: Redis's operations are almost entirely in-memory and CPU-bound at the microsecond scale, not I/O-bound — so the traditional argument for multithreading (overlap CPU work with I/O wait) doesn't apply the way it does for a disk-bound database. A single thread means <strong>every command executes atomically with respect to every other command</strong> — there is no possibility of two clients' <code>INCR</code> calls interleaving at the instruction level, no lock contention, and no context-switching overhead. Concurrency across many client connections is handled by an event loop (built on epoll/kqueue) that multiplexes thousands of socket file descriptors on that one thread, dispatching whichever socket has data ready without blocking on any single slow client. The actual bottleneck this creates is that <strong>any single slow command blocks everything else</strong> — an unbounded <code>KEYS *</code> scan or a <code>SORT</code> over a huge set stalls every other client for its duration, which is why Redis provides <code>SCAN</code> (cursor-based, non-blocking iteration) instead of `KEYS` for production use, and why Redis 6+ offloads I/O threading (reading/writing socket buffers, not command execution) to background threads purely to reduce network-layer overhead, without changing the single-threaded execution guarantee for the commands themselves.</p>
+
+<h3>Core data structures and what problem each solves</h3>
+<table>
+<tr><th>Type</th><th>Underlying structure</th><th>Problem it solves</th></tr>
+<tr><td>String</td><td>Dynamic byte array (SDS — Simple Dynamic String)</td><td>General key-value, counters (<code>INCR</code> is atomic), serialized blobs</td></tr>
+<tr><td>Hash</td><td>Listpack (small) / hash table (large)</td><td>Grouped fields under one key without needing separate top-level keys — e.g., a user object's fields</td></tr>
+<tr><td>List</td><td>Quicklist (linked list of compact listpacks)</td><td>Ordered sequences with fast push/pop at both ends — queues, recent-activity feeds</td></tr>
+<tr><td>Set</td><td>Intset (small, all-integer) / hash table</td><td>Unique membership tests and set algebra (union/intersection/diff) in O(1) average per element</td></tr>
+<tr><td>Sorted Set (ZSet)</td><td>Skip list + hash table</td><td>Ranked data with O(log N) insert and O(log N) range queries by score — leaderboards, priority queues, rate-limiting windows</td></tr>
+</table>
+<div class="callout">
+<div class="callout-title">Why a skip list for sorted sets, not a balanced tree</div>
+<p>A skip list gives the same O(log N) expected search/insert/delete as a balanced binary tree (like a red-black tree), but with a much simpler implementation — no rotations, no rebalancing logic — built from ordinary linked-list nodes with randomized "express lane" pointers at multiple levels. It also makes range queries (fetch all elements with a score between X and Y) and ordered iteration naturally cheap, because at the base level it is just a sorted linked list. Redis's author has stated the choice was pragmatic: comparable performance to a balanced tree with substantially less code complexity and easier debugging.</p>
+</div>
+
+<h3>Persistence: RDB vs AOF</h3>
+<p>Redis is an in-memory store, but "in-memory" and "durable" aren't mutually exclusive if you're willing to trade some performance or some recovery precision.</p>
+<ul>
+<li><strong>RDB (snapshotting)</strong>: periodically forks the process and writes the entire dataset to a compact binary file on disk (the fork's copy-on-write pages mean the parent process keeps serving traffic uninterrupted while the child writes). Fast to restart from (just load one file), compact, but any writes since the last snapshot are lost on a crash — the exposure window is however often you snapshot (e.g., every 60 seconds via <code>save 60 10000</code>, meaning "snapshot if at least 10000 keys changed in 60 seconds").</li>
+<li><strong>AOF (Append-Only File)</strong>: logs every write command to a file as it happens. With <code>appendfsync everysec</code> (the common default trade-off), at most one second of writes can be lost on crash; with <code>appendfsync always</code>, effectively zero loss but every write now pays a disk fsync — a massive latency cost for an otherwise in-memory store. AOF files are larger and slower to replay on restart than an RDB snapshot, which is why Redis periodically rewrites/compacts the AOF file in the background (folding a long command history down to the minimal set of commands that reproduce the current state).</li>
+<li>Redis commonly runs <strong>both</strong>: RDB for fast full backups and fast restarts, AOF for a tighter durability bound, with AOF used for the actual crash-recovery replay and RDB used for portable backups/replication bootstrapping.</li>
+</ul>
+
+<h3>Replication: primary-replica</h3>
+<p>A Redis primary asynchronously streams its write stream (effectively AOF-like propagation) to one or more replicas, which apply those writes and can serve read traffic. Because replication is asynchronous, there is a real <strong>consistency gap</strong>: an acknowledged write on the primary is not guaranteed to have reached a replica yet, so a client reading from a replica immediately after writing to the primary can observe stale data (or a replica can lag arbitrarily far behind under network pressure or heavy write load). This is the direct Redis instance of the general async-replication trade-off discussed in <a href="#/database-architecture">database-architecture</a>: you get read scalability and failover targets, but only eventual, not immediate, consistency on replica reads.</p>
+
+<h3>Redis Cluster: sharding via hash slots</h3>
+<p>Redis Cluster partitions the entire keyspace into <strong>16384 fixed hash slots</strong>. Every key is assigned to a slot via <code>CRC16(key) mod 16384</code>, and each slot is owned by exactly one primary node (with its own replicas for failover) at any given time. A client can compute which node owns a key's slot itself (using cluster topology metadata it caches), or ask any node and get redirected (<code>MOVED</code>/<code>ASK</code> responses) to the correct one. Resharding — moving slot ownership from one node to another, e.g., when adding a new node to spread load — is done slot-by-slot: the cluster migrates the keys within a slot to the new owner, and during that migration window a client might get an <code>ASK</code> redirect telling it to retry a specific key against the new node even though the slot hasn't fully migrated yet. Multi-key operations (like a transaction touching two keys) are only supported if both keys hash to the same slot, which is why Redis Cluster supports "hash tags" — <code>{user:1000}.profile</code> and <code>{user:1000}.settings</code> both hash only on the <code>user:1000</code> portion inside the braces, forcing them onto the same slot deliberately so they can be operated on together.</p>
+
+<h3>Redis Sentinel</h3>
+<p>Sentinel is a separate, lighter-weight high-availability mechanism (distinct from Cluster) for a single primary-replica set without sharding. A quorum of Sentinel processes monitors the primary; if a majority agree it's unreachable, they elect a new primary from among the replicas and reconfigure the remaining replicas to follow it, then inform clients (via pub/sub notifications and by acting as a discovery service) of the new primary's address. This gives automatic failover without manual intervention, at the cost of a brief unavailability window during the failure-detection-and-election process, and it inherits the same async-replication consistency gap — a failover can lose any writes that hadn't yet reached the promoted replica.</p>
+
+<h2>8. CDN Caching (Edge Caching)</h2>
+<p>The same core idea — keep a copy near where it's consumed — applies at the network edge, not just in application memory. A CDN (Content Delivery Network) caches responses at points of presence geographically close to end users, so a request for a static asset (or even a cacheable API response) never has to traverse the full network path back to the origin server. What's cacheable and for how long is controlled by HTTP <code>Cache-Control</code> headers: <code>max-age=3600</code> tells any cache the response is fresh for an hour, <code>no-store</code> forbids caching entirely, <code>private</code> restricts caching to the end client (not shared caches like a CDN), and <code>s-maxage</code> sets a separate TTL specifically for shared caches, overriding <code>max-age</code> for them. CDN invalidation ("purging") faces the same fundamental problem as Section 5's cache invalidation, just at a different layer and often with higher propagation latency, since a purge has to reach every edge node globally.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+<details class="concept-qa">
+<summary>Why does deleting a cache key on write, rather than updating it, reduce (but not eliminate) the risk of serving stale data forever?</summary>
+<div class="qa-body">Deleting is order-independent: no matter which of several concurrent writers' deletes executes last, the outcome is the same — an empty cache slot that the next reader will repopulate from the database. Updating is order-dependent: if writer A's database write and cache update happen, then writer B's database write and cache update happen, the cache correctly ends with B's value. But if the operations interleave differently — A writes DB, B writes DB, then A's delayed cache update finally lands after B's — the cache ends up holding A's stale value with no future write scheduled to fix it, because from the system's perspective the "last write" (B's) has already happened and won't recur. Deletion doesn't fully eliminate the race (a read that started before the write and lands after the delete can still restock the stale value), but it removes the specific failure mode where update-ordering directly determines correctness.</div>
+</details>
+<details class="concept-qa">
+<summary>Why is Redis's LRU only approximate, and what would it cost to make it exact?</summary>
+<div class="qa-body">Exact LRU requires a globally consistent recency ordering that every single read touches and re-threads — in practice a doubly linked list where each access unlinks and re-inserts a node at the head. Maintaining that on every single command, at the hundreds-of-thousands-of-ops-per-second scale Redis targets on a single thread, adds real per-command overhead and extra memory (two pointers per key) purely for bookkeeping that most workloads don't need to be perfectly precise. Instead, Redis stores a compact last-access timestamp on each key and, on eviction, samples a small random subset (`maxmemory-samples`, default 5) and evicts the oldest among just that sample. This trades exactness for near-zero per-access overhead; increasing the sample size buys closer-to-true LRU behavior at the cost of more CPU work per eviction.</div>
+</details>
+<details class="concept-qa">
+<summary>What actually causes a cache stampede, and why doesn't a longer TTL fix it?</summary>
+<div class="qa-body">A stampede happens when many concurrent requests for the same key all discover a miss at effectively the same instant — because the key expired, was evicted, or the cache restarted — and each of them independently goes to the database to recompute the same value, multiplying load on the database exactly at the moment the key's popularity (which is why it's cached at all) is highest. A longer TTL doesn't fix this: it only postpones the moment of collective expiry, and if many related keys share the same TTL, it also makes the eventual synchronized expiry burst larger and more concentrated, not smaller. Fixing it requires either serializing who is allowed to repopulate (single-flight/locking), spreading expirations over time (jitter), or recomputing before expiry instead of only after (probabilistic early expiration).</div>
+</details>
+<details class="concept-qa">
+<summary>Why does Redis being single-threaded not make it slow, and where does that model actually break down?</summary>
+<div class="qa-body">Redis operations are in-memory and CPU-bound at the microsecond scale, so there's little I/O wait for a second thread to usefully overlap with — the traditional justification for multithreading doesn't apply the same way it does to disk-bound systems. Single-threaded execution also buys atomicity for free: no command can be interrupted mid-execution by another command, eliminating a whole category of locking and race conditions inside Redis itself. An event loop (epoll/kqueue-based) lets one thread multiplex many client connections without blocking. The model breaks down when a single command takes a long time to execute — an unbounded `KEYS *`, a large `SORT`, or a huge `DEL` on a massive collection blocks the entire server for every other client for that command's duration, which is why cursor-based alternatives like `SCAN` exist and why expensive commands need to be paginated or avoided in production.</div>
+</details>
+<details class="concept-qa">
+<summary>What consistency guarantee do you actually get when reading from a Redis replica, and why?</summary>
+<div class="qa-body">You get eventual consistency, not immediate consistency. Replication from a Redis primary to its replicas is asynchronous: the primary acknowledges a write to the client as soon as it's applied locally, then streams the write to replicas separately, with no guarantee about how quickly that stream is applied. A client that writes to the primary and then immediately reads from a replica can observe the old value, because the replica simply hasn't received and applied the write yet. This gap can widen arbitrarily under replica load or network delay, which is why read-your-own-writes requirements typically need to route the immediate post-write read back to the primary rather than a replica.</div>
+</details>
+<details class="concept-qa">
+<summary>Why does Redis Cluster use a fixed 16384 hash slots instead of hashing keys directly onto nodes?</summary>
+<div class="qa-body">Hashing keys directly onto a set of N nodes (e.g., `hash(key) mod N`) means that changing N — adding or removing a node — reshuffles almost every key's target node, requiring a massive data migration for even a small topology change. By introducing a fixed intermediate layer of 16384 slots, resharding becomes a matter of reassigning ownership of a subset of slots from one node to another — the mapping of key to slot never changes, only the mapping of slot to node does. This makes scaling the cluster up or down an operation proportional to the slots being moved, not to the entire keyspace, and it lets migration happen incrementally and slot-by-slot rather than all at once.</div>
+</details>
+<details class="concept-qa">
+<summary>Why is write-behind caching considered risky, and what kind of data is it appropriate for?</summary>
+<div class="qa-body">Write-behind acknowledges a write to the client as soon as it lands in the cache, then flushes it to the durable store asynchronously later, often batched with other writes. If the cache node crashes, restarts, or loses its in-memory state before that flush happens, the write is gone permanently — even though the caller already received a success response and has no reason to retry. This makes write-behind inappropriate for anything where losing an acknowledged write is unacceptable, such as financial transactions or order records. It's appropriate for data where a bounded window of loss is tolerable in exchange for lower write latency and reduced database write load — view counters, engagement metrics, or ephemeral rate-limiting state, where losing a few recent increments on a crash is a minor, self-correcting inaccuracy rather than a real inconsistency.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">Days 06–10 · Replication, durability, and the write-ahead log that Redis's AOF mirrors conceptually</div></div>
+<div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Days 06–10 · Consistency models that explain exactly what a stale replica read means</div></div>
+<div class="related-card" onclick="window.location.hash='/hld-basics-scaling'"><div class="rc-title">HLD Basics &amp; Scaling</div><div class="rc-sub">Days 06–10 · Why absorbing read load in a cache tier changes a system's scaling ceiling</div></div>
+<div class="related-card" onclick="window.location.hash='/collections-internals'"><div class="rc-title">Collections Internals</div><div class="rc-sub">Days 01–05 · The hash map and linked list mechanics that make O(1) LRU possible</div></div>
+</div>

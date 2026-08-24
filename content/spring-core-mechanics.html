@@ -1,0 +1,250 @@
+<p class="topic-breadcrumb">Phase 2 — Framework Core &amp; Mid-Scale Architecture · Days 21–25 · Spring / LLD</p>
+<h1>Spring Core Mechanics: IoC, DI, AOP, Auto-Config</h1>
+<div class="topic-tags">
+<span class="tag">Inversion of Control</span>
+<span class="tag">Dependency Injection</span>
+<span class="tag">Bean Lifecycle</span>
+<span class="tag">Bean Scopes</span>
+<span class="tag">AOP Proxies</span>
+<span class="tag">Auto-Configuration</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Almost every confusing Spring bug traces back to one of four mechanics: the order of bean lifecycle callbacks, the fact that AOP is proxy-based and therefore blind to self-invocation, the mismatch between a prototype bean's intended lifetime and the singleton it gets injected into, or a starter's conditional bean silently not activating. None of these are "framework magic" — they are consequences of specific, traceable design decisions. Once you can mentally simulate what the container does at startup and at call time, behaviors that look like bugs (a <code>@Transactional</code> method that doesn't roll back, a prototype bean that never changes) become predictable, and you stop treating Spring as a black box you fight against.</p>
+</div>
+
+<h2>1. Inversion of Control as a Principle, Before Spring</h2>
+<p>Strip away the framework and ask a plain question: in a normal Java program, who is responsible for creating an object's dependencies? Normally, the object itself is. If a <code>OrderService</code> needs a <code>PaymentClient</code>, the naive approach is:</p>
+<pre><code>public class OrderService {
+    private final PaymentClient paymentClient = new StripePaymentClient();
+}</code></pre>
+<p><code>OrderService</code> now controls two things it shouldn't have to: <em>which concrete implementation</em> to use, and <em>when</em> to construct it. This is tight coupling — if you want to swap in a <code>PaypalPaymentClient</code> for a test, or wire in retry logic, you must edit <code>OrderService</code> itself. As a codebase grows, every class ends up transitively wired to concrete classes several layers down, and a change to a constructor signature ripples outward through every caller.</p>
+<p>Inversion of Control (IoC) is the general principle of taking that responsibility away from the object and handing it to something external — a container, a factory, a framework runtime. The object stops asking "who do I need to construct?" and instead declares "here is what I need" (usually via constructor parameters or an interface type), and something else decides what concrete instance to hand it and when. This is sometimes summarized as "don't call us, we'll call you" — the classic Hollywood Principle. The object's own code no longer drives the flow of construction; control has been inverted from the object to the container.</p>
+<p>Dependency Injection (DI) is the specific technique Spring uses to implement IoC: instead of an object looking up or constructing its dependencies, the dependencies are handed ("injected") to it from outside — through a constructor, a setter, or a field. IoC is the principle; DI is one mechanism for achieving it (Service Locator is another, less desirable one, because the object still actively asks a registry for things, which keeps a dependency on the locator itself).</p>
+<div class="callout">
+<div class="callout-title">Why hand control to a container at all?</div>
+<p>Once construction is externalized, you get three things almost for free: (1) you can swap implementations by changing configuration, not code — this is what makes <a href="#/microservice-patterns">profile-specific beans</a> and test doubles trivial; (2) the container can manage cross-cutting concerns (proxying, scoping, lifecycle) uniformly, because it is the single place that owns object creation; (3) dependency graphs become declarative and inspectable — the container can validate the whole graph at startup rather than failing deep into a request at 2am because some manually-wired singleton was never assigned.</p>
+</div>
+
+<h2>2. The IoC Container: BeanFactory vs ApplicationContext</h2>
+<p>Spring's IoC container is the runtime object graph that reads bean definitions (from annotations, XML, or Java <code>@Configuration</code> classes), decides how to instantiate them, resolves their dependencies, and manages their lifecycle from creation to destruction.</p>
+<p>There are two layers to this:</p>
+<ul>
+<li><strong>BeanFactory</strong> — the root interface, the minimal container contract. It supports lazy initialization by default: a bean is only instantiated the first time it's requested via <code>getBean()</code>. It's small and lightweight, but it does not support things like automatic <code>BeanPostProcessor</code> registration, internationalization, or event publishing out of the box.</li>
+<li><strong>ApplicationContext</strong> — a superset of <code>BeanFactory</code> that adds AOP integration, event publication (<code>ApplicationEventPublisher</code>), environment abstraction (profiles, property sources), internationalization, and — critically — <strong>eager initialization of all singleton beans at startup</strong>, not on first use.</li>
+</ul>
+<p>In practice, every Spring Boot application uses an <code>ApplicationContext</code> implementation (typically <code>AnnotationConfigServletWebServerApplicationContext</code> for a web app). The eager-initialization behavior is a deliberate trade-off: it means misconfiguration (a missing bean, a circular dependency, a bad <code>@Value</code> placeholder) fails fast at application startup rather than lazily at 3am when a rarely-used code path first calls <code>getBean()</code> in production. You can opt individual beans out of this with <code>@Lazy</code>, which reverts that one bean to on-first-use semantics — useful for expensive beans that aren't always needed, but it reintroduces the risk of a wiring failure surfacing at request time instead of startup time.</p>
+<div class="callout tip">
+<div class="callout-title">Fail fast is a feature, not a cost</div>
+<p>A team that globally applies <code>@Lazy</code> to speed up startup is trading a loud, obvious, five-second failure at boot for a silent, delayed failure under production traffic. Understanding why <code>ApplicationContext</code> defaults to eager singleton instantiation explains why this is usually a bad trade outside of narrow cases (e.g., breaking a circular dependency, or genuinely optional integrations).</p>
+</div>
+
+<h2>3. Dependency Injection Mechanics: Constructor, Setter, Field</h2>
+<p>Spring supports three injection styles, and they are not equivalent in the guarantees they give you.</p>
+<table>
+<tr><th>Style</th><th>Mechanism</th><th>Guarantees</th><th>Problems</th></tr>
+<tr><td>Constructor injection</td><td>Dependencies passed as constructor parameters</td><td>Fields can be <code>final</code>; object is never in a partially-constructed state; missing dependency fails at object-creation time with a clear exception</td><td>Long constructors are a signal (correctly) that a class has too many responsibilities</td></tr>
+<tr><td>Setter injection</td><td>Dependencies set via public setter methods after construction</td><td>Allows optional dependencies; supports reconfiguration after construction</td><td>Object exists in a valid-looking but incompletely-wired state between construction and the setter calls; fields can't be <code>final</code></td></tr>
+<tr><td>Field injection</td><td><code>@Autowired</code> directly on a field, set via reflection</td><td>Least boilerplate</td><td>Fields can't be <code>final</code>; dependencies are invisible from outside without reflection (can't construct the object manually, e.g. in a plain unit test, without the container); hides circular dependencies (see below)</td></tr>
+</table>
+<p>Constructor injection is preferred, and the reasons compose:</p>
+<ul>
+<li><strong>Immutability.</strong> Constructor-injected fields can be declared <code>final</code>, so once the object exists, its dependencies cannot change — this eliminates a whole class of concurrency bugs where one thread reassigns a field another thread is reading.</li>
+<li><strong>Guaranteed non-null dependencies.</strong> If the constructor requires a <code>PaymentClient</code>, you cannot construct an <code>OrderService</code> without one. With field injection, <code>new OrderService()</code> compiles fine and hands you an object with a null field that only blows up (with a confusing <code>NullPointerException</code>, not a wiring error) the first time it's used.</li>
+<li><strong>Easier testing.</strong> Constructor injection lets you instantiate the class directly in a plain unit test with mocks, no Spring context or reflection tricks required: <code>new OrderService(mockPaymentClient)</code>. Field-injected classes require either a running <code>ApplicationContext</code> or reflection-based mocking frameworks to set private fields.</li>
+<li><strong>Circular dependencies surface immediately instead of being silently "resolved."</strong> This is the subtlest and most important reason.</li>
+</ul>
+
+<h3>3.1 Why field injection hides circular dependencies</h3>
+<p>Suppose <code>ServiceA</code> depends on <code>ServiceB</code> and <code>ServiceB</code> depends on <code>ServiceA</code>. With constructor injection, Spring must fully construct <code>ServiceA</code> (calling its constructor with a ready <code>ServiceB</code>) before it can hand a reference back — but building <code>ServiceB</code> requires a ready <code>ServiceA</code> first. There is no valid order to do this in, so Spring throws <code>BeanCurrentlyInCreationException</code> at startup. This is exactly what you want: a circular dependency is almost always a design smell (two components with a mutual hard dependency should usually be merged, or one direction should be an event/callback instead), and constructor injection forces you to see it and fix it immediately.</p>
+<p>Field injection can "resolve" the exact same cycle without complaint. Spring instantiates <code>ServiceA</code> using its default/no-arg-like construction (fields aren't populated yet), registers the half-built instance in an internal early-reference cache, then while populating <code>ServiceA</code>'s fields it goes to build <code>ServiceB</code>, which needs <code>ServiceA</code> — and gets handed that same half-built instance from the cache. Both objects end up fully wired only after the fact. This works only because field/setter injection allows a bean to exist, be handed out, and be populated after the fact — a constructor-only cycle has no such window. So field injection doesn't fix circular dependencies; it just hides the smell that should have made you redesign the two classes.</p>
+
+<h2>4. The Bean Lifecycle, Step by Step</h2>
+<p>This is the sequence the container runs for every singleton bean during <code>ApplicationContext</code> startup (and, for prototype beans, every time one is requested). Knowing this order precisely is what lets you predict exactly when a proxy gets applied, when a field is guaranteed to be non-null, and what state is safe to assume inside any callback.</p>
+<ol>
+<li><strong>Instantiation.</strong> The container calls a constructor (or a factory method) to create the raw object. Constructor-injected dependencies must already be fully resolved at this point.</li>
+<li><strong>Populating properties.</strong> Setter- and field-injected dependencies are set via reflection/setters. (Constructor dependencies were already set in step 1.)</li>
+<li><strong><code>Aware</code> interfaces.</strong> If the bean implements marker interfaces like <code>BeanNameAware</code>, <code>BeanFactoryAware</code>, or <code>ApplicationContextAware</code>, the container calls their setter methods now (e.g., <code>setBeanName(String name)</code>), giving the bean access to container internals it wouldn't normally have.</li>
+<li><strong><code>BeanPostProcessor.postProcessBeforeInitialization</code>.</strong> Every registered <code>BeanPostProcessor</code> in the context gets a chance to inspect or wrap the bean <em>before</em> init callbacks run. This is where annotation-processing infrastructure (e.g., handling <code>@Value</code>, <code>@Autowired</code> on non-constructor members not already handled, or custom processors) typically runs.</li>
+<li><strong><code>@PostConstruct</code> / <code>InitializingBean.afterPropertiesSet()</code>.</strong> The bean's own initialization logic runs — <code>@PostConstruct</code>-annotated methods first (JSR-250, processed by <code>CommonAnnotationBeanPostProcessor</code>), then <code>afterPropertiesSet()</code> if the bean implements <code>InitializingBean</code>, then a custom <code>init-method</code> if one was declared. At this point all dependencies are guaranteed populated, so this is the correct place to do validation or eager warm-up work that depends on injected collaborators.</li>
+<li><strong><code>BeanPostProcessor.postProcessAfterInitialization</code>.</strong> Every <code>BeanPostProcessor</code> runs again, this time <em>after</em> init callbacks. <strong>This is where AOP proxies get created.</strong> <code>AnnotationAwareAspectJAutoProxyCreator</code> (itself a <code>BeanPostProcessor</code>) inspects the fully-initialized bean, checks whether any aspect's pointcut matches it (including annotation-driven advice like <code>@Transactional</code>/<code>@Cacheable</code>, which are implemented as aspects under the hood), and if so, returns a proxy object instead of the original. Everything downstream — every other bean that gets this bean injected — receives the proxy, not the raw instance.</li>
+<li><strong>The bean is ready for use.</strong> It sits in the singleton cache and is handed out for the remainder of the application's life.</li>
+<li><strong><code>@PreDestroy</code> / <code>DisposableBean.destroy()</code>.</strong> On graceful container shutdown (JVM shutdown hook, or explicit <code>context.close()</code>), destruction callbacks run in roughly the reverse order of creation: <code>@PreDestroy</code> methods, then <code>destroy()</code> if the bean implements <code>DisposableBean</code>, then a custom <code>destroy-method</code>. This is where you release resources — connection pools, thread pools, file handles.</li>
+</ol>
+<pre><code>Instantiate constructor
+  -> populate setter/field deps
+  -> Aware callbacks (BeanNameAware, ApplicationContextAware, ...)
+  -> BeanPostProcessor#postProcessBeforeInitialization  (for every registered BPP)
+  -> @PostConstruct -> InitializingBean#afterPropertiesSet -> custom init-method
+  -> BeanPostProcessor#postProcessAfterInitialization   (AOP proxy wrapping happens here)
+  -> bean is live, handed out from context
+  ... application runs ...
+  -> @PreDestroy -> DisposableBean#destroy -> custom destroy-method (on shutdown)</code></pre>
+<div class="callout warn">
+<div class="callout-title">The self-reference in @PostConstruct is the raw object, not the proxy</div>
+<p>Because proxying happens in <code>postProcessAfterInitialization</code>, which runs <em>after</em> <code>@PostConstruct</code>, any call made from inside <code>@PostConstruct</code> through <code>this</code> to another method on the same bean bypasses whatever AOP advice would otherwise apply — the proxy doesn't exist yet at that point in the lifecycle. If a method needs its own <code>@Transactional</code> or <code>@Cacheable</code> behavior, it must never be invoked via <code>this</code> from inside initialization logic; it needs to go through the proxy (see the self-invocation section below), which by definition isn't available yet during <code>@PostConstruct</code>.</p>
+</div>
+
+<h2>5. Bean Scopes and the Prototype-Into-Singleton Trap</h2>
+<table>
+<tr><th>Scope</th><th>Lifetime</th><th>Typical use</th></tr>
+<tr><td><code>singleton</code> (default)</td><td>One instance per container, created once, reused for the app's lifetime</td><td>Stateless services, repositories, most beans</td></tr>
+<tr><td><code>prototype</code></td><td>New instance every time the bean is requested from the container</td><td>Stateful, non-thread-safe objects — e.g., a builder or a per-use context object</td></tr>
+<tr><td><code>request</code></td><td>One instance per HTTP request (web-aware contexts only)</td><td>Per-request state such as a request-scoped audit trail</td></tr>
+<tr><td><code>session</code></td><td>One instance per HTTP session</td><td>Per-user shopping cart, session-scoped preferences</td></tr>
+</table>
+<p>The trap: a <code>singleton</code> bean is constructed exactly once, and dependency injection into it also happens exactly once. If that singleton has a <code>prototype</code>-scoped field injected the normal way, Spring resolves the dependency at the singleton's own construction time — it asks the container for "a" <code>prototype</code> instance once, injects that one object, and then the singleton holds onto that same instance forever. Every subsequent "new" prototype you thought you were getting is actually the same object from the first resolution. This defeats the entire purpose of declaring the bean <code>prototype</code> in the first place, and it's a purely structural bug: nothing throws an exception, nothing looks wrong in logs, and the code compiles and appears to work — until you notice state bleeding between logically separate uses is really the same object being mutated repeatedly.</p>
+<pre><code>@Component
+@Scope("prototype")
+class ReportBuilder { /* mutable, per-report state */ }
+
+@Service
+class ReportService {
+    private final ReportBuilder builder; // WRONG: resolved once, reused forever
+
+    ReportService(ReportBuilder builder) { this.builder = builder; }
+
+    Report build() {
+        return builder.reset().addSection(...).build(); // same instance every call
+    }
+}</code></pre>
+<p>There are two correct fixes, and they solve the problem by deferring resolution to call time instead of construction time:</p>
+<ul>
+<li><strong>Scoped proxy</strong> — annotate the prototype bean's definition with <code>@Scope(value = "prototype", proxyMode = ScopedProxyMode.TARGET_CLASS)</code>. Spring then injects a proxy into the singleton; every method call on that proxy transparently fetches a fresh prototype instance from the container and delegates to it. The singleton holds a stable proxy reference, but every invocation is backed by a new underlying object.</li>
+<li><strong><code>ObjectProvider&lt;T&gt;</code> (or the older <code>ObjectFactory&lt;T&gt;</code>/<code>Provider&lt;T&gt;</code>)</strong> — inject <code>ObjectProvider&lt;ReportBuilder&gt;</code> into the singleton instead of <code>ReportBuilder</code> directly, and call <code>.getObject()</code> at the point of use. This makes the deferred lookup explicit in code rather than hidden behind a proxy.</li>
+</ul>
+<pre><code>@Service
+class ReportService {
+    private final ObjectProvider&lt;ReportBuilder&gt; builderProvider;
+
+    ReportService(ObjectProvider&lt;ReportBuilder&gt; builderProvider) {
+        this.builderProvider = builderProvider;
+    }
+
+    Report build() {
+        ReportBuilder builder = builderProvider.getObject(); // fresh instance every call
+        return builder.reset().addSection(...).build();
+    }
+}</code></pre>
+<div class="callout">
+<div class="callout-title">Same root cause as request/session scope in non-web contexts</div>
+<p>The identical mismatch shows up if you inject a <code>request</code>-scoped bean into a <code>singleton</code> without a scoped proxy — except there it fails loudly at startup or first use, because there is no active HTTP request thread-bound during singleton construction, and Spring throws <code>BeanCreationException</code> / <code>Scope 'request' is not active</code>. The prototype case is more dangerous precisely because it fails silently instead of throwing.</p>
+</div>
+
+<h2>6. Component Scanning, Stereotypes, and Autowiring Resolution</h2>
+<p><code>@Component</code> is the base stereotype annotation: it marks a class as a candidate for auto-detection when component scanning runs (triggered by <code>@ComponentScan</code>, which <code>@SpringBootApplication</code> includes by default, scanning the package of the main class and everything below it). <code>@Service</code>, <code>@Repository</code>, and <code>@Controller</code>/<code>@RestController</code> are all meta-annotated with <code>@Component</code> — meaning they <em>are</em> components, but with added semantic meaning and, in <code>@Repository</code>'s case, actual behavior: it enables Spring's persistence-exception-translation, converting JDBC/JPA-specific exceptions into Spring's unified <code>DataAccessException</code> hierarchy via a <code>BeanPostProcessor</code> registered by <code>PersistenceExceptionTranslationPostProcessor</code>.</p>
+<p>Once beans are registered, <code>@Autowired</code> resolves dependencies through a specific, deterministic order:</p>
+<ol>
+<li><strong>By type.</strong> Spring looks for a bean matching the declared type (interface or class). If exactly one candidate exists, it's injected — done.</li>
+<li><strong>By qualifier/name, when multiple candidates match by type.</strong> If more than one bean implements the same interface, Spring falls back to matching the field/parameter name (or an explicit <code>@Qualifier("beanName")</code>) against bean names. If a bean is marked <code>@Primary</code>, that one wins regardless of name matching, unless a qualifier explicitly names a different one.</li>
+<li><strong>Failure.</strong> If multiple candidates exist and none is <code>@Primary</code>, none matches by name, and no qualifier disambiguates, the container throws <code>NoUniqueBeanDefinitionException</code> at startup — again, fail-fast rather than an arbitrary silent pick.</li>
+</ol>
+
+<h2>7. AOP: Proxies, Advice Types, and the Self-Invocation Trap</h2>
+<p>Aspect-Oriented Programming lets you attach behavior (logging, transactions, caching, security checks) to methods matched by a pattern (a <em>pointcut</em>), without editing those methods' code. Spring implements this entirely through <strong>runtime proxies</strong> — there is no bytecode weaving into your original class files at compile time (that's what full AspectJ does; Spring AOP is a lighter-weight proxy-based subset).</p>
+<h3>7.1 How the proxy gets chosen</h3>
+<ul>
+<li><strong>JDK dynamic proxies</strong> are used when the target bean implements at least one interface. The proxy is a runtime-generated class implementing the same interface(s), and every call to an interface method is routed through an <code>InvocationHandler</code> that runs the applicable advice and then delegates to the real object.</li>
+<li><strong>CGLIB proxies</strong> (subclass-based) are used when the target class implements no interface. CGLIB generates a runtime subclass of the target class itself, overriding its public/protected methods to insert advice before delegating to <code>super.method()</code>. This is why a class marked <code>final</code>, or a method marked <code>final</code>/<code>private</code>, cannot be proxied by CGLIB — you cannot override a <code>final</code> method or subclass a <code>final</code> class, so advice silently never applies to those methods, with no error raised.</li>
+</ul>
+<h3>7.2 Why self-invocation breaks AOP</h3>
+<p>The proxy sits <em>in front of</em> the real bean, intercepting calls that arrive at the bean from outside. But once you're executing code inside the real bean's own method, and that method calls another method using <code>this.otherMethod()</code> (or just <code>otherMethod()</code>), that call goes directly to the real object's own method table — it never passes back out through the proxy. There is nothing to intercept, because the call never leaves the object.</p>
+<pre><code>@Service
+public class OrderService {
+
+    public void placeOrder(Order order) {
+        // ... business logic ...
+        this.chargeCustomer(order); // calls the REAL object directly, not the proxy
+    }
+
+    @Transactional
+    public void chargeCustomer(Order order) {
+        paymentRepository.save(new Charge(order));
+    }
+}</code></pre>
+<p>If <code>placeOrder</code> is called from outside (say, a controller), that call does go through the proxy. But the proxy's job for <code>placeOrder</code> is just to run whatever advice applies to <em>placeOrder</em> (none, here) and delegate. Once execution is inside the real <code>placeOrder</code> method, the call to <code>chargeCustomer</code> is a plain Java call on <code>this</code>, so the <code>@Transactional</code> advice on <code>chargeCustomer</code> never runs — no transaction is opened, and if <code>chargeCustomer</code> throws partway through a multi-step operation, nothing rolls back, silently. The exact same mechanism explains a <code>@Cacheable</code> method called internally never hitting the cache: the cache-check advice lives on the proxy, and self-invocation never reaches it.</p>
+<div class="callout warn">
+<div class="callout-title">This is not a bug in Spring — it's an inherent limit of proxy-based AOP</div>
+<p>Fixes all work by forcing the call to route back through the proxy: (1) inject the bean into itself (via <code>@Lazy</code> to avoid a construction-time cycle) and call the method on that injected proxy reference instead of <code>this</code>; (2) call <code>AopContext.currentProxy()</code> inside the method (requires <code>exposeProxy = true</code> on <code>@EnableAspectJAutoProxy</code>); or (3), the cleanest, split the two methods into different beans so the call from one to the other is always an inter-bean call that necessarily passes through the second bean's proxy.</p>
+</div>
+
+<h3>7.3 Advice types and pointcuts</h3>
+<table>
+<tr><th>Advice</th><th>Runs</th><th>Can it affect the return value / suppress exceptions?</th></tr>
+<tr><td><code>@Before</code></td><td>Before the target method executes</td><td>Cannot change return value; can throw to prevent the method from running at all</td></tr>
+<tr><td><code>@After</code> (finally)</td><td>After the method completes, whether it returned normally or threw</td><td>No access to return value or exception details</td></tr>
+<tr><td><code>@AfterReturning</code></td><td>After successful normal return</td><td>Can inspect (not replace) the return value; skipped entirely if an exception was thrown</td></tr>
+<tr><td><code>@AfterThrowing</code></td><td>Only if the method threw</td><td>Can inspect the exception; cannot suppress it (the exception still propagates)</td></tr>
+<tr><td><code>@Around</code></td><td>Wraps the entire invocation</td><td>Full control — must explicitly call <code>ProceedingJoinPoint.proceed()</code>, can change arguments, replace the return value, or swallow exceptions</td></tr>
+</table>
+<p>A pointcut expression selects which join points (method executions) the advice applies to, e.g. <code>execution(* com.app.service.*.*(..))</code> matches any method on any class directly in <code>com.app.service</code>. <code>@Transactional</code> and <code>@Cacheable</code> are themselves implemented as pre-packaged aspects with pointcuts matching "any method/class annotated with this annotation" — you rarely write raw pointcut expressions yourself in application code, but understanding that they're aspects under the hood is exactly what explains the self-invocation limitation above.</p>
+
+<h2>8. Spring Boot Auto-Configuration Mechanics</h2>
+<p><code>@SpringBootApplication</code> is not one mechanism — it's a meta-annotation bundling three:</p>
+<ul>
+<li><code>@Configuration</code> — marks the class itself as a source of bean definitions.</li>
+<li><code>@ComponentScan</code> — triggers classpath scanning for <code>@Component</code>-family beans starting at the annotated class's package.</li>
+<li><code>@EnableAutoConfiguration</code> — the piece that makes Boot "boot": it tells Spring to look for auto-configuration classes and conditionally apply them.</li>
+</ul>
+<h3>8.1 How a starter injects configuration without the app mentioning it</h3>
+<p>Historically, Boot discovered auto-configuration classes by reading <code>META-INF/spring.factories</code> from every JAR on the classpath, looking for entries under the key <code>org.springframework.boot.autoconfigure.EnableAutoConfiguration</code>. Modern Boot versions (2.7+) use a simpler dedicated file, <code>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</code>, listing one fully-qualified auto-configuration class per line. Either mechanism achieves the same goal: a third-party dependency (a "starter," e.g. <code>spring-boot-starter-data-redis</code>) ships a file that Boot's classpath scanning at startup reads automatically — the application module never imports or references that configuration class directly. Adding the dependency to the build file is the entire integration step from the application's point of view.</p>
+<h3>8.2 Why auto-configuration doesn't just always register everything</h3>
+<p>If every auto-configuration class unconditionally registered its beans, adding any starter to the classpath would forcibly override beans you'd already defined, and unrelated starters would conflict constantly. Auto-configuration classes are guarded by conditional annotations evaluated once, at context-refresh time, by the <code>SpringBootCondition</code> infrastructure:</p>
+<table>
+<tr><th>Annotation</th><th>Bean registers only if...</th></tr>
+<tr><td><code>@ConditionalOnClass</code></td><td>a specific class is present on the classpath — e.g., a Redis auto-configuration only activates if <code>RedisTemplate</code>'s class is actually on the classpath, meaning the driver dependency was pulled in</td></tr>
+<tr><td><code>@ConditionalOnMissingBean</code></td><td>the application (or an earlier-processed configuration) hasn't already defined a bean of that type — this is what lets you override any auto-configured bean simply by declaring your own <code>@Bean</code> of the same type; yours wins because auto-configuration classes are processed last, after user configuration</td></tr>
+<tr><td><code>@ConditionalOnProperty</code></td><td>a specific property is set (and optionally matches a specific value) in the environment — e.g., <code>spring.datasource.hikari.*</code> auto-configuration only fully applies when a corresponding property namespace is present</td></tr>
+<tr><td><code>@ConditionalOnMissingClass</code></td><td>a class is absent — used to avoid clashing with an alternative implementation</td></tr>
+</table>
+<p>Auto-configuration classes are also ordered relative to each other (via <code>@AutoConfigureAfter</code>/<code>@AutoConfigureBefore</code>) and are always evaluated after the application's own <code>@Configuration</code> classes, which is precisely why <code>@ConditionalOnMissingBean</code> is a reliable override mechanism: by the time Boot gets to deciding whether to register its default <code>DataSource</code>, it can already see whether you defined your own.</p>
+<div class="callout tip">
+<div class="callout-title">This is IoC applied to configuration itself</div>
+<p>Auto-configuration is the same inversion-of-control idea from section 1, one level up: instead of your application code deciding "if Redis is on the classpath, construct a <code>RedisTemplate</code> with these settings," a starter declares the intent conditionally and the container decides, at startup, whether the condition holds. You get to skip writing that wiring entirely for the common case, and you retain full override power for the uncommon one.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does constructor injection turn a circular dependency into a startup failure, while field injection can silently "work"?</summary>
+<div class="qa-body">Constructor injection requires a bean's dependencies to be fully resolved before the constructor runs, because they're passed as arguments. If A needs a ready B and B needs a ready A, there is no valid construction order — Spring detects this and throws <code>BeanCurrentlyInCreationException</code>. Field and setter injection separate "create the object" from "populate its dependencies" into two distinct steps, which opens a window: Spring can create a half-built A, register it in an early-reference cache, then while building B (which needs A) hand back that half-built A reference, and finish populating both objects afterward. The cycle still exists structurally — it's just papered over instead of surfaced, which is exactly why relying on it is a design smell rather than a solution.</div>
+</details>
+
+<details class="concept-qa">
+<summary>At what exact point in the bean lifecycle does an AOP proxy replace the real bean, and what does that imply about @PostConstruct?</summary>
+<div class="qa-body">The proxy is created inside <code>BeanPostProcessor.postProcessAfterInitialization</code>, which is the very last step of initialization — it runs after property population, Aware callbacks, <code>postProcessBeforeInitialization</code>, and <code>@PostConstruct</code>/<code>afterPropertiesSet</code>. This means during <code>@PostConstruct</code>, the object you're operating on (including any call through <code>this</code>) is still the raw, unproxied instance. Any method call made from inside <code>@PostConstruct</code> to another method on the same object will not go through AOP advice — including <code>@Transactional</code> or <code>@Cacheable</code> — because the proxy that would carry that advice doesn't exist yet at that point.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does injecting a prototype-scoped bean directly into a singleton fail to give you "a new instance every time," and what are the two correct fixes?</summary>
+<div class="qa-body">Dependency injection into a singleton happens exactly once, at the singleton's own construction. If the injected field is a plain reference to a prototype bean, Spring resolves that reference once (asking the container for one prototype instance) and the singleton holds that same object for its entire lifetime — every "new" prototype it appears to use is actually the same mutable object being reused. The fix has to defer resolution to the moment of use rather than the moment of construction: either inject a scoped proxy (<code>@Scope(proxyMode = ScopedProxyMode.TARGET_CLASS)</code>), where each method call on the proxy internally fetches a fresh prototype and delegates to it, or inject an <code>ObjectProvider&lt;T&gt;</code> and call <code>.getObject()</code> explicitly at each point of use.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why can't a proxy intercept a method calling another method on `this`?</summary>
+<div class="qa-body">Spring AOP works by wrapping the real bean in a separate proxy object (JDK dynamic proxy or CGLIB subclass) that sits between callers and the real object. External callers get a reference to the proxy, and any call that arrives at the proxy is intercepted, has advice applied, and is then delegated to the real object. But once execution is already running inside a method of the real object, a call like <code>this.otherMethod()</code> is a direct call on the real object's own method table — the JVM has no reason to route it back out through the proxy, because from inside the object, there is no proxy in the call chain at all. The advice only exists on the proxy, so a call that never reaches the proxy never triggers it.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does @ConditionalOnMissingBean reliably let you override an auto-configured bean just by declaring your own @Bean?</summary>
+<div class="qa-body">Boot processes the application's own <code>@Configuration</code> classes before it processes auto-configuration classes (auto-configuration is explicitly ordered to run last, near the end of context refresh). <code>@ConditionalOnMissingBean</code> is evaluated at the point the auto-configuration class is processed, by which point your own bean definition, if you declared one of the same type, already exists in the bean definition registry. The condition sees that a bean of that type is already present and simply skips registering the auto-configured default — no explicit exclusion or override syntax needed, just ordering plus a presence check.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What's the actual difference between a JDK dynamic proxy and a CGLIB proxy, and why does it matter for `final` classes?</summary>
+<div class="qa-body">A JDK dynamic proxy is a class generated at runtime that implements the same interface(s) as the target and routes every interface method call through an <code>InvocationHandler</code>, which runs advice and then delegates to the real object — it requires the target to implement at least one interface, since the proxy's type is defined purely in terms of interfaces. A CGLIB proxy instead generates a runtime subclass of the target's concrete class, overriding methods to insert advice before calling <code>super.method()</code>. Because CGLIB works by subclassing, it cannot proxy a class marked <code>final</code> (you cannot subclass it) or a method marked <code>final</code> or <code>private</code> (you cannot override it) — advice on such methods is silently never applied, with no runtime error, which is why final classes/methods are a quiet trap for anything relying on Spring AOP (transactions, caching, security).</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does Spring's ApplicationContext eagerly instantiate all singletons at startup instead of lazily on first use like a plain BeanFactory?</summary>
+<div class="qa-body">A plain <code>BeanFactory</code> defers bean creation until <code>getBean()</code> is first called, which is simpler and lighter but means a broken bean definition (missing dependency, bad configuration value, circular dependency) only surfaces the first time that code path is actually exercised — potentially long after deployment, under production traffic, on a rarely-hit branch. <code>ApplicationContext</code> eagerly constructs every singleton during context refresh specifically so that these failures happen at startup, in a controlled window, with a clear stack trace tied to application boot rather than to whatever user request happened to trigger the first use. This fail-fast behavior is a deliberate design choice trading slightly slower startup for much safer, more predictable failure timing.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/jvm-architecture'"><div class="rc-title">JVM Architecture</div><div class="rc-sub">Days covering JVM internals · CGLIB subclassing, reflection-based injection, and classloading all sit on top of these JVM mechanics</div></div>
+<div class="related-card" onclick="window.location.hash='/solid-design-patterns'"><div class="rc-title">SOLID &amp; Design Patterns</div><div class="rc-sub">Foundational OOP patterns · Dependency Inversion Principle is the design-level idea that IoC containers implement mechanically</div></div>
+<div class="related-card" onclick="window.location.hash='/jpa-hibernate'"><div class="rc-title">JPA &amp; Hibernate</div><div class="rc-sub">Persistence layer internals · @Repository's exception translation and @Transactional's proxy-based demarcation both build directly on these mechanics</div></div>
+<div class="related-card" onclick="window.location.hash='/microservice-patterns'"><div class="rc-title">Microservice Patterns</div><div class="rc-sub">Service-level architecture · profile-driven and conditional bean wiring is what makes environment-specific service configuration possible</div></div>
+</div>
