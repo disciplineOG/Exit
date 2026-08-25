@@ -236,12 +236,59 @@ kbd {
   letter-spacing: -0.01em;
   border-top: 1px solid var(--border);
   padding-top: 32px;
+  scroll-margin-top: 76px;
 }
 .topic-page h2:first-of-type { border-top: none; padding-top: 0; }
 .topic-page h3 {
   font-size: 18px;
   font-weight: 650;
   margin: 28px 0 12px;
+  scroll-margin-top: 76px;
+}
+
+/* In-page table of contents */
+.page-toc {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 16px;
+  margin: 0 0 28px;
+}
+.page-toc summary {
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  list-style: none;
+  padding: 4px 0;
+}
+.page-toc summary::-webkit-details-marker { display: none; }
+.page-toc summary::before { content: "▸ "; color: var(--accent); }
+.page-toc[open] summary::before { content: "▾ "; }
+.page-toc nav ul {
+  list-style: none;
+  margin: 8px 0 4px;
+  padding: 0;
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+.page-toc nav li { margin-bottom: 4px; }
+.page-toc nav li.toc-sub { padding-left: 16px; font-size: 13px; opacity: 0.85; }
+.page-toc nav a { color: var(--text); }
+.page-toc nav a:hover { color: var(--accent); text-decoration: none; }
+
+@media (min-width: 1300px) {
+  .page-toc {
+    position: fixed;
+    top: 78px;
+    right: max(24px, calc((100vw - 1400px) / 2 + 12px));
+    width: 230px;
+    max-height: calc(100vh - 110px);
+    overflow-y: auto;
+  }
+  .page-toc summary { display: none; }
 }
 .topic-page p { font-size: 16px; line-height: 1.7; color: var(--text); margin: 0 0 16px; }
 .topic-page ul, .topic-page ol { font-size: 16px; line-height: 1.7; padding-left: 22px; margin: 0 0 16px; }

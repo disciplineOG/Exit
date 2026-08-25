@@ -117,6 +117,65 @@
     });
   }
 
+  function slugify(text) {
+    return (
+      text
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/(^-|-$)/g, '') || 'section'
+    );
+  }
+
+  function buildPageToc(articleEl) {
+    const headers = Array.from(articleEl.querySelectorAll('h2, h3'));
+    if (headers.length < 3) return null;
+
+    const used = new Set();
+    const items = headers.map((h) => {
+      let id = slugify(h.textContent);
+      let n = 2;
+      while (used.has(id)) {
+        id = `${slugify(h.textContent)}-${n++}`;
+      }
+      used.add(id);
+      h.id = id;
+      return { id, text: h.textContent, level: h.tagName.toLowerCase() };
+    });
+
+    const toc = document.createElement('details');
+    toc.className = 'page-toc';
+    toc.open = true;
+
+    const summary = document.createElement('summary');
+    summary.textContent = 'On this page';
+    toc.appendChild(summary);
+
+    const nav = document.createElement('nav');
+    const ul = document.createElement('ul');
+    items.forEach((item) => {
+      const li = document.createElement('li');
+      li.className = item.level === 'h3' ? 'toc-sub' : '';
+      const a = document.createElement('a');
+      a.href = '#';
+      a.textContent = item.text;
+      a.dataset.tocTarget = item.id;
+      li.appendChild(a);
+      ul.appendChild(li);
+    });
+    nav.appendChild(ul);
+    toc.appendChild(nav);
+
+    toc.addEventListener('click', (e) => {
+      const link = e.target.closest('a[data-toc-target]');
+      if (!link) return;
+      e.preventDefault();
+      const target = document.getElementById(link.dataset.tocTarget);
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+
+    return toc;
+  }
+
   function setActiveLink(topicId) {
     document.querySelectorAll('.topic-link').forEach((el) => {
       el.classList.toggle('active', el.dataset.topicId === topicId);
@@ -160,6 +219,16 @@
       </div>`;
 
     contentEl.innerHTML = `<article class="topic-page">${html}${footer}</article>`;
+
+    const articleEl = contentEl.querySelector('.topic-page');
+    const toc = buildPageToc(articleEl);
+    if (toc) {
+      const tagsEl = articleEl.querySelector('.topic-tags');
+      const anchor = tagsEl || articleEl.querySelector('h1');
+      if (anchor) anchor.insertAdjacentElement('afterend', toc);
+      else articleEl.insertBefore(toc, articleEl.firstChild);
+    }
+
     window.scrollTo({ top: 0, behavior: 'instant' in window ? 'instant' : 'auto' });
   }
 
