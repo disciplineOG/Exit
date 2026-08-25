@@ -125,6 +125,18 @@
             { "id": "ci-cd-deployment", "track": "Bonus", "title": "CI/CD & Deployment Strategies: Blue-Green, Canary, Feature Flags", "file": "content/ci-cd-deployment.html" },
             { "id": "cloud-fundamentals", "track": "Bonus", "title": "Cloud Fundamentals for Backend Engineers (AWS core services)", "file": "content/cloud-fundamentals.html" }
           ]
+        },
+        {
+          "range": "Extended",
+          "topics": [
+            { "id": "security-hardening-owasp", "track": "Security / Bonus", "title": "Security Hardening: Input Validation, Secrets Management & OWASP Top 10", "file": "content/security-hardening-owasp.html" },
+            { "id": "payment-systems-idempotency", "track": "HLD / Bonus", "title": "Payment Systems & Idempotent Transactions", "file": "content/payment-systems-idempotency.html" },
+            { "id": "jvm-profiling-troubleshooting", "track": "Java / Bonus", "title": "JVM Performance Profiling & Production Troubleshooting", "file": "content/jvm-profiling-troubleshooting.html" },
+            { "id": "grpc-protobuf", "track": "Microservices / Bonus", "title": "gRPC & Protocol Buffers for Service-to-Service Communication", "file": "content/grpc-protobuf.html" },
+            { "id": "search-recommendation-systems", "track": "HLD / Bonus", "title": "Search & Recommendation Systems", "file": "content/search-recommendation-systems.html" },
+            { "id": "batch-processing-scheduled-jobs", "track": "Spring / Bonus", "title": "Batch Processing & Scheduled Jobs", "file": "content/batch-processing-scheduled-jobs.html" },
+            { "id": "data-privacy-compliance", "track": "Bonus", "title": "Data Privacy & Compliance: GDPR & PCI-DSS", "file": "content/data-privacy-compliance.html" }
+          ]
         }
       ]
     }
