@@ -4,6 +4,7 @@
 <span class="tag">Streams Pipeline</span>
 <span class="tag">Laziness</span>
 <span class="tag">Spliterator</span>
+<span class="tag">flatMap</span>
 <span class="tag">Functional Interfaces</span>
 <span class="tag">Collectors</span>
 <span class="tag">Parallel Streams</span>
@@ -16,17 +17,17 @@
 </div>
 
 <h2>1. From Imperative Loops to Declarative Pipelines</h2>
-<p>Traditional Java iteration describes <em>how</em> to compute a result: you declare a mutable accumulator, write a loop construct, and mutate state on each pass.</p>
-<pre><code>List&lt;String&gt; names = new ArrayList&lt;&gt;();
-for (Employee e : employees) {
-    if (e.getSalary() &gt; 100000) {
-        names.add(e.getName().toUpperCase());
+<p>Traditional Java iteration describes <em>how</em> to compute a result: you declare a mutable accumulator, write a loop construct, and mutate state on each pass. Suppose ShopSphere needs the uppercased names of every customer whose lifetime order total exceeds $10,000, for a VIP mailing list:</p>
+<pre><code>List&lt;String&gt; vipNames = new ArrayList&lt;&gt;();
+for (Customer c : customers) {
+    if (c.getLifetimeOrderTotal() &gt; 10_000) {
+        vipNames.add(c.getName().toUpperCase());
     }
 }</code></pre>
 <p>The Streams API, introduced in Java 8 alongside lambdas, lets you describe <em>what</em> result you want as a composition of transformations, and leaves the iteration mechanics to the library:</p>
-<pre><code>List&lt;String&gt; names = employees.stream()
-    .filter(e -&gt; e.getSalary() &gt; 100000)
-    .map(e -&gt; e.getName().toUpperCase())
+<pre><code>List&lt;String&gt; vipNames = customers.stream()
+    .filter(c -&gt; c.getLifetimeOrderTotal() &gt; 10_000)
+    .map(c -&gt; c.getName().toUpperCase())
     .collect(Collectors.toList());</code></pre>
 <p>This isn't just syntactic sugar. Declarative pipelines are easier to reason about compositionally (each stage has a single, nameable responsibility), they're trivially parallelizable by swapping <code>stream()</code> for <code>parallelStream()</code> without rewriting the loop body, and — as covered below — the library can apply optimizations (short-circuiting, operation fusion) that a hand-written loop would need to encode manually. The cost is a layer of indirection: understanding <em>when</em> code actually executes requires understanding the pipeline's execution model, which is the core of this page.</p>
 
@@ -37,6 +38,37 @@ for (Employee e : employees) {
 <li><strong>Zero or more intermediate operations</strong> — <code>filter</code>, <code>map</code>, <code>flatMap</code>, <code>sorted</code>, <code>distinct</code>, <code>peek</code>, <code>limit</code>, <code>skip</code>. Each returns a new <code>Stream</code>, which is what enables the fluent chaining syntax.</li>
 <li><strong>Exactly one terminal operation</strong> — <code>collect</code>, <code>forEach</code>, <code>reduce</code>, <code>count</code>, <code>findFirst</code>, <code>anyMatch</code>, <code>toArray</code>, etc. This is what actually triggers execution and produces a non-stream result (or a side effect).</li>
 </ul>
+
+<h3>flatMap: one-to-many mapping, not one-to-one</h3>
+<p><code>map()</code> is a strict one-to-one transformation: each input element produces exactly one output element, so <code>Stream&lt;A&gt;.map(A -&gt; B)</code> always yields a <code>Stream&lt;B&gt;</code> of the same length as the source. That shape is wrong whenever the natural transformation of one element is itself a <em>collection</em> of things, rather than a single thing. Suppose ShopSphere needs a flat list of every <code>OrderItem</code> across a customer's entire order history — not a list of orders, and not a list-of-lists of items, but one flat stream of items ready to sum or group. Reaching for <code>map()</code> here produces a nested, unusable shape:</p>
+<pre><code>// map(): one Order -> one List&lt;OrderItem&gt;, so you get Stream&lt;List&lt;OrderItem&gt;&gt; — a stream of lists, not of items
+Stream&lt;List&lt;OrderItem&gt;&gt; nested = customer.getOrders().stream()
+    .map(Order::getItems);
+// You'd now need a second nested loop just to get at the actual OrderItems.</code></pre>
+<p><code>flatMap()</code> solves exactly this: it takes a function that maps each element to a <em>stream</em> (not a plain value), and then splices all of those inner streams together, in order, into a single flat output stream — discarding the per-element grouping entirely. Conceptually, <code>flatMap</code> is "map, then flatten the stream of streams into one stream," fused into a single intermediate operation rather than done as two separate passes:</p>
+<pre><code>List&lt;OrderItem&gt; allItems = customer.getOrders().stream()
+    .flatMap(order -&gt; order.getItems().stream())   // Order -> Stream&lt;OrderItem&gt;, then flattened
+    .collect(Collectors.toList());
+// allItems is one flat List&lt;OrderItem&gt; across every order — no nesting.
+
+// A second example: every Product across every Seller in a marketplace, as one flat stream —
+// useful for building a catalog-wide search index across all sellers at once.
+List&lt;Product&gt; allProducts = sellers.stream()
+    .flatMap(seller -&gt; seller.getProducts().stream())  // Seller -> Stream&lt;Product&gt;, flattened
+    .collect(Collectors.toList());
+
+// This composes naturally with filter/map after the flatten, since you're now working
+// with the flat element type (OrderItem), not the outer type (Order):
+double totalSpentOnElectronics = customer.getOrders().stream()
+    .flatMap(order -&gt; order.getItems().stream())
+    .filter(item -&gt; item.getCategory() == Category.ELECTRONICS)
+    .mapToDouble(item -&gt; item.getUnitPriceAtPurchase() * item.getQuantity())
+    .sum();</code></pre>
+<p>Mechanically, <code>flatMap</code>'s mapper function returns a <code>Stream&lt;R&gt;</code> per source element; the pipeline consumes each of those inner streams completely (pulling every element out of it) before moving to the next source element, then closes it. This is still vertical execution (Section 4) at the level of the outer stream — no intermediate <code>List&lt;List&lt;OrderItem&gt;&gt;</code> is ever materialized — but each inner stream is itself fully drained, so <code>flatMap</code> over infinite inner streams (rare, but possible with something like <code>Stream.generate</code>) can hang the same way a stateful operation over an infinite source can. The primitive-stream equivalents (<code>flatMapToInt</code>, <code>flatMapToDouble</code>, etc.) exist for the same autoboxing-avoidance reason the primitive functional interfaces do (Section 5).</p>
+<div class="callout">
+<div class="callout-title">map vs flatMap, side by side</div>
+<p><code>map(Function&lt;T,R&gt;)</code>: one element in, one element out — shape-preserving. <code>flatMap(Function&lt;T, Stream&lt;R&gt;&gt;)</code>: one element in, zero-to-many elements out — shape-flattening. A useful rule of thumb: if the lambda you want to pass to <code>map</code> would itself need to return something you'd then have to <code>.stream()</code> or loop over to use, that's the signal you actually need <code>flatMap</code> instead. This is exactly the same distinction <code>Optional.flatMap</code> makes relative to <code>Optional.map</code> (Section 9) — avoiding a nested <code>Optional&lt;Optional&lt;T&gt;&gt;</code> the same way stream <code>flatMap</code> avoids a nested <code>Stream&lt;Stream&lt;T&gt;&gt;</code>.</p>
+</div>
 
 <h3>Intermediate operations are lazy</h3>
 <p>Calling <code>.filter()</code> or <code>.map()</code> does not touch a single element of the source. It only records the operation — building up a description of the pipeline — and returns a new <code>Stream</code> wrapper. Nothing executes until a terminal operation is invoked. You can prove this:</p>
@@ -50,13 +82,22 @@ s.forEach(x -&gt; {}); // NOW "saw 1", "saw 2", "saw 3" print</code></pre>
 
 <div class="callout">
 <div class="callout-title">Stateless vs. stateful intermediate operations</div>
-<p><code>filter</code>, <code>map</code>, and <code>peek</code> are stateless — each output element depends only on the corresponding input element, so they can be applied one element at a time as it flows through. <code>sorted</code>, <code>distinct</code>, and <code>limit</code>/<code>skip</code> (on unordered parallel sources) are stateful — they need to see multiple (sometimes all) elements before producing output, which forces a partial "barrier" in the pipeline. A stream with a <code>sorted()</code> stage effectively needs to buffer the entire source in memory before it can start sorting, and consuming from an infinite stream (<code>Stream.iterate</code>) through a <code>sorted()</code> stage will hang forever.</p>
+<p><code>filter</code>, <code>map</code>, and <code>peek</code> are stateless — each output element depends only on the corresponding input element, so they can be applied one element at a time as it flows through. <code>sorted</code>, <code>distinct</code>, and <code>limit</code>/<code>skip</code> (on unordered parallel sources) are stateful — they need to see multiple (sometimes all) elements before producing output, which forces a partial "barrier" in the pipeline. A stream with a <code>sorted()</code> stage effectively needs to buffer the entire source in memory before it can start sorting, and consuming from an infinite stream (<code>Stream.iterate</code>, which repeatedly applies a function to generate the next element forever unless bounded by <code>limit()</code>) through a <code>sorted()</code> stage will hang forever.</p>
 </div>
+
+<h3>Other core intermediate/terminal operations, named but worth defining precisely</h3>
+<ul>
+<li><strong><code>distinct()</code></strong> — removes duplicate elements, using each element's <code>equals()</code> (and, mechanically, <code>hashCode()</code> to bucket candidates first, exactly like the <a href="#/collections-internals">HashMap/HashSet mechanics</a> it's built on) to decide what counts as "the same." For a stream of <code>Order</code> objects, <code>orders.stream().distinct()</code> only collapses duplicates if <code>Order</code> has a correct <code>equals()</code>/<code>hashCode()</code> override — otherwise every object is "distinct" by identity, and the call is silently a no-op.</li>
+<li><strong><code>sorted()</code> / <code>sorted(Comparator)</code></strong> — the no-arg overload requires elements to implement <code>Comparable</code> (natural ordering); the <code>Comparator</code> overload lets you supply an explicit ordering, commonly built via <code>Comparator.comparingDouble(Product::price)</code> (extracts a <code>double</code> key to compare by) chained with <code>.reversed()</code> (flips ascending to descending) or <code>.thenComparing(...)</code> (breaks ties with a secondary key). This is the stateful, buffer-everything operation described above.</li>
+<li><strong><code>peek(Consumer)</code></strong> — runs a side-effecting action on each element as it passes through, without transforming it (input and output are identical) — its only legitimate use is debugging/logging a pipeline mid-flight (as in the laziness proof below), never mutating shared state, because whether and how many times <code>peek</code> actually runs for a given element is not guaranteed once short-circuiting or certain optimizations are involved.</li>
+<li><strong><code>reduce(...)</code></strong> — the general-purpose terminal fold: repeatedly combines a running accumulated value with the next stream element using a <code>BinaryOperator&lt;T&gt;</code>, until one final value remains. The single-argument form <code>reduce(BinaryOperator&lt;T&gt;)</code> has no starting value, so an empty stream has nothing to return and the method yields <code>Optional&lt;T&gt;</code> to represent that; the two-argument form <code>reduce(identity, BinaryOperator&lt;T&gt;)</code> supplies a starting value (e.g. <code>0</code> for a sum), which guarantees a result exists even for an empty stream, so it returns a plain <code>T</code>, not an <code>Optional</code>. For example, <code>customer.getOrders().stream().map(Order::getTotalAmount).reduce(0.0, Double::sum)</code> totals a customer's lifetime spend; <code>collect()</code> with a <code>Collector</code> (Section 6) is the more general, more efficient tool for building a mutable result (a <code>List</code>, a <code>Map</code>) because <code>reduce</code>'s functional, immutable-combination style forces allocating a new intermediate result on every step when the accumulated type isn't a cheap primitive.</li>
+<li><strong><code>boxed()</code></strong> — converts a primitive stream (<code>IntStream</code>, <code>LongStream</code>, <code>DoubleStream</code>) into the corresponding boxed <code>Stream&lt;Integer&gt;</code>/<code>Stream&lt;Long&gt;</code>/<code>Stream&lt;Double&gt;</code>. Primitive streams exist specifically to avoid autoboxing overhead (Section 5) through arithmetic-heavy stages, but generic stream APIs like <code>Collectors.toList()</code> or a <code>Function&lt;T,R&gt;</code>-based operation need reference types — <code>boxed()</code> is the deliberate, explicit point where you pay the boxing cost once you actually need object semantics.</li>
+</ul>
 
 <h2>3. Laziness Enables Short-Circuiting</h2>
 <p>Short-circuiting operations are ones that can produce a result without consuming the entire stream: <code>findFirst()</code>, <code>findAny()</code>, <code>anyMatch()</code>, <code>allMatch()</code>, <code>noneMatch()</code>, and the intermediate operation <code>limit(n)</code>. Because the pipeline hasn't run anything yet by the time these are set up, the runtime is free to pull elements from the source lazily, one at a time, and stop as soon as the short-circuit condition is satisfied.</p>
-<pre><code>Optional&lt;Integer&gt; firstEven = IntStream.rangeClosed(1, 1_000_000)
-    .boxed()
+<pre><code>Optional&lt;Integer&gt; firstEvenOrderId = IntStream.rangeClosed(1, 1_000_000)
+    .boxed()   // IntStream -> Stream&lt;Integer&gt;; IntStream itself would return an OptionalInt, not Optional&lt;Integer&gt;
     .filter(n -&gt; n % 2 == 0)
     .findFirst();
 // Only ever evaluates n = 1, then n = 2 — stops immediately, does NOT
@@ -83,22 +124,22 @@ s.forEach(x -&gt; {}); // NOW "saw 1", "saw 2", "saw 3" print</code></pre>
 <p>Streams are only possible because Java 8 added lambda expressions and, to type them, a family of standard <strong>functional interfaces</strong> in <code>java.util.function</code> — interfaces with exactly one abstract method (a "SAM," Single Abstract Method), optionally marked with <code>@FunctionalInterface</code> so the compiler enforces the constraint.</p>
 <table>
 <tr><th>Interface</th><th>Abstract method</th><th>Shape</th><th>Typical use</th></tr>
-<tr><td><code>Function&lt;T,R&gt;</code></td><td><code>R apply(T t)</code></td><td>T → R</td><td><code>.map(e -&gt; e.getName())</code></td></tr>
+<tr><td><code>Function&lt;T,R&gt;</code></td><td><code>R apply(T t)</code></td><td>T → R</td><td><code>.map(order -&gt; order.getCustomerId())</code></td></tr>
 <tr><td><code>BiFunction&lt;T,U,R&gt;</code></td><td><code>R apply(T t, U u)</code></td><td>(T,U) → R</td><td><code>Map.merge</code>, custom reduce combiners</td></tr>
-<tr><td><code>Predicate&lt;T&gt;</code></td><td><code>boolean test(T t)</code></td><td>T → boolean</td><td><code>.filter(e -&gt; e.isActive())</code></td></tr>
+<tr><td><code>Predicate&lt;T&gt;</code></td><td><code>boolean test(T t)</code></td><td>T → boolean</td><td><code>.filter(order -&gt; order.getStatus() == OrderStatus.DELIVERED)</code></td></tr>
 <tr><td><code>Supplier&lt;T&gt;</code></td><td><code>T get()</code></td><td>() → T</td><td>lazy defaults, <code>Collector</code> supplier</td></tr>
 <tr><td><code>Consumer&lt;T&gt;</code></td><td><code>void accept(T t)</code></td><td>T → void</td><td><code>.forEach(System.out::println)</code></td></tr>
-<tr><td><code>UnaryOperator&lt;T&gt;</code></td><td><code>T apply(T t)</code></td><td>T → T (specializes Function)</td><td><code>list.replaceAll(String::trim)</code></td></tr>
+<tr><td><code>UnaryOperator&lt;T&gt;</code></td><td><code>T apply(T t)</code></td><td>T → T (specializes Function)</td><td><code>orderIds.replaceAll(String::trim)</code></td></tr>
 </table>
 <p>There are also primitive specializations (<code>IntPredicate</code>, <code>ToIntFunction&lt;T&gt;</code>, <code>IntUnaryOperator</code>, etc.) whose entire purpose is avoiding autoboxing on hot paths — <code>IntStream.map(IntUnaryOperator)</code> never boxes an <code>int</code> to <code>Integer</code>, while a generic <code>Stream&lt;Integer&gt;.map(Function&lt;Integer,Integer&gt;)</code> would.</p>
 
 <h3>How a lambda becomes bytecode</h3>
-<p>A lambda expression like <code>e -&gt; e.getSalary() &gt; 100000</code> is <em>not</em> compiled into an anonymous inner class the way pre-Java-8 code emulated closures. Instead, javac emits:</p>
+<p>A lambda expression like <code>order -&gt; order.getTotalAmount() &gt; 500</code> is <em>not</em> compiled into an anonymous inner class the way pre-Java-8 code emulated closures. Instead, javac emits:</p>
 <ul>
-<li>The lambda body as a private synthetic method on the enclosing class (e.g. <code>lambda$filterHighEarners$0</code>).</li>
+<li>The lambda body as a private synthetic method on the enclosing class (e.g. <code>lambda$filterHighValueOrders$0</code>).</li>
 <li>An <code>invokedynamic</code> instruction at the call site, whose bootstrap method is <code>LambdaMetafactory.metafactory</code>.</li>
 </ul>
-<p>At first invocation, the JVM calls that bootstrap method, which generates — at runtime, via <code>ASM</code>-style bytecode spinning, not reflection — a small class implementing the target functional interface (here, <code>Predicate</code>) whose single method body just calls the synthetic lambda method. That generated class is cached as a <code>CallSite</code>, so subsequent invocations at the same call site skip regeneration. This is why lambdas have near-zero allocation overhead after warm-up and why they are meaningfully cheaper than the anonymous-class idiom they replaced, which always allocated a genuine class file loaded at compile time and a new instance (with captured-variable fields) on every evaluation. Method references (<code>String::trim</code>, <code>Employee::getSalary</code>) go through the exact same <code>invokedynamic</code>/<code>LambdaMetafactory</code> path — they're not a distinct mechanism, just different syntax describing which method the generated implementation should delegate to. See <a href="#/jvm-architecture">jvm-architecture</a> for how <code>invokedynamic</code> and call-site linking work more generally.</p>
+<p>At first invocation, the JVM calls that bootstrap method, which generates — at runtime, via <code>ASM</code>-style bytecode spinning (writing raw <code>.class</code> bytes directly into memory and loading them on the fly, the same low-level technique the ASM library popularized, rather than compiling source or using reflection) — a small class implementing the target functional interface (here, <code>Predicate</code>) whose single method body just calls the synthetic lambda method. That generated class is cached as a <code>CallSite</code> — a JVM object that holds the resolved target of an <code>invokedynamic</code> instruction, so the linkage only has to happen once — so subsequent invocations at the same call site skip regeneration. This is why lambdas have near-zero allocation overhead after warm-up and why they are meaningfully cheaper than the anonymous-class idiom they replaced, which always allocated a genuine class file loaded at compile time and a new instance (with captured-variable fields) on every evaluation. Method references (<code>String::trim</code>, <code>Order::getTotalAmount</code>) go through the exact same <code>invokedynamic</code>/<code>LambdaMetafactory</code> path — they're not a distinct mechanism, just different syntax describing which method the generated implementation should delegate to. See <a href="#/jvm-architecture">jvm-architecture</a> for how <code>invokedynamic</code> and call-site linking work more generally.</p>
 
 <h2>6. Collectors: Reshaping Stream Output</h2>
 <p><code>collect()</code> is a terminal operation parameterized by a <code>Collector</code>, which describes <em>how</em> to accumulate stream elements into a result container. <code>java.util.stream.Collectors</code> provides factories for the common cases:</p>
@@ -115,7 +156,7 @@ s.forEach(x -&gt; {}); // NOW "saw 1", "saw 2", "saw 3" print</code></pre>
 
 <div class="callout warn">
 <div class="callout-title">toMap and duplicate keys</div>
-<p><code>employees.stream().collect(Collectors.toMap(Employee::getDepartment, Function.identity()))</code> throws at runtime the moment two employees share a department — the two-argument form has no way to resolve the collision. This is a common source of production incidents that only manifest once real data has a duplicate that test fixtures didn't. The fix is always to decide the merge policy explicitly: <code>toMap(Employee::getDepartment, Function.identity(), (first, second) -&gt; second)</code> to keep the last one, or route through <code>groupingBy</code> if you actually want all of them.</p>
+<p><code>orders.stream().collect(Collectors.toMap(Order::getCustomerId, Function.identity()))</code> throws at runtime the moment two orders share a customer ID — the two-argument form has no way to resolve the collision, and in ShopSphere any customer with more than one order will trigger this immediately. This is a common source of production incidents that only manifest once real data has a duplicate that test fixtures didn't. The fix is always to decide the merge policy explicitly: <code>toMap(Order::getCustomerId, Function.identity(), (first, second) -&gt; second)</code> to keep the last one, or route through <code>groupingBy</code> if you actually want all of a customer's orders rather than just one.</p>
 </div>
 
 <h3>Writing a custom Collector</h3>
@@ -140,43 +181,43 @@ s.forEach(x -&gt; {}); // NOW "saw 1", "saw 2", "saw 3" print</code></pre>
 );</code></pre>
 
 <h2>7. A Worked Example Combining groupingBy, Downstream Collectors, and toMap Collisions</h2>
-<p>Consider a payroll dataset where you need: for each department, the two highest earners' names joined into a single string, but only for departments where at least one employee earns above 100000 — and separately, a lookup from employee ID to name that must fail loudly on duplicate IDs (a data integrity bug) rather than silently dropping one.</p>
-<pre><code>record Employee(String id, String name, String department, double salary) {}
+<p>Consider a seller-analytics dashboard where you need: for each product category, the two priciest products' names joined into a single string, but only for categories where at least one product is priced above $500 — and separately, a lookup from product ID to name that must fail loudly on duplicate IDs (a data integrity bug, since product IDs are supposed to be unique) rather than silently dropping one. The code below uses <code>Collectors.collectingAndThen(downstream, finisher)</code>, which is not in the table above but follows the same shape as a custom <code>Collector</code>'s <code>finisher()</code> (Section 6): it runs a normal downstream collector to completion and then pipes its result through one more transformation function before handing it back — useful whenever the collector you want isn't quite what a stock factory produces, but is one extra step away from one that is.</p>
+<pre><code>record Product(String id, String name, String category, double price) {}
 
-List&lt;Employee&gt; staff = List.of(
-    new Employee("E1", "Asha",  "Engineering", 145000),
-    new Employee("E2", "Ravi",  "Engineering", 132000),
-    new Employee("E3", "Meera", "Engineering",  98000),
-    new Employee("E4", "Jon",   "Sales",        88000),
-    new Employee("E5", "Priya", "Sales",        91000),
-    new Employee("E6", "Sam",   "Support",      76000)
+List&lt;Product&gt; catalog = List.of(
+    new Product("P1", "4K OLED TV",              "Electronics", 1450.00),
+    new Product("P2", "Noise-Cancel Headphones",  "Electronics",  320.00),
+    new Product("P3", "USB-C Cable",              "Electronics",   12.00),
+    new Product("P4", "Standing Desk",            "Furniture",    380.00),
+    new Product("P5", "Ergonomic Chair",          "Furniture",    410.00),
+    new Product("P6", "Desk Lamp",                "Furniture",     45.00)
 );
 
-// Step 1: group by department, downstream-collect into "top 2 names, comma joined",
-// but only keep departments that clear the 100000 threshold for at least one member.
-Map&lt;String, String&gt; topEarnersByDept = staff.stream()
+// Step 1: group by category, downstream-collect into "top 2 priciest names, comma joined",
+// but only keep categories that clear the $500 threshold for at least one product.
+Map&lt;String, String&gt; topProductsByCategory = catalog.stream()
     .collect(Collectors.groupingBy(
-        Employee::department,
+        Product::category,
         Collectors.collectingAndThen(
             Collectors.toList(),
             list -&gt; list.stream()
-                .sorted(Comparator.comparingDouble(Employee::salary).reversed())
+                .sorted(Comparator.comparingDouble(Product::price).reversed())
                 .limit(2)
-                .map(Employee::name)
+                .map(Product::name)
                 .collect(Collectors.joining(", "))
         )
     )).entrySet().stream()
-    .filter(entryDept -&gt; staff.stream()
-        .filter(e -&gt; e.department().equals(entryDept.getKey()))
-        .anyMatch(e -&gt; e.salary() &gt; 100000))
+    .filter(entryCategory -&gt; catalog.stream()
+        .filter(p -&gt; p.category().equals(entryCategory.getKey()))
+        .anyMatch(p -&gt; p.price() &gt; 500))
     .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
-// -> {"Engineering" = "Asha, Ravi"}   (Sales and Support excluded: no one over 100000)
+// -> {"Electronics" = "4K OLED TV, Noise-Cancel Headphones"}   (Furniture excluded: nothing over $500)
 
 // Step 2: id -> name lookup that must throw on a duplicate id instead of merging.
-Map&lt;String, String&gt; idToName = staff.stream()
-    .collect(Collectors.toMap(Employee::id, Employee::name)); // no merge fn: throws on dup id
+Map&lt;String, String&gt; idToName = catalog.stream()
+    .collect(Collectors.toMap(Product::id, Product::name)); // no merge fn: throws on dup id
 </code></pre>
-<p>This example exercises several mechanics at once worth tracing through deliberately: <code>groupingBy</code>'s classifier builds the buckets; the downstream <code>collectingAndThen</code> wraps <code>toList()</code> with a finishing transform, showing that downstream collectors compose (you can post-process whatever a nested collector produces); the inner <code>sorted().limit(2)</code> is a stateful-then-short-circuiting mini-pipeline running per bucket, not over the whole dataset; and the second block demonstrates why the two-argument <code>toMap</code> is a deliberate fail-fast choice, not an oversight — for an ID field, silently picking a winner on collision would hide a bug, whereas for the department example above a `reversed()` earner ranking is exactly the point.</p>
+<p>This example exercises several mechanics at once worth tracing through deliberately: <code>groupingBy</code>'s classifier builds the buckets; the downstream <code>collectingAndThen</code> wraps <code>toList()</code> with a finishing transform, showing that downstream collectors compose (you can post-process whatever a nested collector produces); the inner <code>sorted().limit(2)</code> is a stateful-then-short-circuiting mini-pipeline running per bucket, not over the whole dataset; and the second block demonstrates why the two-argument <code>toMap</code> is a deliberate fail-fast choice, not an oversight — for a product ID field, silently picking a winner on collision would hide a bug, whereas for the category example above a <code>reversed()</code> price ranking is exactly the point.</p>
 
 <h2>8. Parallel Streams</h2>
 <p>Calling <code>.parallelStream()</code> (or <code>.parallel()</code> on an existing stream) does not change the pipeline's operations — it changes how the source <code>Spliterator</code> is traversed. Instead of one thread calling <code>tryAdvance</code> repeatedly, the runtime recursively calls <code>trySplit()</code> on the spliterator to divide the source into smaller and smaller sub-ranges (conceptually similar to a fork/join divide-and-conquer), until chunks are small enough (governed by a target size heuristic) to process sequentially, at which point each chunk is submitted as a task.</p>
@@ -200,12 +241,12 @@ Map&lt;String, String&gt; idToName = staff.stream()
 
 <h2>9. Optional: Intended Use and Anti-Patterns</h2>
 <p><code>Optional&lt;T&gt;</code> was added specifically as a return-type container to make the possibility of "no value" visible in a method's signature, forcing callers to explicitly handle absence rather than silently risking a <code>NullPointerException</code> three call frames away from where the null actually originated. It composes naturally with streams: <code>findFirst()</code>, <code>findAny()</code>, <code>reduce()</code> without an identity, and <code>min()</code>/<code>max()</code> all return <code>Optional</code> precisely because "the stream was empty" is a real, expected outcome that the type system should surface.</p>
-<pre><code>Optional&lt;Employee&gt; topEarner = staff.stream()
-    .max(Comparator.comparingDouble(Employee::salary));
+<pre><code>Optional&lt;Product&gt; priciestProduct = catalog.stream()
+    .max(Comparator.comparingDouble(Product::price));
 
-String name = topEarner
-    .map(Employee::name)
-    .orElse("No employees");   // forces handling of the empty case at the call site</code></pre>
+String name = priciestProduct
+    .map(Product::name)
+    .orElse("No products in catalog");   // forces handling of the empty case at the call site</code></pre>
 
 <div class="callout warn">
 <div class="callout-title">Anti-patterns that defeat the purpose</div>
@@ -229,28 +270,33 @@ String name = topEarner
 </details>
 
 <details class="concept-qa">
+<summary>Why does flatMap need its mapper function to return a Stream, rather than just a List or a Collection?</summary>
+<div class="qa-body"><code>flatMap</code> is defined generically over anything that can be traversed lazily, one element at a time, because that's the shape the rest of the pipeline machinery (Sinks, Section 4) already understands — a <code>Stream</code> is exactly that, so requiring a <code>Stream</code> return type lets <code>flatMap</code> reuse the same vertical-execution machinery for the inner streams instead of inventing a second traversal protocol. In practice, this is rarely friction, because every <code>Collection</code> already exposes a zero-cost <code>.stream()</code> method: <code>order -&gt; order.getItems().stream()</code> is the standard idiom for turning a <code>List&lt;OrderItem&gt;</code> field into the <code>Stream&lt;OrderItem&gt;</code> <code>flatMap</code> expects. If your source data is already <code>Optional</code>-shaped rather than collection-shaped, <code>Optional</code> has its own, separately-defined <code>flatMap</code> (Section 9) that expects a function returning <code>Optional</code>, not <code>Stream</code> — the two <code>flatMap</code>s share a name and a flattening idea but are different methods on different types.</div>
+</details>
+
+<details class="concept-qa">
 <summary>Why does adding more intermediate operations to a stream pipeline not multiply its runtime the way adding more sequential loops would?</summary>
-<div class="qa-body">Because of vertical fusion (Section 4): the whole chain of intermediate operations is compiled into one chain of nested Sink objects, and the source spliterator is traversed exactly once, pushing each element through every stage before the next element is pulled. There is no per-stage intermediate collection and no per-stage full pass. The cost of an extra <code>.filter()</code> is one extra predicate check per element within the single pass, not an extra O(n) traversal. This is fundamentally different from writing `list = list.stream().filter(...).collect(toList())` repeatedly in separate statements, which does create a new list and a new pass at each step.</div>
+<div class="qa-body">Because of vertical fusion (Section 4): the whole chain of intermediate operations is compiled into one chain of nested Sink objects, and the source spliterator is traversed exactly once, pushing each element through every stage before the next element is pulled. There is no per-stage intermediate collection and no per-stage full pass. The cost of an extra <code>.filter()</code> is one extra predicate check per element within the single pass, not an extra O(n) traversal. This is fundamentally different from writing <code>list = list.stream().filter(...).collect(toList())</code> repeatedly in separate statements, which does create a new list and a new pass at each step.</div>
 </details>
 
 <details class="concept-qa">
 <summary>What is the practical difference between groupingBy and partitioningBy, beyond one taking a Predicate?</summary>
-<div class="qa-body"><code>partitioningBy</code> always produces a <code>Map</code> with exactly two keys, `Boolean.TRUE` and `Boolean.FALSE`, even if every element falls into one bucket — the other key is still present, mapped to an empty (or downstream-collector-default) result. <code>groupingBy</code> with an arbitrary classifier only creates keys for values it actually observed; a department with zero employees never appears in the result map at all. This matters when code downstream assumes a key exists: iterating `partitioningBy` results is safe to do unconditionally for both keys, while `groupingBy` results require a `getOrDefault` or an explicit containsKey check for keys you expect but might not appear.</div>
+<div class="qa-body"><code>partitioningBy</code> always produces a <code>Map</code> with exactly two keys, <code>Boolean.TRUE</code> and <code>Boolean.FALSE</code>, even if every element falls into one bucket — the other key is still present, mapped to an empty (or downstream-collector-default) result. <code>groupingBy</code> with an arbitrary classifier only creates keys for values it actually observed; a product category with zero products in the current catalog snapshot never appears in the result map at all. This matters when code downstream assumes a key exists: iterating <code>partitioningBy</code> results is safe to do unconditionally for both keys, while <code>groupingBy</code> results require a <code>getOrDefault</code> or an explicit containsKey check for keys you expect but might not appear.</div>
 </details>
 
 <details class="concept-qa">
 <summary>Why is the ForkJoinPool.commonPool() a shared liability across a whole JVM process rather than a per-call resource?</summary>
-<div class="qa-body">The common pool is a static, lazily-initialized singleton owned by the <code>ForkJoinPool</code> class itself, sized once at JVM startup based on available processors, and reused by every caller in the process that doesn't explicitly supply its own executor. Parallel streams, `CompletableFuture`'s async variants without an explicit `Executor` argument, and any third-party library built on `ForkJoinTask` all submit work to this same pool. Because its thread count is fixed and small (typically core count minus one), submitting long-blocking work from one part of an application can leave too few worker threads available for unrelated parallel work elsewhere, and there is no per-caller isolation or prioritization — it's a shared, contended resource by design, not a bug, so isolating blocking work into a dedicated pool is a deliberate architectural choice, not a workaround.</div>
+<div class="qa-body">The common pool is a static, lazily-initialized singleton owned by the <code>ForkJoinPool</code> class itself, sized once at JVM startup based on available processors, and reused by every caller in the process that doesn't explicitly supply its own executor. Parallel streams, <code>CompletableFuture</code>'s async variants without an explicit <code>Executor</code> argument, and any third-party library built on <code>ForkJoinTask</code> all submit work to this same pool. Because its thread count is fixed and small (typically core count minus one), submitting long-blocking work from one part of an application can leave too few worker threads available for unrelated parallel work elsewhere, and there is no per-caller isolation or prioritization — it's a shared, contended resource by design, not a bug, so isolating blocking work into a dedicated pool is a deliberate architectural choice, not a workaround.</div>
 </details>
 
 <details class="concept-qa">
 <summary>Concretely, why does a lambda not allocate a new object on every single invocation the way a naive desugaring to an anonymous class would suggest?</summary>
-<div class="qa-body">The `invokedynamic` call site created for a lambda expression is only linked once — the first time control reaches it, the JVM invokes `LambdaMetafactory.metafactory` to spin up the implementation class and bind it into the call site as a `CallSite` object. Every subsequent execution of that same source-code call site reuses the already-linked target directly; it does not re-run the metafactory or regenerate the class. Whether an actual instance is allocated per call still depends on whether the lambda captures any enclosing state (a non-capturing lambda can be cached as a singleton instance by the JVM, while a capturing lambda does allocate a small object to hold the captured variables) — but the expensive one-time cost, class generation, only happens once per call site, not once per invocation.</div>
+<div class="qa-body">The <code>invokedynamic</code> call site created for a lambda expression is only linked once — the first time control reaches it, the JVM invokes <code>LambdaMetafactory.metafactory</code> to spin up the implementation class and bind it into the call site as a <code>CallSite</code> object. Every subsequent execution of that same source-code call site reuses the already-linked target directly; it does not re-run the metafactory or regenerate the class. Whether an actual instance is allocated per call still depends on whether the lambda captures any enclosing state (a non-capturing lambda can be cached as a singleton instance by the JVM, while a capturing lambda does allocate a small object to hold the captured variables) — but the expensive one-time cost, class generation, only happens once per call site, not once per invocation.</div>
 </details>
 
 <details class="concept-qa">
 <summary>Why does Collectors.toMap throw on duplicate keys instead of just keeping the last value like a plain HashMap.put would?</summary>
-<div class="qa-body">A `HashMap.put` in a loop implicitly picks "last write wins" because that's simply what the method does when a key exists — the caller controls the loop and, implicitly, the order and intent. `Collectors.toMap` deliberately does not assume this default, because doing so silently would let real data-integrity bugs — two entities that were supposed to have distinct keys — disappear without a trace: one of the two values vanishes and nothing signals that this happened. By throwing `IllegalStateException` on the two-argument form, the collector forces the developer to make an explicit, visible choice via the three-argument merge-function overload (`(existing, incoming) -> ...`), which documents in the code itself what should happen on a collision instead of leaving it to incidental map semantics.</div>
+<div class="qa-body">A <code>HashMap.put</code> in a loop implicitly picks "last write wins" because that's simply what the method does when a key exists — the caller controls the loop and, implicitly, the order and intent. <code>Collectors.toMap</code> deliberately does not assume this default, because doing so silently would let real data-integrity bugs — two entities that were supposed to have distinct keys — disappear without a trace: one of the two values vanishes and nothing signals that this happened. By throwing <code>IllegalStateException</code> on the two-argument form, the collector forces the developer to make an explicit, visible choice via the three-argument merge-function overload (<code>(existing, incoming) -> ...</code>), which documents in the code itself what should happen on a collision instead of leaving it to incidental map semantics.</div>
 </details>
 
 <h2>Related Topics</h2>
@@ -259,4 +305,5 @@ String name = topEarner
 <div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Concurrency &amp; Multithreading</div><div class="rc-sub">Days 16–22 · ForkJoinPool's work-stealing scheduler underlies every parallel stream execution</div></div>
 <div class="related-card" onclick="window.location.hash='/jvm-architecture'"><div class="rc-title">JVM Architecture</div><div class="rc-sub">Days 26–30 · invokedynamic and call-site linking are what make lambda compilation cheap</div></div>
 <div class="related-card" onclick="window.location.hash='/modern-java-features'"><div class="rc-title">Modern Java Features</div><div class="rc-sub">Days 11–15 · Records, var, and sealed types frequently pair with stream pipelines in idiomatic modern code</div></div>
+<div class="related-card" onclick="window.location.hash='/batch-processing-scheduled-jobs'"><div class="rc-title">Batch Processing &amp; Scheduled Jobs</div><div class="rc-sub">Bulk data processing · parallel stream pipelines over large in-memory batches are a common building block inside scheduled jobs</div></div>
 </div>

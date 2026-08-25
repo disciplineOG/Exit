@@ -1,0 +1,264 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Extended Bonus · HLD / Bonus</p>
+<h1>Search &amp; Recommendation Systems</h1>
+<div class="topic-tags">
+<span class="tag">Inverted Index</span>
+<span class="tag">Elasticsearch / OpenSearch</span>
+<span class="tag">CDC &amp; Outbox</span>
+<span class="tag">TF-IDF / BM25</span>
+<span class="tag">Faceted Search</span>
+<span class="tag">Collaborative Filtering</span>
+<span class="tag">Content-Based Filtering</span>
+<span class="tag">Cold Start</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>ShopSphere's <code>Product</code> table in its primary database is optimized for exactly one access pattern well: fetch a product (or a small set of products) by a known key — <code>productId</code>, or <code>sellerId</code> for a seller's own catalog. It is fundamentally the wrong tool for "find every product whose name, description, or category loosely matches wireless bluetooth headphones, ranked by relevance, filterable by price range and brand, in under 100ms, across 20 million products." Building that on the primary database with <code>LIKE '%...%'</code> queries doesn't just perform badly — it's solving a different problem than the database engine was designed to solve, using an index structure (a B-tree, ordered for range/equality lookups on a column) that has no way to represent "this word appears somewhere in this text." A dedicated search index inverts the entire problem — from "for this row, what words does it contain" to "for this word, which rows contain it" — which is precisely what makes free-text and faceted search fast at scale. Understanding why that inversion works, how to keep it in sync with a source-of-truth database without coupling every write path to search infrastructure, and the basic mechanics of relevance ranking and recommendations, is what separates "I called Elasticsearch" from actually knowing what problem it solves and where its consistency model can bite you.</p>
+</div>
+
+<h2>1. Why SQL <code>LIKE</code> Doesn't Scale for Product Search</h2>
+<p>ShopSphere's <code>Product</code> table looks roughly like <code>Product(id, sellerId, name, description, category, price, stockQuantity)</code>. A relational database's standard indexes — B-tree indexes on columns like <code>id</code>, <code>sellerId</code>, or <code>price</code> — support fast equality and range lookups (<code>WHERE sellerId = ?</code>, <code>WHERE price BETWEEN ? AND ?</code>) because a B-tree stores keys in sorted order, so the engine can binary-search down to the right leaf page in O(log n) disk/page accesses. That structure has nothing useful to offer a query like <code>WHERE name LIKE '%wireless%'</code>, because the substring you're searching for can start anywhere inside the text — there is no sorted position for "contains this substring somewhere in the middle" the way there is for "equals this value" or "falls in this range."</p>
+<p>Concretely, <code>LIKE '%wireless%'</code> (a leading-wildcard pattern) cannot use a B-tree index at all — the database has no choice but to fall back to a full table scan, reading every row and running a string-search check against each one's <code>name</code>/<code>description</code>. This is O(n) in the number of rows, per query, with a non-trivial per-row string-matching cost on top. It gets worse the moment real search requirements show up:</p>
+<ul>
+<li><strong>Multi-word, ranked queries.</strong> A customer searching "wireless bluetooth headphones" doesn't want an exact-substring match — they want products that mention any subset of those words, ranked by how well they match, with a product mentioning all three terms prominently in its title ranked above one that mentions "wireless" once in a buried description field. SQL has no native notion of "relevance rank" between a query and a text column; you'd be building tokenization, scoring, and ranking logic yourself, on top of a full scan, on every request.</li>
+<li><strong>Typo tolerance and stemming.</strong> "Headphone" should match "headphones"; "blutooth" (a typo) should still surface bluetooth products. SQL string matching is exact-substring by construction — there is no built-in notion of edit distance, word stems, or synonyms.</li>
+<li><strong>Faceted filtering combined with free text.</strong> "Wireless headphones, under $50, brand X, in stock, 4+ stars" needs the free-text relevance match and several structured filters evaluated together, then aggregated into facet counts ("Brand: Sony (142), Bose (88)...") for the UI — a fundamentally different query shape than anything a B-tree-backed row store is built to aggregate quickly across millions of rows on every request.</li>
+</ul>
+<div class="callout warn">
+<div class="callout-title">This isn't "SQL is slow" — it's the wrong index structure for the problem</div>
+<p>A relational database is not inherently bad at search — it's that <code>LIKE '%term%'</code> asks it to solve a text-retrieval problem using an index designed for sorted-key lookups, which forces a full scan every time. Postgres's own full-text search extension (<code>tsvector</code>/<code>GIN</code> index) is actually a small-scale inverted index bolted onto a relational engine, which tells you something: even the answer <em>within</em> SQL-land is to build the same structure a dedicated search engine builds natively, just with less scale, less relevance tuning, and less operational tooling around it than a system purpose-built for exactly this.</p>
+</div>
+
+<h2>2. The Inverted Index: Why Search Engines Are Fast</h2>
+<p>An <strong>inverted index</strong> flips the natural "document → words" relationship into "word → documents." Instead of storing, per product, a blob of text you'd have to scan, the index stores, per distinct term, the sorted list of product IDs (a <strong>postings list</strong>) whose text contains that term. Looking up "which products contain the word wireless" becomes a direct key lookup into a hash table or sorted structure keyed by the term "wireless" — no scan of product rows required at all.</p>
+<h3>2.1 Building the index: tokenization and analysis</h3>
+<p>Before anything is indexed, raw text goes through an <strong>analyzer</strong> pipeline that turns "Wireless Bluetooth Over-Ear Headphones — Noise Cancelling" into a normalized token stream: lowercase everything, split on whitespace/punctuation (<strong>tokenization</strong>), strip common low-information words like "the"/"and" (<strong>stop-word removal</strong>), and reduce words to a root form (<strong>stemming</strong>, e.g. "cancelling" → "cancel", "headphones" → "headphon") so that a query for "cancel noise" still matches a document that only contains "cancelling." The same analyzer runs over both indexed documents and incoming queries, which is exactly what makes "headphone" (singular, in a query) match "headphones" (plural, in a product title) — they stem to the same token.</p>
+<pre><code>// ShopSphere product, before analysis
+Product(id="prod-8841", name="Wireless Bluetooth Over-Ear Headphones",
+        description="Noise cancelling, 30-hour battery")
+
+// after tokenize -> lowercase -> stop-word removal -> stemming
+tokens = ["wireless", "bluetooth", "over", "ear", "headphon",
+          "noise", "cancel", "30", "hour", "batteri"]
+
+// inverted index entries this document contributes to (postings list per term)
+"wireless"  -> [prod-8841, prod-1092, prod-7723, ...]
+"bluetooth" -> [prod-8841, prod-2201, ...]
+"headphon"  -> [prod-8841, prod-1092, prod-9042, ...]
+"cancel"    -> [prod-8841, prod-3390, ...]</code></pre>
+<h3>2.2 Answering a query against the index</h3>
+<p>A search for "wireless headphones" is analyzed the same way into <code>["wireless", "headphon"]</code>, and the engine looks up the postings lists for each term and combines them — an intersection for "must contain all these terms," a union with per-term scoring for "should contain, rank higher if more terms match." Because each postings list is already the exact set of matching document IDs (no scan needed to discover them), the cost of the lookup is roughly proportional to the size of the postings lists involved, not the total number of products in the catalog — the difference between "scan 20 million rows" and "read two short lists and intersect them" is the entire reason this is fast.</p>
+<pre><code>Query: "wireless headphones"
+  -> analyzed tokens: ["wireless", "headphon"]
+  -> postings["wireless"]  = {8841, 1092, 7723, ...}
+  -> postings["headphon"]  = {8841, 1092, 9042, ...}
+  -> candidates (union, scored by how many/how well terms match) = {8841, 1092, 7723, 9042, ...}
+  -> rank candidates by relevance score (section 4) -> return top N</code></pre>
+<h3>2.3 Faceted search as aggregation over the same index</h3>
+<p>Facets ("Brand: Sony (142), Bose (88)", "Price: $0-25 (310), $25-50 (204)") are computed by running an aggregation over the same candidate set the query already matched — grouping by a structured field (<code>brand</code>, a <code>price</code> bucket) and counting, the same conceptual operation as a SQL <code>GROUP BY COUNT(*)</code>, except it's computed over the inverted-index-derived candidate set in memory rather than re-scanning a row store, and it's computed on every request against a live, filtered result set rather than a precomputed report.</p>
+
+<h2>3. Keeping the Search Index in Sync With the Product Database</h2>
+<p>The inverted index lives in a completely separate system — Elasticsearch or OpenSearch, not the relational database that owns <code>Product</code> as source of truth. That split is deliberate (a relational engine and a search engine are optimized for genuinely different access patterns), but it creates a real problem: every <code>Product</code> insert, price change, or stock update in catalog-service's database now needs to eventually show up in the search index too, or search results go stale — a delisted product still appears in results, or a price drop doesn't show up in a "under $50" facet filter for a while.</p>
+<h3>3.1 Dual-write: simple, and broken under failure</h3>
+<p>The naive approach is a <strong>dual write</strong>: catalog-service's update handler writes to the <code>Product</code> table, then immediately calls Elasticsearch's index API to write the same change there, in the same request:</p>
+<pre><code>// naive dual-write - looks fine, is NOT safe against partial failure
+@Transactional
+public void updateProduct(Product product) {
+    productRepository.save(product);              // write 1: relational DB
+    searchIndexClient.index("products", product);  // write 2: Elasticsearch
+    // if the process crashes, or the network call to ES times out,
+    // between these two lines -> DB and search index have now diverged,
+    // silently, with no record that a divergence happened
+}</code></pre>
+<p>This fails because the two writes are against two entirely separate systems with no shared transaction — there is no way to atomically commit "update the row" and "update the index" together. If the service crashes after the DB commit but before the ES call succeeds (or the ES call throws, times out, or the service is killed mid-request), the database has the new price but the search index still has the old one, permanently, with nothing anywhere recording that this product needs to be re-synced. Under any real production failure rate (network blips, ES cluster hiccups, deploys restarting pods mid-request), this drift accumulates continuously and silently.</p>
+<h3>3.2 Outbox pattern: making the sync durable</h3>
+<p>The fix that keeps the durability guarantee is the same <strong>transactional outbox</strong> pattern used for reliably publishing domain events (see the <a href="#/hld-ecommerce-flash-sale">flash-sale checkout flow</a> for the same pattern applied to <code>OrderPlaced</code>): instead of calling the search index directly inside the request, catalog-service writes an outbox row (<code>ProductChanged</code>, with the product id and change type) into its <em>own</em> database, in the exact same local transaction as the <code>Product</code> update itself. Because both writes are against the same database, they commit atomically — either both happen, or neither does, with no window where one succeeds and the other silently doesn't.</p>
+<pre><code>@Transactional
+public void updateProduct(Product product) {
+    productRepository.save(product);
+    outboxRepository.save(new OutboxEvent(
+        "ProductChanged", product.getId(), toJson(product)));
+    // both inserts are in ONE local DB transaction - atomic, all-or-nothing
+}</code></pre>
+<p>A separate poller or CDC process (section 3.3) reads unpublished outbox rows and pushes them into the search index asynchronously, retrying on failure until it succeeds, then marks the row processed. If the search-index write fails, the outbox row simply stays unprocessed and gets retried — nothing is lost, because the durable record of "this product changed and needs re-indexing" survived in the same transaction as the change itself, independent of whether Elasticsearch was reachable at that exact moment.</p>
+<h3>3.3 Change Data Capture (CDC): syncing without touching application code at all</h3>
+<p><strong>CDC</strong> takes this a step further by not requiring catalog-service to write an outbox row explicitly at all. A CDC tool (Debezium is the standard choice) tails the database's own replication log — the same write-ahead log (WAL in Postgres, binlog in MySQL) the database already uses for crash recovery and replica sync — and streams every row-level insert/update/delete as an event, without the application ever having to know CDC exists. This has a strong advantage over an application-level outbox: it's impossible for a code path to "forget" to write the outbox row (a bug, a new endpoint someone added without wiring in the sync logic), because CDC reads what actually changed in storage, not what the application remembered to announce.</p>
+<pre><code>Catalog DB write-ahead log (WAL)
+   |  every row-level INSERT/UPDATE/DELETE on `product` table, already
+   |  being written for crash recovery/replication - CDC just also reads it
+   v
+Debezium connector (tails the WAL, requires no app code changes)
+   |
+   v
+Kafka topic: product-changes  (one ProductChanged/ProductDeleted event per row change)
+   |
+   v
+search-index-sync consumer  ->  Elasticsearch/OpenSearch  (products index)
+                                 upsert or delete the corresponding document</code></pre>
+<pre><code>catalog-service (writes Product rows)
+        |
+        | normal DB writes - catalog-service does not know CDC exists
+        v
+  Product DB  --(WAL tailed by Debezium)-->  Kafka: product-changes
+                                                     |
+                                                     v
+                                        search-index-sync consumer
+                                                     |
+                                                     v
+                                  Elasticsearch/OpenSearch: products index
+                                          (what customer search queries hit)</code></pre>
+<h3>3.4 The consistency trade-off: eventual, not immediate</h3>
+<p>Both the outbox and CDC approaches share the same fundamental property: the search index converges to match the database <em>eventually</em>, not instantly, and not within any transaction that also touches the database. There is an unavoidable propagation delay — typically milliseconds to low seconds in a healthy system, but unbounded under a backlog (a Kafka consumer lag spike, an Elasticsearch cluster under load rejecting writes) — during which a query against search can return a result that no longer matches the current database state.</p>
+<table>
+<tr><th></th><th>Dual write (no outbox)</th><th>Outbox + poller/relay</th><th>CDC (Debezium)</th></tr>
+<tr><td>Atomicity with the DB write</td><td>None — two independent writes</td><td>Outbox row is atomic with the DB write; the ES write is still separate/async</td><td>Same as outbox — CDC reads only what was durably committed</td></tr>
+<tr><td>Risk of silent, permanent drift</td><td>High — any failure between the two writes is unrecovered</td><td>None — unpublished outbox rows are retried until they succeed</td><td>None — CDC reads the WAL itself, can't miss a committed change</td></tr>
+<tr><td>Requires app code changes</td><td>Yes, at every write path</td><td>Yes — every write path must remember to write an outbox row</td><td>No — works against existing writes with zero app changes</td></tr>
+<tr><td>Propagation latency</td><td>Immediate if it succeeds (all-or-nothing risk)</td><td>Small poll/relay delay</td><td>Small delay, typically sub-second, driven by WAL-tailing lag</td></tr>
+</table>
+<div class="callout">
+<div class="callout-title">Why "eventual" is an acceptable trade-off here specifically</div>
+<p>This asymmetry is exactly why search is a good fit for eventual consistency in a way that, say, decrementing <code>Inventory.availableQty</code> during checkout is not: a stale search result showing a product's old price for a few hundred milliseconds is a minor UX inconsistency the checkout flow itself will correct (the actual charge always reads current price from the source-of-truth <code>Product</code>/<code>Inventory</code> tables, never from the search index), whereas a stale inventory count during a flash sale can directly cause overselling — real money and real fulfillment failures. Search indexes are a read-optimized, secondary, derived view; nothing should ever treat them as the authoritative source for a price, a stock count, or anything a financial transaction depends on.</p>
+</div>
+
+<h2>4. Relevance Ranking: TF-IDF and BM25</h2>
+<p>Once a query matches a candidate set of products (section 2.2), they still need to be <em>ranked</em> — "wireless bluetooth headphones" should surface a product titled exactly that above one that merely mentions "wireless" once in a warranty disclaimer. This is a fundamentally different problem from a SQL filter, which only ever answers true/false per row with no notion of "how well" a row matches.</p>
+<h3>4.1 TF-IDF: term frequency, inverse document frequency</h3>
+<p><strong>TF-IDF</strong> scores a term's importance to a specific document by combining two counteracting signals:</p>
+<ul>
+<li><strong>Term Frequency (TF)</strong> — how many times the term appears in this document, normalized by document length. A product description that says "wireless" three times is, all else equal, more about wireless-ness than one that says it once.</li>
+<li><strong>Inverse Document Frequency (IDF)</strong> — a weight that <em>penalizes</em> terms that appear in almost every document in the catalog, and <em>rewards</em> terms that are rare/distinctive. In a headphones catalog, "headphones" itself might appear in nearly every listing (low IDF — not very discriminating between products), while "noise-cancelling" appears in only a subset (higher IDF — a match on it is more informative about relevance).</li>
+</ul>
+<p>The product of the two, summed across all query terms, is the TF-IDF score: a document scores highly when it repeats the query's rarer, more distinctive terms often — exactly the intuition "this document is unusually, specifically about what you searched for," rather than just "this document contains common words that happen to be in your query too."</p>
+<h3>4.2 BM25: the practical improvement over raw TF-IDF that Elasticsearch actually uses</h3>
+<p><strong>BM25</strong> (the default scoring algorithm in both Elasticsearch and OpenSearch) refines TF-IDF with two corrections that make it behave better in practice:</p>
+<ul>
+<li><strong>Term frequency saturation.</strong> Raw TF-IDF lets term frequency contribute linearly and unboundedly — a description that repeats "wireless" fifty times (whether legitimately or via keyword-stuffing) would score proportionally higher than one that says it three times, which isn't actually more relevant past a point. BM25 applies a saturating function so that additional repetitions matter less and less, capping the benefit of just repeating a word many times.</li>
+<li><strong>Document length normalization.</strong> A longer product description naturally contains more words and thus more chances to match query terms by sheer volume, independent of actual relevance. BM25 explicitly normalizes against the average document length in the catalog, so a short, precise title match isn't unfairly outranked by a long description that happens to mention the term once amid a lot of unrelated text.</li>
+</ul>
+<table>
+<tr><th></th><th>Simple structured filter</th><th>TF-IDF / BM25 relevance ranking</th></tr>
+<tr><td>Question answered</td><td>"Does this row satisfy this condition?" — boolean</td><td>"How well does this document match this query, relative to every other candidate?" — continuous score</td></tr>
+<tr><td>Example</td><td><code>category = 'electronics' AND price &lt; 50</code></td><td>Ranking products matching "wireless bluetooth headphones" by how central those terms are to each one</td></tr>
+<tr><td>Underlying mechanism</td><td>Direct comparison against a field value (index lookup or scan)</td><td>Statistical weighting of term frequency against corpus-wide term rarity</td></tr>
+<tr><td>Where it's evaluated in ShopSphere search</td><td>Facet filters ("in stock", "brand=Sony", "price range")</td><td>The free-text portion of the query, scoring/ordering the filtered candidate set</td></tr>
+</table>
+<p>In practice a real ShopSphere search request combines both in one query: BM25 scores the free-text relevance of "wireless bluetooth headphones" against product titles/descriptions, while structured filters (category, price range, in-stock) are applied as hard boolean constraints that don't affect the relevance score at all — a product either passes the filter or is excluded outright, but among the ones that pass, BM25 decides the order.</p>
+
+<h2>5. Recommendation Systems: The Basics</h2>
+<p>Search answers "find me things matching this explicit query." Recommendations answer a different question: "given what I know about this customer (or this product), what else should they see, without them typing anything?" — the "customers who bought this also bought" module on a ShopSphere product page, or a personalized homepage feed. The two dominant approaches differ in what signal they mine.</p>
+<h3>5.1 Collaborative filtering: mining behavior, not content</h3>
+<p><strong>Collaborative filtering</strong> recommends based purely on patterns in <em>behavior across many customers</em> — it never looks at what a product actually is, only at who bought/viewed/rated what. The core idea behind "customers who bought this also bought": build a co-occurrence signal from ShopSphere's own <code>Order</code>/<code>OrderItem</code> history — for every pair of products that show up together in the same customer's order history with unusual frequency (more often than chance would predict), record that as an association.</p>
+<pre><code>-- Simplified co-occurrence mining from ShopSphere's own order history
+SELECT oi1.productId AS product_a, oi2.productId AS product_b, COUNT(*) AS co_purchase_count
+FROM order_item oi1
+JOIN order_item oi2 ON oi1.orderId = oi2.orderId AND oi1.productId &lt;&gt; oi2.productId
+GROUP BY oi1.productId, oi2.productId
+ORDER BY co_purchase_count DESC;
+-- e.g. (prod-8841 wireless headphones, prod-9042 charging case) co-purchased 3,400 times
+--       -> "customers who bought this also bought" surfaces prod-9042 on prod-8841's page</code></pre>
+<p>Two flavors exist, both built on the same underlying idea of a customer × product interaction matrix (rows = customers, columns = products, cells = purchased/rated/viewed):</p>
+<ul>
+<li><strong>Item-based</strong> ("customers who bought this also bought X") — find products that co-occur frequently with the product currently being viewed, across all customers' histories. This is what powers a product-detail-page recommendation module, and it's what the query above builds.</li>
+<li><strong>User-based</strong> ("customers similar to you bought X") — find other customers whose purchase history overlaps heavily with this customer's, then recommend what those similar customers bought that this customer hasn't. This powers a personalized homepage feed rather than a single product page.</li>
+</ul>
+<p>The defining property of collaborative filtering is that it needs <strong>zero knowledge of product content</strong> — it works purely off co-occurrence patterns in behavioral data, which means it can surface genuinely surprising, non-obvious associations (a phone case and a specific brand of screen protector, discovered purely because many customers happen to buy both) that no content-based rule would ever have predicted.</p>
+<h3>5.2 Content-based filtering: mining product attributes</h3>
+<p><strong>Content-based filtering</strong> instead recommends based on <em>attributes of the products themselves</em> — category, brand, price range, description text, tags — matched against a profile of what a specific customer has shown interest in. If a customer has browsed and purchased several items in ShopSphere's "wireless audio" category from budget-friendly brands, a content-based recommender surfaces other wireless-audio products in a similar price band, purely by comparing product attributes/description similarity (often using the same text-vectorization ideas as TF-IDF from section 4, treating each product's description as a vector and recommending nearby vectors) — with no need for any other customer's purchase history at all.</p>
+<table>
+<tr><th></th><th>Collaborative Filtering</th><th>Content-Based Filtering</th></tr>
+<tr><td>Signal used</td><td>Behavior across many customers (purchases, ratings, views)</td><td>Attributes of the product itself (category, description, price, tags)</td></tr>
+<tr><td>Can it recommend a brand-new product with zero sales?</td><td>No — needs co-occurrence data that doesn't exist yet (cold start, section 5.3)</td><td>Yes — a new product's attributes are known immediately at listing time</td></tr>
+<tr><td>Can it recommend to a brand-new customer with zero history?</td><td>No — needs this customer's own behavior data</td><td>Partially — needs at least some signal of stated or inferred preference (browsed category, filled-in preferences)</td></tr>
+<tr><td>Discovers non-obvious associations?</td><td>Yes — purely data-driven, can surface surprising pairings humans wouldn't predict</td><td>No — limited to what attribute similarity can express; won't find a phone-case/screen-protector pairing unless they share explicit attributes</td></tr>
+<tr><td>Typical ShopSphere use</td><td>"Customers who bought this also bought" on product pages</td><td>"More like this" / "similar products," and any recommendation for newly-listed products</td></tr>
+</table>
+<p>Most real systems, including large e-commerce platforms, blend both (a <strong>hybrid</strong> approach) precisely because their weaknesses are complementary — collaborative filtering supplies the strong behavioral signal once enough data exists, content-based filtering fills the gap for anything too new to have that signal yet.</p>
+<h3>5.3 The cold-start problem</h3>
+<p>Both approaches share a structural weakness rooted in exactly what data they depend on: they need a history that, for something genuinely new, doesn't exist yet.</p>
+<ul>
+<li><strong>New product cold start.</strong> A seller just listed a brand-new product on ShopSphere. Collaborative filtering has zero co-purchase data for it — it has never appeared in any order, so it cannot be recommended via "bought together" logic no matter how well it would actually sell, and it can't yet be a target of any "customers who bought this also bought" pairing either. The practical mitigation is to lean on content-based signals (category, description similarity to existing well-performing products) until enough purchase/view data accumulates, plus deliberately boosting new listings' visibility in generic browse/search placements (independent of personalization) so they get enough initial exposure to start generating the interaction data collaborative filtering needs.</li>
+<li><strong>New customer cold start.</strong> A customer who just created a ShopSphere account has no purchase history, no ratings, nothing for either a collaborative or a personalized content-based model to work from. The standard mitigations are non-personalized fallbacks — trending/best-selling products, category-level popularity — combined with any explicit signal you can get cheaply (an onboarding "what are you shopping for?" prompt) and a rapid shift to personalization as soon as even a small amount of behavior (a few page views, a first purchase) becomes available.</li>
+</ul>
+<div class="callout tip">
+<div class="callout-title">Cold start isn't a bug to eliminate — it's a permanent edge you design fallbacks for</div>
+<p>Every catalog with churn has a constant trickle of new products and new customers, so cold start isn't a one-time bootstrapping problem you solve once and move past — it's a permanent segment of traffic that a production recommendation system must always have a defined, reasonable fallback for. The practical pattern is a tiered fallback: use collaborative filtering when there's enough interaction data, fall back to content-based similarity when there isn't, and fall back further to non-personalized popularity ranking when there's no signal at all — never simply show nothing or an empty recommendation module for a segment of traffic that lacks history.</p>
+</div>
+
+<h2>6. Architecture: Catalog-Service, CDC, and the Search Index Together</h2>
+<p>Putting sections 2, 3, and 5 together, the shape of ShopSphere's search-and-recommendation infrastructure sits alongside, not inside, the transactional path:</p>
+<pre><code>                 write path (source of truth)                    read path (search)
+                 -----------------------------                    -------------------
+Seller updates   catalog-service                                  Customer searches
+Product/price -> (owns Product table,                             "wireless headphones"
+                  the source of truth)                                   |
+                       |                                                 v
+                       | normal transactional write                catalog/search-service
+                       v                                           (query API in front of ES)
+                  Product DB (relational)                                |
+                       |                                                 v
+                       | WAL tailed by Debezium (CDC, section 3.3)  Elasticsearch/OpenSearch
+                       v                                            (inverted index + BM25 ranking
+                  Kafka: product-changes                            + facet aggregation, section 2-4)
+                       |                                                 ^
+                       v                                                 |
+              search-index-sync consumer  ----------  upserts/deletes ---
+              (idempotent per productId - safe to
+               reprocess the same event twice)
+
+                 recommendation path (offline/near-real-time)
+                 ---------------------------------------------
+Order DB (OrderItem history) -> batch/streaming job (section 5.1 co-occurrence mining,
+                                  see batch-processing-scheduled-jobs)
+                                       |
+                                       v
+                          precomputed "customers who bought X also bought Y" table
+                          (read by catalog/search-service when rendering a product page -
+                           NOT recomputed live per request; recomputation is periodic)</code></pre>
+<p>Two design choices in this diagram are worth calling out explicitly. First, catalog-service never talks to Elasticsearch directly on the write path — it only ever writes to its own relational database, and has no idea CDC or a search index exist at all, which is exactly what keeps a search-infrastructure outage from ever being able to block a seller from updating their product's price or stock (section 3.4's consistency trade-off in architectural form: the write path stays fast and decoupled precisely because it doesn't wait on the read-optimized copy). Second, the recommendation co-occurrence table is <em>precomputed</em>, not calculated live on each product-page request — mining co-purchase patterns across the full order history is a batch aggregation, run periodically (hourly/daily) as a background job, with the product page simply doing a fast key lookup (<code>productId</code> → precomputed list of related productIds) at request time.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why can't a B-tree index make SQL LIKE '%wireless%' fast, and what structural property of an inverted index fixes that?</summary>
+<div class="qa-body">A B-tree index stores keys in sorted order so the engine can binary-search down to a value or a range in roughly log(n) steps — but that only works when you're looking for something anchored at a known position in the sort order, like an exact value or "greater than X." A leading-wildcard substring search has no such anchor: the substring can start anywhere inside the text, so there's no sorted position to binary-search toward, forcing a full scan and a per-row string check. An inverted index sidesteps this entirely by flipping the relationship being indexed: instead of indexing "for this document, what text does it contain" (which is what a B-tree on a text column would give you), it indexes "for this specific term, which document IDs contain it," stored as a direct-lookup postings list keyed by term. Looking up a word becomes an O(1)-ish key lookup into that structure rather than a scan over every document's text, because the index was built specifically around the query shape "find documents containing term X," not "sort documents by column value."</div>
+</details>
+
+<details class="concept-qa">
+<summary>Walk through what happens end-to-end when a seller updates a product's price, using CDC, until it's reflected in search results.</summary>
+<div class="qa-body">Catalog-service runs a normal transactional UPDATE against the Product row in its own relational database — it does not call Elasticsearch, does not know CDC exists, and the request returns as soon as that single-database transaction commits. Separately, Debezium is tailing the database's write-ahead log (the same log the database already writes for crash recovery and replication), and it observes the committed row-level UPDATE as a change event, which it publishes onto a Kafka topic (product-changes) carrying the new row state. A dedicated search-index-sync consumer reads that Kafka event and issues an upsert against the corresponding document in Elasticsearch/OpenSearch, updating the indexed price field. From the moment the seller's update commits to the moment a customer's search reflects the new price, there's a real but typically small propagation delay — driven by WAL-tailing lag, Kafka throughput, and consumer processing time — during which a customer could still see the old price in search results even though the database itself already has the new one.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is dual-writing to the database and the search index in the same request unsafe, and how does the outbox pattern fix it without adding a distributed transaction?</summary>
+<div class="qa-body">A dual write is two independent writes against two different systems with no shared transaction coordinating them — the database commit and the Elasticsearch write can each succeed or fail independently, and any failure (a crash, a timeout, a network blip) landing between the two leaves them permanently diverged with no record anywhere that a divergence happened. The outbox pattern fixes this without needing a two-phase-commit-style distributed transaction across the database and Elasticsearch (which would be slow and operationally fragile, and which Elasticsearch doesn't even support as a transactional participant) by only ever writing to systems that share a single local transaction: the Product update and an outbox row describing that change go into the same relational database, in the same transaction, so they're atomic with each other by construction. The actual push to Elasticsearch happens afterward, asynchronously, off that outbox row — and if it fails, the outbox row simply remains unprocessed and gets retried, so nothing is silently lost; the durability guarantee comes from the outbox row surviving in the same transaction as the change, not from the downstream push succeeding on the first try.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What specifically does BM25 improve over raw TF-IDF, and why do those improvements matter for ranking real product listings?</summary>
+<div class="qa-body">Raw TF-IDF lets a document's term-frequency contribution grow linearly and without bound, so a description that repeats a keyword many times scores proportionally higher purely from repetition, independent of whether that repetition reflects genuine relevance — this is exploitable by keyword-stuffed listings and generally overweights raw repetition. BM25 applies a saturating function to term frequency so that each additional repetition contributes less and less to the score, capping the benefit of merely repeating a word many times. Separately, raw TF-IDF doesn't account for document length: a longer product description has more words and thus more opportunities to incidentally match query terms, which can make it outrank a short, precise title match purely due to length rather than actual relevance. BM25 explicitly normalizes term frequency against the corpus's average document length, correcting for that length bias. Both corrections matter directly for product search because real catalogs have wildly inconsistent description lengths and real sellers have real incentive to keyword-stuff, and BM25's corrections make the ranking robust to both.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why can't collaborative filtering recommend a product that was listed five minutes ago, no matter how good a fit it might be for a given customer?</summary>
+<div class="qa-body">Collaborative filtering's entire signal is behavioral co-occurrence mined from actual customer interaction history — who bought, viewed, or rated what, alongside what else. A product with zero purchase or view history has no co-occurrence data with anything, by definition, because the signal the algorithm depends on is generated purely by accumulated customer behavior after listing, and a five-minute-old product hasn't had time to accumulate any. This isn't a tunable parameter or a bug that better data engineering fixes — it's a structural property of what the algorithm is: it can only ever surface patterns that already exist in historical interaction data, so anything without that history is invisible to it regardless of how well-matched it might actually be to a given customer. The practical fix is to lean on a fundamentally different signal (content-based similarity, using the product's own attributes rather than any behavioral history) until enough interaction data accumulates for collaborative filtering to have something to work with.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is it architecturally important that catalog-service's write path never talks to Elasticsearch directly, even though the search index does eventually need every product change?</summary>
+<div class="qa-body">If catalog-service called Elasticsearch synchronously as part of handling a seller's product update, the availability and latency of the transactional write path would become coupled to the availability and latency of a completely separate system with different scaling characteristics, different failure modes, and a different operational team's on-call rotation — an Elasticsearch cluster having a bad day (overloaded, mid-reindex, network-partitioned) would now be able to block sellers from updating their own prices and stock, which is a core write path with no legitimate reason to depend on a read-optimized secondary system succeeding. Routing the sync through CDC or an outbox instead means catalog-service's write path only ever depends on its own database committing, full stop — the search index update becomes a downstream, asynchronous, retryable concern with its own failure isolation, so a search-infrastructure outage degrades search relevance/freshness but never blocks the actual business-critical write.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does ShopSphere precompute the "customers who bought this also bought" table in a batch job rather than computing it live on every product-page load?</summary>
+<div class="qa-body">Computing genuine co-occurrence statistics requires scanning across a large fraction of the order history — joining OrderItem rows against each other to find which product pairs appear together unusually often — which is an aggregation over potentially the entire historical order dataset, not something that can be computed cheaply per individual page view without imposing a heavy, repeated cost on every single product-page load. Precomputing it periodically (hourly or daily, as a batch or streaming aggregation job) means that expensive aggregation work happens once per cycle regardless of how many customers view the resulting recommendations, and the product page itself only ever does a cheap, fast key lookup (productId to a short precomputed list of related productIds) at request time. The trade-off is explicit: the recommendation reflects order history as of the last batch run, not the literal current instant, which is an acceptable staleness window for a discovery feature in exactly the way section 3.4 argues eventual consistency is acceptable for search — nothing about a "customers who bought this also bought" suggestion needs to be transactionally fresh to the millisecond.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">B-tree indexing, why relational engines are optimized for a different access pattern than free-text search</div></div>
+<div class="related-card" onclick="window.location.hash='/caching-strategies'"><div class="rc-title">Caching Strategies</div><div class="rc-sub">Search results and facet counts are themselves cacheable, read-heavy, eventually-consistent derived data — the same trade-offs apply</div></div>
+<div class="related-card" onclick="window.location.hash='/hld-ecommerce-flash-sale'"><div class="rc-title">HLD: E-Commerce Flash Sale</div><div class="rc-sub">The same transactional outbox pattern used here for search sync is used there for reliable OrderPlaced event publishing</div></div>
+<div class="related-card" onclick="window.location.hash='/batch-processing-scheduled-jobs'"><div class="rc-title">Batch Processing &amp; Scheduled Jobs</div><div class="rc-sub">Collaborative-filtering co-occurrence mining is exactly the kind of periodic batch aggregation job covered there</div></div>
+<div class="related-card" onclick="window.location.hash='/data-privacy-compliance'"><div class="rc-title">Data Privacy &amp; Compliance: GDPR &amp; PCI-DSS</div><div class="rc-sub">Purchase-history-driven recommendations rely on customer behavioral data, which is exactly the personal data GDPR governs the use of</div></div>
+</div>

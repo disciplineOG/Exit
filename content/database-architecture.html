@@ -13,7 +13,7 @@
 
 <div class="callout tip">
   <div class="callout-title">Why this matters</div>
-  <p>Almost every "the database is slow" incident traces back to one of a handful of mechanical facts: an index that doesn't match the query's sort order, a write-heavy table backed by the wrong storage engine, a replica that's minutes behind primary, or two transactions racing on the same row. None of these are exotic — they are direct, predictable consequences of how B-Trees, LSM-Trees, replication logs, and locks actually work. If you understand the mechanics in this page, you can look at a slow query plan or a stale-read bug report and know exactly which structural choice caused it, rather than guessing and adding indexes until something sticks.</p>
+  <p>Almost every "the database is slow" incident traces back to one of a handful of mechanical facts: an index that doesn't match the query's sort order, a write-heavy table backed by the wrong storage engine, a replica that's minutes behind primary, or two transactions racing on the same row. None of these are exotic — they are direct, predictable consequences of how B-Trees, LSM-Trees, replication logs, and locks actually work. Picture ShopSphere on a normal Tuesday versus the two minutes after a flash sale opens: the same <code>orders</code> table that serves a trickle of point lookups by <code>order_id</code> all day suddenly has ten thousand customers hitting checkout at once, all writing to whichever partition holds the newest rows, while a dashboard job scans <code>orders</code> by <code>status</code> for the fulfillment queue. If you understand the mechanics in this page, you can look at that slow query plan or a stale-read bug report ("my order still shows CREATED, not PAID") and know exactly which structural choice caused it — the wrong index, the wrong shard key, a lagging replica — rather than guessing and adding indexes until something sticks.</p>
 </div>
 
 <h2>1. SQL vs NoSQL Is a Spectrum, Not a Binary Choice</h2>
@@ -21,15 +21,15 @@
 
 <h3>The axes</h3>
 <ul>
-  <li><strong>Schema rigidity vs flexibility.</strong> A relational table enforces a schema at write time: every row has the same columns with the same types, checked by the engine before the write commits. This catches bugs early (you cannot accidentally write a string into an integer column) but makes evolving the schema across a large table an operational event (though modern engines like Postgres and MySQL 8 support fast metadata-only <code>ADD COLUMN</code> in most cases). Document stores defer that validation to the application: a `users` collection in MongoDB can have documents with wildly different shapes, which is powerful for rapidly evolving domains but pushes correctness checking into your code.</li>
-  <li><strong>Join support.</strong> Relational engines implement joins natively and optimize them (hash joins, merge joins, nested loop joins with index lookups) because normalization assumes you'll reassemble related data at query time. Most NoSQL stores either don't support joins at all or support them poorly, because their scaling model assumes data for one logical entity lives on one node — a join across shards would mean fanning a query out across the network, which the engine avoids by design, not by oversight.</li>
+  <li><strong>Schema rigidity vs flexibility.</strong> A relational table enforces a schema at write time: every row has the same columns with the same types, checked by the engine before the write commits. This catches bugs early (you cannot accidentally write a string into ShopSphere's <code>orders.total_amount</code> numeric column) but makes evolving the schema across a large table an operational event (though modern engines like Postgres and MySQL 8 support fast metadata-only <code>ADD COLUMN</code> in most cases). Document stores defer that validation to the application: a ShopSphere <code>products</code> collection in MongoDB can have documents with wildly different shapes — a clothing product with a <code>sizeChart</code> field, an electronics product with a <code>warrantyMonths</code> field — which is powerful for a rapidly evolving multi-category catalog but pushes correctness checking into the seller-service code instead of the database.</li>
+  <li><strong>Join support.</strong> Relational engines implement joins natively and optimize them (hash joins, merge joins, nested loop joins with index lookups) because normalization assumes you'll reassemble related data at query time — ShopSphere's <code>orders JOIN order_items JOIN products</code> to render an order confirmation page is a textbook example. Most NoSQL stores either don't support joins at all or support them poorly, because their scaling model assumes data for one logical entity lives on one node — a join across shards would mean fanning a query out across the network, which the engine avoids by design, not by oversight.</li>
   <li><strong>Horizontal scalability.</strong> A single-leader relational database scales reads via replicas but scales writes only by getting a bigger machine (vertical scaling) unless you add manual sharding on top. Many NoSQL systems (Cassandra, DynamoDB, MongoDB with sharding) build horizontal partitioning into the core engine from day one, because they were designed after teams had already been burned trying to bolt sharding onto MySQL.</li>
-  <li><strong>Consistency guarantees.</strong> Relational databases default to strong consistency: a committed write is immediately visible to the next read on that node, and transactions give you atomicity across multiple rows. Many distributed NoSQL stores trade this for availability and partition tolerance (the CAP theorem trade-off), offering tunable or eventual consistency instead — see <a href="#/distributed-systems-core">distributed-systems-core</a> for why this trade-off is forced, not optional, once you replicate across nodes.</li>
+  <li><strong>Consistency guarantees.</strong> Relational databases default to strong consistency: a committed write is immediately visible to the next read on that node, and transactions give you atomicity across multiple rows — ShopSphere's checkout, which must decrement <code>inventory.available_qty</code> and insert an <code>order</code> row atomically, leans on exactly this. Many distributed NoSQL stores trade this for availability and partition tolerance (the CAP theorem trade-off), offering tunable or eventual consistency instead — see <a href="#/distributed-systems-core">distributed-systems-core</a> for why this trade-off is forced, not optional, once you replicate across nodes.</li>
 </ul>
 
 <div class="callout">
   <div class="callout-title">A more useful question than "SQL or NoSQL?"</div>
-  <p>Ask instead: does my access pattern need multi-row transactions and ad-hoc joins (favor relational), is my data naturally a self-contained document that's always read/written as a whole (favor document store), do I need sub-millisecond lookups by a single key at massive scale (favor key-value), do I need to write huge volumes of time-ordered or wide-row data (favor column-family), or is the domain itself a graph of relationships I need to traverse (favor graph)? The category follows from the access pattern, not the reverse.</p>
+  <p>Ask instead: does my access pattern need multi-row transactions and ad-hoc joins (favor relational — ShopSphere's <code>orders</code>/<code>payments</code>/<code>inventory</code> core, where checkout must touch several tables atomically), is my data naturally a self-contained document that's always read/written as a whole (favor document store — a <code>Product</code> with its nested attributes and images), do I need sub-millisecond lookups by a single key at massive scale (favor key-value — a Redis <code>cart:{customerId}</code> lookup during browsing), do I need to write huge volumes of time-ordered or wide-row data (favor column-family — order-status-change events or clickstream logs feeding search-service), or is the domain itself a graph of relationships I need to traverse (favor graph — "customers who bought this also bought" traversal). The category follows from the access pattern, not the reverse.</p>
 </div>
 
 <h3>The major NoSQL categories and the concrete problem each one solves</h3>
@@ -38,27 +38,27 @@
   <tr>
     <td>Document</td>
     <td>MongoDB, Couchbase</td>
-    <td>Application objects are naturally nested (an order with line items, a user profile with addresses). Storing that as a single JSON-like document avoids the object-relational impedance mismatch of splitting it into five normalized tables and rejoining them on every read.</td>
+    <td>Application objects are naturally nested — a ShopSphere <code>Product</code> with variant attributes, images, and category-specific fields, or a <code>Review</code> with nested reply threads. Storing that as a single JSON-like document avoids the object-relational impedance mismatch of splitting it into five normalized tables and rejoining them on every catalog page load.</td>
   </tr>
   <tr>
     <td>Key-value</td>
     <td>Redis, DynamoDB, Riak</td>
-    <td>When the access pattern is purely "give me the value for this key," you don't need a query planner, joins, or a schema at all — you need the absolute minimum indirection between a hash lookup and the bytes on disk/memory, which is what makes these the fastest tier for point lookups.</td>
+    <td>When the access pattern is purely "give me the value for this key" — ShopSphere's session cart (<code>cart:{customerId} -&gt; CartItem[]</code>) or a per-product page-view counter — you don't need a query planner, joins, or a schema at all, just the minimum indirection between a hash lookup and the bytes on disk/memory, which is what makes these the fastest tier for point lookups.</td>
   </tr>
   <tr>
     <td>Column-family (wide-column)</td>
     <td>Cassandra, HBase, Bigtable</td>
-    <td>Built for workloads that write huge volumes of rows keyed by a partition key plus a sortable clustering key (time-series metrics, event logs) where you need very high write throughput and range scans within a partition, but never need cross-partition joins.</td>
+    <td>Built for workloads that write huge volumes of rows keyed by a partition key plus a sortable clustering key — e.g. ShopSphere's inventory-adjustment event log, partitioned by <code>productId</code> and clustered by timestamp — where you need very high write throughput and range scans within a partition, but never need cross-partition joins.</td>
   </tr>
   <tr>
     <td>Graph</td>
     <td>Neo4j, Amazon Neptune</td>
-    <td>When the query itself is "traverse relationships N hops deep" (friend-of-a-friend, fraud rings, recommendation paths), a relational engine has to do N nested joins that get combinatorially expensive; a graph engine stores adjacency directly so traversal is a pointer walk, not a join.</td>
+    <td>When the query itself is "traverse relationships N hops deep" — ShopSphere's "customers who bought X also bought Y" recommendation traversal, or tracing a fraud ring of accounts sharing payment methods — a relational engine has to do N nested joins that get combinatorially expensive; a graph engine stores adjacency directly so traversal is a pointer walk, not a join. See <a href="#/search-recommendation-systems">search-recommendation-systems</a> for how this feeds recommendation pipelines end to end.</td>
   </tr>
 </table>
 
 <h2>2. B-Tree Indexes: The Default for Disk-Backed Storage</h2>
-<p>An index exists to avoid scanning every row to answer a query. The interesting engineering question is: what data structure should back that index, given that the data lives on disk (or, more precisely, is read in fixed-size pages, typically 4KB–16KB, and each page read is orders of magnitude slower than an in-memory pointer dereference)?</p>
+<p>An index exists to avoid scanning every row to answer a query. Consider ShopSphere's <code>orders</code> table with 500 million rows: without an index, <code>SELECT * FROM orders WHERE id = 8841923</code> would mean reading every row until the engine happens to find the one it wants — a full table scan. The interesting engineering question is: what data structure should back the index that avoids this, given that the data lives on disk (or, more precisely, is read in fixed-size pages, typically 4KB–16KB, and each page read is orders of magnitude slower than an in-memory pointer dereference)?</p>
 
 <h3>Why not a binary search tree?</h3>
 <p>A balanced binary search tree gives you O(log₂ n) comparisons, which sounds fine until you account for what each "comparison" costs. If each node lives on its own disk page, then a tree over one billion rows needs about log₂(10⁹) ≈ 30 levels, meaning up to 30 random disk seeks per lookup. On a spinning disk (~10ms seek) that's 300ms for one lookup — unusable. Even on SSDs, random reads are far slower than sequential ones and you still pay 30 page faults per query.</p>
@@ -81,8 +81,8 @@ Leaf pages (sorted, linked list):
 <h3>Why this helps both equality and range queries</h3>
 <p>Because keys within a node are sorted, and leaf nodes are additionally linked together as a doubly-linked list, a B+Tree serves two access patterns well with the same structure:</p>
 <ul>
-  <li><strong>Equality lookup</strong> (<code>WHERE id = 4201</code>): walk down from root to leaf using binary search within each page, ~3-4 page reads total.</li>
-  <li><strong>Range query</strong> (<code>WHERE id BETWEEN 4200 AND 4300</code>): walk down to the starting leaf once, then walk sideways along the linked leaf pages until the range is exhausted — no need to revisit the root for each row.</li>
+  <li><strong>Equality lookup</strong> (<code>WHERE id = 8841923</code> on ShopSphere's <code>orders</code> table): walk down from root to leaf using binary search within each page, ~3-4 page reads total.</li>
+  <li><strong>Range query</strong> (<code>WHERE created_at BETWEEN '2026-08-01' AND '2026-08-25'</code> — a seller pulling last month's orders): walk down to the starting leaf once, then walk sideways along the linked leaf pages until the range is exhausted — no need to revisit the root for each row.</li>
 </ul>
 <p>This dual capability is precisely why B-Trees remain the standard index structure in Postgres, MySQL/InnoDB, Oracle, and SQL Server: a hash index could theoretically beat a B-Tree on pure equality lookups (O(1) vs O(log n)), but it provides no ordering, so it cannot serve range scans, <code>ORDER BY</code>, or prefix matches at all.</p>
 
@@ -91,8 +91,39 @@ Leaf pages (sorted, linked list):
   <p>An index is not free storage on the side — it is a second (or third, or tenth) data structure that must stay consistent with the table. Every <code>INSERT</code>, <code>UPDATE</code> of an indexed column, or <code>DELETE</code> has to also locate and modify the corresponding B-Tree leaf, potentially triggering a page split if the leaf is full. This is why tables with many indexes have measurably slower write throughput than the same table with fewer indexes — you're paying a write-amplification cost proportional to the number of indexed columns, not just the number of rows.</p>
 </div>
 
+<h3>Index types are not interchangeable: a taxonomy</h3>
+<p>"Add an index" is not one operation — different index structures are matched to different query shapes, and picking the wrong one either does nothing for performance or silently fails to apply at all. ShopSphere's schema uses several of these side by side:</p>
+<pre><code>Index structures (by the query shape they're built to serve)
+│
+├── B-Tree (B+Tree)                    default in Postgres/MySQL/Oracle/SQL Server
+│     Serves: equality AND range/order   e.g. orders(customer_id, created_at)
+│     Cannot do: arbitrary substring/full-text match, nearest-neighbor
+│
+├── Hash index                         Postgres HASH, DynamoDB partition key
+│     Serves: pure equality only, O(1)   e.g. sessions lookup by session_token
+│     Cannot do: range queries, ORDER BY, prefix match — no ordering is stored at all
+│
+├── Inverted index                     Elasticsearch/Solr/Postgres GIN (tsvector)
+│     Serves: "which rows contain this   e.g. full-text search over products.description
+│     token/word" — maps token -> list    ("wireless mouse" matches "wireless bluetooth
+│     of row ids (postings list)          mouse" via tokenization, not string equality)
+│     Cannot do: efficient range scans over the original untokenized value
+│
+├── GiST / R-Tree (generalized search tree)   Postgres GiST, MySQL SPATIAL
+│     Serves: "is this point inside this     e.g. "sellers within 10km of this delivery
+│     region," nearest-neighbor, overlap      address" using lat/long geometry
+│     Cannot do: simple scalar equality as efficiently as a plain B-Tree would
+│
+└── Bitmap index                        Postgres planner's bitmap scan, data-warehouse engines
+      Serves: combining several LOW-      e.g. products.category IN (5 values) AND
+      cardinality filters cheaply via       products.in_stock = true, on a reporting query
+      bitwise AND/OR of per-value bitmaps
+      Cannot do: high-cardinality columns (id, email) — bitmap per distinct value explodes
+</code></pre>
+<p>The B-Tree and hash rows matter most day to day: a hash index on <code>payments.idempotency_key</code> would answer "does this key already exist?" in O(1) with no ordering overhead, but the moment you also need <code>ORDER BY created_at</code> or a range scan on the same column, a hash index can't help at all — which is exactly why Postgres defaults every index to B-Tree unless you explicitly ask for something else. The inverted index matters for ShopSphere's product search: <code>catalog/search-service</code> (typically backed by Elasticsearch, not the primary relational store) tokenizes <code>products.name</code> and <code>products.description</code> into words, builds a postings list per token, and a search for "wireless mouse" becomes a lookup of the postings lists for "wireless" and "mouse" intersected together — something a B-Tree fundamentally cannot do, because a B-Tree only knows how to compare whole indexed values, not find one substring buried inside a text blob. See <a href="#/search-recommendation-systems">search-recommendation-systems</a> for how that search pipeline is built end to end, including ranking and ANN/vector search for "similar products."</p>
+
 <h2>3. LSM-Trees: Optimizing for Write Throughput</h2>
-<p>B-Trees are excellent for read-heavy, range-query-heavy workloads, but they have an inherent weakness for writes: an in-place update to a B-Tree leaf means a random write to a random disk location, and if that leaf is full, a page split that rewrites and re-links multiple pages. For workloads dominated by very high write volume (event logging, metrics ingestion, write-heavy feeds), this random-write cost becomes the bottleneck. The Log-Structured Merge Tree (LSM-Tree) is the structural answer, used by Cassandra, RocksDB, LevelDB, HBase, and as an optional storage engine in some MySQL forks (MyRocks).</p>
+<p>B-Trees are excellent for read-heavy, range-query-heavy workloads, but they have an inherent weakness for writes: an in-place update to a B-Tree leaf means a random write to a random disk location, and if that leaf is full, a page split that rewrites and re-links multiple pages. For workloads dominated by very high write volume — think ShopSphere's inventory-change event stream during a flash sale, where every one of ten thousand concurrent checkouts fires an <code>InventoryReserved</code> write, or a raw clickstream/page-view log feeding analytics — this random-write cost becomes the bottleneck. The Log-Structured Merge Tree (LSM-Tree) is the structural answer, used by Cassandra, RocksDB, LevelDB, HBase, and as an optional storage engine in some MySQL forks (MyRocks).</p>
 
 <h3>The structure: memtable + immutable SSTables</h3>
 <ol>
@@ -173,12 +204,12 @@ Read path:
 <p>Indexes are not free wins; each one is a trade of write cost and storage for read speed, and that trade isn't always worth it.</p>
 <ul>
   <li><strong>Write amplification per indexed column.</strong> Each additional index on a table means each <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> must also update that index's B-Tree, so a table with eight indexes pays roughly eight times the index-maintenance cost of a table with one index, on every write.</li>
-  <li><strong>Index bloat.</strong> Frequent updates and deletes leave behind dead entries in B-Tree leaves (particularly visible in Postgres, where an <code>UPDATE</code> is implemented as a delete-plus-insert due to MVCC, leaving old row versions that must be vacuumed). An un-vacuumed, bloated index can become larger than the table itself and paradoxically slower than a full table scan.</li>
+  <li><strong>Index bloat.</strong> Frequent updates and deletes leave behind dead entries in B-Tree leaves (particularly visible in Postgres, where an <code>UPDATE</code> is implemented as a delete-plus-insert due to MVCC — Multi-Version Concurrency Control, where readers see a consistent snapshot of a row as it existed at their transaction's start by keeping older row versions around instead of locking the row, so writers never block readers — leaving old row versions that must be vacuumed). An un-vacuumed, bloated index can become larger than the table itself and paradoxically slower than a full table scan.</li>
   <li><strong>Low-selectivity columns rarely earn their cost.</strong> An index on a boolean column or a column with three possible values doesn't narrow the search space enough to be worth the write and storage overhead — the planner will often ignore it and scan the table anyway.</li>
 </ul>
 
 <h2>5. Replication: Leader-Follower, Sync vs Async, and Replication Lag</h2>
-<p>Replication exists to solve two separate problems that are easy to conflate: durability/availability (if one node dies, another has the data) and read scalability (spread read load across multiple copies). The dominant pattern in relational systems is leader-follower (primary-replica): all writes go to a single leader, which then streams a log of changes (the write-ahead log, or a logical replication stream) to one or more followers, which replay it to stay in sync.</p>
+<p>Replication exists to solve two separate problems that are easy to conflate: durability/availability (if one node dies, another has the data) and read scalability (spread read load across multiple copies). The dominant pattern in relational systems is leader-follower (primary-replica): all writes go to a single leader, which then streams a log of changes (the write-ahead log, or a logical replication stream) to one or more followers, which replay it to stay in sync. ShopSphere's order-service is a canonical case for the second problem: every checkout writes to the leader, but "order history" pages, seller dashboards, and admin reporting queries are read-heavy and tolerant of a little staleness, so they get routed to dedicated <strong>order-history read replicas</strong> instead of competing with checkout writes for the same node's resources.</p>
 
 <h3>Synchronous vs asynchronous replication</h3>
 <table>
@@ -201,48 +232,48 @@ Read path:
   <tr>
     <td>Common deployment</td>
     <td>Semi-synchronous — one nearby follower is synchronous for durability, the rest are asynchronous for reach</td>
-    <td>Most read replicas in typical deployments (e.g., MySQL/Postgres read replicas used purely for scaling read traffic)</td>
+    <td>Most read replicas in typical deployments — e.g., ShopSphere's order-history replicas, which exist purely to absorb read traffic and can tolerate a second or two of staleness</td>
   </tr>
 </table>
 
 <h3>Replication lag and read-after-write consistency</h3>
-<p>Replication lag is simply the delay between a write committing on the leader and that write becoming visible on a given follower. It is not a bug — it's the direct, unavoidable cost of asynchronous replication, and it's why "read your own writes" is a named consistency problem rather than an assumed default: a user who updates their profile and is then immediately routed to a lagging read replica will see their old data, because the replica genuinely hasn't received the update yet.</p>
+<p>Replication lag is simply the delay between a write committing on the leader and that write becoming visible on a given follower. It is not a bug — it's the direct, unavoidable cost of asynchronous replication, and it's why "read your own writes" is a named consistency problem rather than an assumed default: a ShopSphere customer who just paid for an order and is then immediately routed to a lagging order-history replica will see status <code>CREATED</code> instead of <code>PAID</code>, because the replica genuinely hasn't received the update yet.</p>
 <div class="callout warn">
   <div class="callout-title">Concrete failure mode: the phantom revert</div>
-  <p>A user submits a form, the write succeeds on the leader, the page reloads and issues a read that's load-balanced to a replica still 200ms behind. The user sees their old data and, reasonably, assumes the save failed and resubmits — sometimes creating duplicate records. The fix is architectural, not a bigger box: route the read-after-write case to the leader (or a replica the application can verify has caught up, e.g., via a monotonic sequence/LSN check), or accept eventual consistency explicitly in the UI ("your changes may take a moment to appear").</p>
+  <p>A customer completes checkout, payment-service publishes <code>PaymentCaptured</code>, order-service's leader commits the status update to <code>PAID</code> — but the order confirmation page's next read is load-balanced to an order-history replica still 200ms behind. The customer sees <code>CREATED</code>, reasonably assumes the payment failed, and hits "place order" again, sometimes creating a duplicate order (this is exactly the class of bug <a href="#/payment-systems-idempotency">payment-systems-idempotency</a> covers from the payment side). The fix is architectural, not a bigger box: route the read-after-write case (the immediate post-checkout confirmation read) to the leader, or a replica the application can verify has caught up (e.g., via a monotonic sequence/LSN check), and let only the tolerant reads (order-history list pages, seller dashboards) hit the lagging replicas.</p>
 </div>
 
 <h2>6. Sharding: Horizontal Partitioning and Its Costs</h2>
-<p>Replication copies the same data onto multiple nodes to scale reads and provide redundancy; it does nothing for write scalability because every write still has to go through the single leader. Sharding (horizontal partitioning) solves a different problem: splitting the dataset itself across multiple nodes so that no single node holds all of it, letting both storage and write throughput scale by adding nodes.</p>
+<p>Replication copies the same data onto multiple nodes to scale reads and provide redundancy; it does nothing for write scalability because every write still has to go through the single leader. Sharding (horizontal partitioning) solves a different problem: splitting the dataset itself across multiple nodes so that no single node holds all of it, letting both storage and write throughput scale by adding nodes. This is the eventual answer to ShopSphere's <code>orders</code> table outgrowing a single machine as the marketplace grows past a few hundred million rows.</p>
 
 <h3>Choosing a sharding key</h3>
-<p>The sharding key determines which shard a given row lives on, and this single decision dominates the entire system's behavior. A poorly chosen key creates a <strong>hot shard</strong>: if you shard a multi-tenant system by <code>tenant_id</code> and one tenant is 100x larger than the others, that tenant's shard absorbs a disproportionate share of load while other shards sit idle — you've added machines but not actually distributed the work.</p>
+<p>The sharding key determines which shard a given row lives on, and this single decision dominates the entire system's behavior. Suppose ShopSphere shards <code>orders</code> by <code>customer_id</code>: every row for a given customer lands on the same shard, which is exactly what you want for the most common query ("show me this customer's order history") — it becomes a single-shard lookup instead of a scatter-gather across every node. A poorly chosen key creates a <strong>hot shard</strong>: if ShopSphere instead sharded by <code>seller_id</code> and one seller (say, a large brand running a flash sale) generates 100x the order volume of a typical seller, that seller's shard absorbs a disproportionate share of write load while other shards sit idle — you've added machines but not actually distributed the work.</p>
 
 <h3>Sharding strategies</h3>
 <table>
   <tr><th>Strategy</th><th>How it works</th><th>Trade-off</th></tr>
   <tr>
     <td>Range-based</td>
-    <td>Each shard owns a contiguous range of key values (e.g., user IDs 1–1M, 1M–2M)</td>
-    <td>Efficient range queries within a shard, but new data (e.g., always-increasing IDs or timestamps) piles onto the newest shard, creating a hot shard for write-heavy, append-style workloads</td>
+    <td>Each shard owns a contiguous range of key values (e.g., <code>customer_id</code> 1–1M on shard 1, 1M–2M on shard 2)</td>
+    <td>Efficient range queries within a shard, but new data (e.g., always-increasing order IDs, or newly-registered customer IDs) piles onto the newest shard, creating a hot shard for write-heavy, append-style workloads like order creation</td>
   </tr>
   <tr>
     <td>Hash-based</td>
-    <td>A hash function maps each key to a shard, spreading keys uniformly regardless of their natural ordering</td>
-    <td>Excellent write distribution, but range queries (e.g., "all orders from last week") must fan out to every shard, since consecutive keys are deliberately scattered</td>
+    <td>A hash function maps each key to a shard — e.g., <code>shard = hash(customer_id) % N</code> — spreading customers uniformly across shards regardless of signup order</td>
+    <td>Excellent write distribution during flash-sale spikes (no single shard absorbs all the newest checkouts), but a query like "all orders placed last week across all customers" must fan out to every shard, since consecutive customer IDs are deliberately scattered</td>
   </tr>
   <tr>
     <td>Directory-based</td>
-    <td>A separate lookup service/table maps each key (or key range) to a specific shard explicitly</td>
-    <td>Maximum flexibility — you can rebalance by moving individual entries in the directory — but the directory itself becomes a critical, latency-sensitive dependency and potential single point of failure</td>
+    <td>A separate lookup service/table maps each key (or key range) to a specific shard explicitly — e.g. a <code>customer_id -&gt; shard_id</code> directory order-service consults before routing a query</td>
+    <td>Maximum flexibility — you can rebalance by moving individual customers' data between shards without touching a hash formula — but the directory itself becomes a critical, latency-sensitive dependency and potential single point of failure</td>
   </tr>
 </table>
 
 <h3>Resharding pain and consistent hashing</h3>
-<p>With naive hash-based sharding (<code>shard = hash(key) % N</code>), adding or removing a single node changes <code>N</code>, which changes the modulus result for nearly every key — in practice, close to 100% of keys map to a different shard. That means a full data reshuffle just to add one machine, which is operationally unacceptable at scale. <strong>Consistent hashing</strong> fixes this by mapping both shards and keys onto a fixed hash ring (e.g., 0 to 2³²−1); each key belongs to the first shard found walking clockwise from its hash position. Adding or removing one shard now only affects the keys between that shard and its immediate neighbor on the ring — roughly <code>1/N</code> of all keys move, not nearly all of them. Virtual nodes (each physical shard is assigned many points on the ring) further smooth the distribution so that one shard doesn't end up owning a disproportionate arc just by chance.</p>
+<p>With naive hash-based sharding (<code>shard = hash(customer_id) % N</code>), adding or removing a single node changes <code>N</code>, which changes the modulus result for nearly every key — in practice, close to 100% of customers' orders would need to move to a different shard just to add one machine to handle ShopSphere's growth, which is operationally unacceptable at scale. <strong>Consistent hashing</strong> fixes this by mapping both shards and keys onto a fixed hash ring (e.g., 0 to 2³²−1); each key belongs to the first shard found walking clockwise from its hash position. Adding or removing one shard now only affects the keys between that shard and its immediate neighbor on the ring — roughly <code>1/N</code> of all customers' data moves, not nearly all of it. Virtual nodes (each physical shard is assigned many points on the ring) further smooth the distribution so that one shard doesn't end up owning a disproportionate arc just by chance.</p>
 
 <h3>Cross-shard queries and transactions: the fundamental cost</h3>
-<p>Sharding's core trade-off is this: anything that needs to touch data across more than one shard becomes dramatically harder. A query that filtered on the sharding key becomes a single targeted lookup; a query that doesn't (or an aggregate like "total revenue across all customers") has to scatter-gather across every shard and merge results in the application or a coordinating layer, paying the latency of the slowest shard and losing the ability to push sorting/filtering fully down to one engine. Transactions are worse: a relational transaction's ACID guarantees are native within one node's engine, but a transaction that must atomically update rows on two different shards requires a distributed transaction protocol (e.g., two-phase commit) or a compensating-transaction/saga pattern, both of which trade simplicity and latency for cross-shard atomicity. This is precisely why schema design for a sharded system usually starts from "what needs to be transactional together" and picks a sharding key that keeps those things co-located, rather than picking a key first and discovering the transactional boundaries don't fit — see <a href="#/distributed-systems-core">distributed-systems-core</a> for the deeper mechanics of distributed transactions and consensus.</p>
+<p>Sharding's core trade-off is this: anything that needs to touch data across more than one shard becomes dramatically harder. A query filtered on <code>customer_id</code> (the sharding key) becomes a single targeted lookup on one shard; a query that doesn't filter on it — an admin dashboard aggregate like "total revenue across all sellers this month" — has to scatter-gather across every shard and merge results in the application or a coordinating layer, paying the latency of the slowest shard and losing the ability to push sorting/filtering fully down to one engine. Transactions are worse: a relational transaction's ACID guarantees (Atomicity, Consistency, Isolation, Durability — a transaction's changes either all happen or none do, it never leaves data in a state that violates the database's constraints, concurrent transactions can't see each other's half-finished work, and once committed the result survives a crash) are native within one node's engine, but a transaction that must atomically update rows on two different shards — say, transferring loyalty points between two customers who happen to land on different shards — requires a distributed transaction protocol (e.g., two-phase commit) or a compensating-transaction/saga pattern, both of which trade simplicity and latency for cross-shard atomicity. This is precisely why schema design for a sharded system usually starts from "what needs to be transactional together" and picks a sharding key that keeps those things co-located — sharding <code>orders</code> by <code>customer_id</code> works well specifically because a single order's own rows (its <code>order_items</code>, its own status transitions) never need a cross-shard transaction, since they all belong to one customer and therefore one shard — rather than picking a key first and discovering the transactional boundaries don't fit. See <a href="#/distributed-systems-core">distributed-systems-core</a> for the deeper mechanics of distributed transactions and consensus.</p>
 
 <h2>7. Optimistic vs Pessimistic Locking</h2>
 <p>Both strategies solve the same problem — preventing two concurrent transactions from corrupting each other's updates to the same row (a lost update) — but they make opposite bets about how often conflicts actually happen.</p>
@@ -250,16 +281,16 @@ Read path:
 <h3>Pessimistic locking</h3>
 <p>Pessimistic locking assumes conflicts are likely, so it prevents them upfront by acquiring an exclusive lock before reading data it intends to modify, typically via <code>SELECT ... FOR UPDATE</code>. Any other transaction that tries to read (for update) or write that same row blocks until the lock holder commits or rolls back.</p>
 <div class="callout">
-  <div class="callout-title">Concrete scenario: seat reservation</div>
-  <p>Two customers try to book the last seat on a flight at nearly the same instant. With pessimistic locking, the first transaction runs <code>SELECT * FROM seats WHERE id = ? FOR UPDATE</code>, which locks that row; the second transaction's identical query blocks and waits. Once the first transaction commits (marking the seat booked) and releases the lock, the second transaction proceeds, re-reads the now-updated row, and correctly sees the seat is taken — no double-booking is possible because the second transaction was never allowed to read stale state while a conflicting write was in flight.</p>
+  <div class="callout-title">Concrete scenario: last item in stock</div>
+  <p>Two customers try to buy the last unit of a product at nearly the same instant during a flash sale. With pessimistic locking, the first transaction runs <code>SELECT * FROM inventory WHERE product_id = ? AND warehouse_id = ? FOR UPDATE</code>, which locks that row; the second transaction's identical query blocks and waits. Once the first transaction commits (decrementing <code>available_qty</code> to 0 and inserting the order) and releases the lock, the second transaction proceeds, re-reads the now-updated row, and correctly sees <code>available_qty = 0</code> — no overselling is possible because the second transaction was never allowed to read stale inventory state while a conflicting write was in flight.</p>
 </div>
 <p>The cost is contention: every transaction that wants the locked row must wait, and if lock acquisition order isn't carefully controlled across multiple tables, you risk deadlocks (transaction A holds lock 1 and waits for lock 2, while transaction B holds lock 2 and waits for lock 1), which the database eventually detects and resolves by forcibly aborting one of the transactions.</p>
 
 <h3>Optimistic locking</h3>
 <p>Optimistic locking assumes conflicts are rare, so it lets transactions proceed without locking and instead checks, at commit time, whether the data changed since it was read. The standard mechanism is a version column (or a timestamp) on the row: read the row along with its current <code>version</code>, and when writing, issue <code>UPDATE t SET data = ?, version = version + 1 WHERE id = ? AND version = ?</code> using the version value you originally read. If no other transaction modified the row in between, the <code>WHERE</code> clause matches and the update succeeds, incrementing the version. If another transaction won the race and already updated the row, the version no longer matches, zero rows are affected, and the application detects this and retries (typically by re-reading and reapplying the change, or surfacing a conflict to the user).</p>
 <div class="callout">
-  <div class="callout-title">Concrete scenario: editing a shared document field</div>
-  <p>Two team members open the same task record and both edit its description. With optimistic locking, both reads succeed immediately with no blocking. Whoever saves first succeeds and bumps the version. When the second person saves, their <code>UPDATE ... WHERE version = 3</code> matches zero rows because the version is now 4, so the application detects the conflict and either re-fetches the latest version for the user to merge manually, or in low-contention cases simply retries with the new data. Because conflicts here are genuinely rare (two people editing the exact same record within seconds is uncommon), paying an occasional retry is far cheaper than pessimistically locking the row on every single read.</p>
+  <div class="callout-title">Concrete scenario: a seller editing their product listing</div>
+  <p>A seller updates a product's price in one browser tab while an admin, moderating flagged listings, edits the same product's category in another tab. With optimistic locking, both reads succeed immediately with no blocking. Whoever saves first succeeds and bumps the version. When the second save arrives, its <code>UPDATE products SET ... WHERE id = ? AND version = 3</code> matches zero rows because the version is now 4, so the application detects the conflict and either re-fetches the latest row for a merge, or in low-contention cases simply retries with the new data. Because conflicts here are genuinely rare (a seller and an admin touching the exact same product within seconds is uncommon), paying an occasional retry is far cheaper than pessimistically locking the row on every single read — contrast this with the inventory row above, which is deliberately handled with pessimistic locking instead, precisely because contention on that row during a flash sale is not rare at all.</p>
 </div>
 
 <table>
@@ -309,6 +340,11 @@ Read path:
   <div class="qa-body">A non-covering index still requires, for every matching row, a second lookup from the index's leaf entry back to the actual row in the table's heap or clustered structure (a bookmark lookup) to fetch any column not present in the index. That second lookup is effectively a separate, often random, page read per row. A covering index eliminates that step entirely because every column the query needs — filter and select — already lives in the index's own leaf pages, so the engine can answer the query by reading only the index, cutting the number of page accesses roughly in half or more for queries returning many rows.</div>
 </details>
 
+<details class="concept-qa">
+  <summary>Why can't you just put a B-Tree index on a text column and get fast full-text search out of it?</summary>
+  <div class="qa-body">A B-Tree index stores and compares whole values in sorted order — it can answer "does this column equal exactly this string" or "what values fall between these two strings" very efficiently, because those are both operations on the value as a single sorted unit. Full-text search asks a fundamentally different question: "which rows contain this word anywhere inside a larger block of text," which requires the text to have already been broken into individual tokens, each mapped to the set of rows (or documents) that contain it — a postings list. A B-Tree has no mechanism for looking inside a value to find a substring match without a full scan; an inverted index solves exactly this by making the token itself the indexed key. This is why ShopSphere's product search over <code>products.description</code> is not served by adding a B-Tree index in Postgres — it needs a dedicated inverted-index structure such as Postgres GIN over a <code>tsvector</code>, or an external engine like Elasticsearch built entirely around inverted indexes and relevance ranking.</div>
+</details>
+
 <h2>Related Topics</h2>
 <div class="related-grid">
   <div class="related-card" onclick="window.location.hash='/distributed-systems-core'">
@@ -326,5 +362,17 @@ Read path:
   <div class="related-card" onclick="window.location.hash='/collections-internals'">
     <div class="rc-title">Collections Internals</div>
     <div class="rc-sub">Days vary · The same tree and hashing structures (skip lists, hash tables) reappear as in-memory building blocks</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/search-recommendation-systems'">
+    <div class="rc-title">Search &amp; Recommendation Systems</div>
+    <div class="rc-sub">Inverted indexes, ranking, and vector search extend product search well past what a B-Tree can express</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'">
+    <div class="rc-title">Payment Systems &amp; Idempotent Transactions</div>
+    <div class="rc-sub">Idempotency keys and version-based optimistic locking are the same conflict-detection idea applied to payments</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/batch-processing-scheduled-jobs'">
+    <div class="rc-title">Batch Processing &amp; Scheduled Jobs</div>
+    <div class="rc-sub">Nightly reporting and reconciliation jobs are exactly the read-heavy workload order-history replicas exist to absorb</div>
   </div>
 </div>

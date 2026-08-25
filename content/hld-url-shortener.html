@@ -38,6 +38,23 @@
 
 <h2>2. Core Decision: How to Generate the Short Code</h2>
 <p>The heart of the system is turning a long URL into a short, unique identifier. There are three broad strategies, and they differ in where they push the hard part of the "uniqueness" problem: onto a central sequence, onto a hash function's odds, or onto pre-allocated batches.</p>
+<pre><code>Short-code generation strategies
+|
++-- A. Centralized sequence (counter) + base62 encode
+|      uniqueness: guaranteed by construction (monotonic counter never repeats)
+|      bottleneck: every write serializes through one counter
+|      leak: sequential codes reveal creation order/volume
+|
++-- B. Content hash (MD5/SHA) + truncate + base62 encode
+|      uniqueness: probabilistic — truncation reintroduces collisions
+|      bottleneck: none (local computation, no shared state)
+|      needs: explicit collision-check-and-retry loop (rehash with a salt)
+|
++-- C. Pre-generated key pool (batched counter, claimed offline)
+       uniqueness: guaranteed by construction (single writer, like A)
+       bottleneck: amortized — one atomic batch claim per N writes, not per write
+       cost: an extra service to run; a crashed server wastes its unused batch remainder</code></pre>
+<p>All three strategies are variations on the same base62 encoding trick from Section 2's Approach A — only the input to that encoding step changes (a counter value, a hash prefix, or a value drawn from a pre-claimed batch). That same trick generalizes anywhere a system needs a short, URL-safe, human-shareable token for something that's internally just a large number — for example, a ShopSphere order-tracking link (<code>shopsphere.com/t/9kLmZ2</code>) could base62-encode an internal order ID exactly the same way, trading a guessable sequential order number for a compact opaque one.</p>
 
 <h3>Approach A: Auto-increment ID + Base62 encoding</h3>
 <p>Maintain a single, globally increasing integer counter (e.g., a database sequence or an auto-increment primary key). Every new URL gets the next integer, and that integer is encoded into a short, URL-safe string using base62 — the alphabet <code>[0-9a-zA-Z]</code>, 62 symbols, chosen specifically because it's safe to put directly into a URL path with no escaping needed (unlike base64, which includes <code>+</code>, <code>/</code>, and padding <code>=</code> that all have special meaning in a URL).</p>
@@ -127,7 +144,7 @@ App Server A                        App Server B
 </div>
 
 <h2>6. Rate Limiting the Creation Endpoint</h2>
-<p>The creation endpoint is the one part of this system that does meaningful work per request — generating or validating a code, writing a row — and is also the part exposed to abuse: a scripted client can hammer it to exhaust the short-code keyspace, flood the database with writes, or use the service as a URL-obfuscation layer for spam and phishing links (hiding a malicious destination behind an innocuous-looking short link is a well-known abuse pattern for this exact kind of service). Rate limiting the creation endpoint — by client IP, API key, or authenticated user ID — bounds this without affecting the redirect path at all, since the two are logically and often physically separate endpoints.</p>
+<p>The creation endpoint is the one part of this system that does meaningful work per request — generating or validating a code, writing a row — and is also the part exposed to abuse: a scripted client can hammer it to exhaust the short-code keyspace, flood the database with writes, or use the service as a URL-obfuscation layer for spam and phishing links (hiding a malicious destination behind an innocuous-looking short link is a well-known abuse pattern for this exact kind of service). Rate limiting the creation endpoint — by client IP, API key, or authenticated user ID — bounds this without affecting the redirect path at all, since the two are logically and often physically separate endpoints. The phishing angle is worth taking seriously rather than treating as a footnote: because the short code carries no visible information about its destination, this class of service is a standing target for disguising malicious links, and defending against it (destination-URL scanning against known-bad-URL lists, warning interstitials for newly created or low-reputation links) is really an input-validation and abuse-prevention problem, the same family of concerns covered generally in <a href="#/security-hardening-owasp">security-hardening-owasp</a>.</p>
 <p>The choice of algorithm here follows the general trade-offs of rate limiting rather than anything specific to URL shortening: a token bucket is a natural fit because it allows a legitimate burst (a user pasting in and shortening ten links from a spreadsheet at once) while still enforcing a steady-state average rate, whereas a strict fixed window would either reject that entire legitimate burst or, at a window boundary, let through nearly double the intended rate. The redirect endpoint is deliberately <em>not</em> rate limited the same way (or is limited far more permissively) — throttling redirects would directly contradict the availability requirement from Section 1, since a redirect is usually not an action initiated by the same client repeatedly in a way that indicates abuse, but rather many different end users clicking a link that was shared once.</p>
 
 <h2>7. Scaling the Redirect Service Horizontally</h2>
@@ -141,6 +158,9 @@ App Server A                        App Server B
    -> issue 302 redirect to client               (response sent, latency-critical, done)
    -> publish {short_code, timestamp, referrer,
                ip_hash, user_agent} to a queue    (fire-and-forget from the request's perspective)
+               -- ip_hash: a one-way hash of the client IP, not the
+                  raw IP, so rough geography/uniqueness can still be
+                  derived for analytics without storing PII verbatim
 
                      |
                      v
@@ -195,4 +215,5 @@ App Server A                        App Server B
 <div class="related-card" onclick="window.location.hash='/hld-basics-scaling'"><div class="rc-title">HLD Basics &amp; Scaling</div><div class="rc-sub">Days 01–05 · Statelessness and load balancing behind horizontally scaling the redirect tier</div></div>
 <div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">Days 06–10 · How access patterns, not schema complexity, drive indexing and read-scaling decisions</div></div>
 <div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience &amp; Fault Tolerance</div><div class="rc-sub">Isolating non-critical work like analytics from a latency-sensitive critical path</div></div>
+<div class="related-card" onclick="window.location.hash='/security-hardening-owasp'"><div class="rc-title">Security Hardening: Input Validation, Secrets Management &amp; OWASP Top 10</div><div class="rc-sub">Defending the creation endpoint against phishing/spam abuse of an opaque short code</div></div>
 </div>

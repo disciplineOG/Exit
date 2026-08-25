@@ -18,30 +18,41 @@
 
 <h2>1. The Richardson Maturity Model — a vocabulary for "how RESTful"</h2>
 <p>"Is this API RESTful?" is usually an unanswerable yes/no question because REST (Representational State Transfer) as Roy Fielding defined it is a constraint set, not a checkbox. The Richardson Maturity Model gives you four levels so you can say precisely which constraints an API satisfies, which is far more useful than arguing about the label.</p>
+<pre><code>Level 3  HATEOAS               responses carry links describing legal next actions
+           |                   (rare in practice - see below)
+Level 2  HTTP verbs + status codes used correctly
+           |                   nouns as URIs, GET/POST/PUT/DELETE carry meaning,
+           |                   status codes communicate outcome  <- most real APIs stop here
+Level 1  Resources, one verb
+           |                   distinct URIs per resource, but everything is POST
+           |                   (/orders/42/cancel as a POST-only "action" URI)
+Level 0  POX (Plain Old XML/JSON) - the RPC swamp
+                                one endpoint, verb-in-body, HTTP is just a transport tunnel</code></pre>
+<p>Each level strictly adds a constraint on top of the one below it — Level 2 doesn't replace Level 1's resource URIs, it adds correct verb/status-code usage on top of them, and Level 3 adds hypermedia on top of that. This is why the model is a ladder you can point at a real API and say "this one satisfies Level 2, and here's specifically the Level 3 constraint it doesn't," rather than a binary RESTful/not-RESTful label.</p>
 
 <h3>Level 0 — the swamp of POX (Plain Old XML/JSON)</h3>
 <p>A single endpoint, usually POST, that acts as an RPC dispatcher. The HTTP verb and URI carry no meaning — everything is decided by an "action" or "method" field in the body.</p>
 <pre><code>POST /api
-{ "action": "getUser", "id": 42 }
+{ "action": "getOrder", "orderId": 8831 }
 
 POST /api
-{ "action": "deleteUser", "id": 42 }</code></pre>
+{ "action": "cancelOrder", "orderId": 8831 }</code></pre>
 <p>This is HTTP used purely as a transport tunnel, functionally identical to SOAP or a raw RPC framework. HTTP infrastructure — caches, proxies, load balancers, browsers — cannot help you at all because it has no visibility into what the request actually does.</p>
 
 <h3>Level 1 — resources, one verb</h3>
 <p>You introduce distinct URIs per resource, but still funnel everything through one HTTP method (almost always POST):</p>
-<pre><code>POST /users/42/get
-POST /users/42/delete
-POST /users/42/promote</code></pre>
-<p>This is progress — at least the URI names a thing — but the verb-in-the-path pattern (<code>/get</code>, <code>/delete</code>) is a strong signal that the API hasn't adopted HTTP semantics yet; it's still RPC, just with prettier addresses.</p>
+<pre><code>POST /orders/8831/get
+POST /orders/8831/cancel
+POST /orders/8831/promoteToPriority</code></pre>
+<p>This is progress — at least the URI names a thing — but the verb-in-the-path pattern (<code>/get</code>, <code>/cancel</code>) is a strong signal that the API hasn't adopted HTTP semantics yet; it's still RPC, just with prettier addresses.</p>
 
 <h3>Level 2 — HTTP verbs and status codes used correctly</h3>
 <p>This is where the overwhelming majority of real-world "REST" APIs live, and it's a perfectly legitimate place to stop. Resources are nouns, HTTP methods carry the meaning of the operation, and status codes communicate the outcome:</p>
-<pre><code>GET    /users/42        → 200 OK
-POST   /users           → 201 Created
-PUT    /users/42        → 200 OK / 204 No Content
-DELETE /users/42        → 204 No Content
-GET    /users/999       → 404 Not Found</code></pre>
+<pre><code>GET    /api/v1/orders/8831        → 200 OK
+POST   /api/v1/orders             → 201 Created
+PUT    /api/v1/orders/8831        → 200 OK / 204 No Content
+DELETE /api/v1/orders/8831        → 204 No Content
+GET    /api/v1/orders/999999      → 404 Not Found</code></pre>
 <p>Reverse proxies can now cache GETs, browsers can prefetch safely, monitoring can alert on 5xx rates without parsing bodies, and any HTTP-aware tool (curl, an API gateway, a service mesh) understands the shape of the traffic without custom logic. This is almost always the right target for internal and external APIs — Level 3 buys diminishing returns for the complexity it costs.</p>
 
 <h3>Level 3 — HATEOAS (Hypermedia as the Engine of Application State)</h3>
@@ -50,9 +61,9 @@ GET    /users/999       → 404 Not Found</code></pre>
   "orderId": 8831,
   "status": "PENDING_PAYMENT",
   "_links": {
-    "self":   { "href": "/orders/8831" },
-    "pay":    { "href": "/orders/8831/payment", "method": "POST" },
-    "cancel": { "href": "/orders/8831/cancel",  "method": "POST" }
+    "self":   { "href": "/api/v1/orders/8831" },
+    "pay":    { "href": "/api/v1/orders/8831/payment", "method": "POST" },
+    "cancel": { "href": "/api/v1/orders/8831/cancellation", "method": "POST" }
   }
 }</code></pre>
 <p>The theoretical payoff is huge: the server can change URI structure, retire an action, or add a new state transition, and a hypermedia-aware client adapts automatically because it never hardcoded a path — it just follows whatever links are present. In practice this level is rare, for concrete reasons:</p>
@@ -70,36 +81,68 @@ GET    /users/999       → 404 Not Found</code></pre>
 <p>A URI names a resource — a thing that has representation and state — not an operation. The verb belongs to the HTTP method:</p>
 <table>
   <tr><th>Instead of</th><th>Use</th></tr>
-  <tr><td><code>POST /createOrder</code></td><td><code>POST /orders</code></td></tr>
-  <tr><td><code>POST /orders/42/cancelOrder</code></td><td><code>POST /orders/42/cancellation</code> or <code>PATCH /orders/42 {"status":"CANCELLED"}</code></td></tr>
-  <tr><td><code>GET /getUserOrders?userId=42</code></td><td><code>GET /users/42/orders</code></td></tr>
+  <tr><td><code>POST /createOrder</code></td><td><code>POST /api/v1/orders</code></td></tr>
+  <tr><td><code>POST /orders/42/cancelOrder</code></td><td><code>POST /api/v1/orders/42/cancellation</code> or <code>PATCH /api/v1/orders/42 {"status":"CANCELLED"}</code></td></tr>
+  <tr><td><code>GET /getCustomerOrders?customerId=42</code></td><td><code>GET /api/v1/customers/42/orders</code></td></tr>
 </table>
-<p>Some actions genuinely resist noun-ification (<code>login</code>, <code>search</code>, bulk <code>import</code>). Modeling them as a resource — a "session" you create with <code>POST /sessions</code>, a "search" you create with <code>POST /searches</code> whose result you then <code>GET</code> — keeps the verb discipline intact even for workflow-shaped operations, though a pragmatic, well-documented action endpoint is a reasonable escape hatch rather than a design failure.</p>
+<p>Some actions genuinely resist noun-ification (<code>login</code>, <code>search</code>, bulk <code>import</code>). Modeling them as a resource — a "session" you create with <code>POST /api/v1/sessions</code> when a Customer logs in, a "search" you create with <code>POST /api/v1/product-searches</code> whose result you then <code>GET</code> — keeps the verb discipline intact even for workflow-shaped operations, though a pragmatic, well-documented action endpoint is a reasonable escape hatch rather than a design failure.</p>
 
 <h3>Nesting for ownership</h3>
-<p>Nest a resource under its parent when the child cannot meaningfully exist, or cannot be addressed uniquely, without the parent: <code>/users/42/orders/17</code> says order 17 belongs to user 42. Two rules keep nesting from spiraling out of control:</p>
+<p>Nest a resource under its parent when the child cannot meaningfully exist, or cannot be addressed uniquely, without the parent: <code>/api/v1/customers/42/orders/17</code> says order 17 belongs to customer 42. Two rules keep nesting from spiraling out of control:</p>
 <ul>
-  <li><strong>Nest one level deep for the primary relationship, then flatten.</strong> <code>/users/42/orders/17/items/3</code> is defensible; <code>/companies/9/departments/2/employees/42/orders/17/items/3</code> forces every client to carry the whole ancestry chain just to fetch one order line. Prefer exposing the leaf resource at its own root once it has a globally unique ID: <code>/orders/17/items/3</code>, with <code>/users/42/orders</code> reserved for the "list orders belonging to this user" view.</li>
-  <li><strong>If a resource can have more than one legitimate parent</strong> (an order item might logically hang off an order or off a warehouse shipment), nesting under just one parent is misleading — model it as a top-level resource referenced by ID from both, not nested under either.</li>
+  <li><strong>Nest one level deep for the primary relationship, then flatten.</strong> <code>/api/v1/orders/17/items/3</code> is defensible; <code>/api/v1/marketplaces/9/regions/2/customers/42/orders/17/items/3</code> forces every client to carry the whole ancestry chain just to fetch one order line. Prefer exposing the leaf resource at its own root once it has a globally unique ID: <code>/api/v1/orders/17/items/3</code>, with <code>/api/v1/customers/42/orders</code> reserved for the "list orders belonging to this customer" view.</li>
+  <li><strong>If a resource can have more than one legitimate parent</strong> (an <code>OrderItem</code> might logically hang off an <code>Order</code> or off a warehouse shipment record in <code>inventory-service</code>), nesting under just one parent is misleading — model it as a top-level resource referenced by ID from both, not nested under either.</li>
 </ul>
 
 <h3>Query parameters vs. path segments</h3>
 <p>The path identifies <em>which resource</em>; the query string modifies <em>how you want to view or filter a collection</em>. A useful test: if the value is part of what makes the resource unique and addressable, it's a path segment; if it's a lens applied to a collection (filtering, sorting, pagination, field selection), it's a query parameter.</p>
-<pre><code>GET /orders/17                       — a single, uniquely identified resource → path
-GET /orders?status=SHIPPED&sort=-createdAt&limit=50   — a filtered, ordered view of a collection → query params
-GET /orders/17/items                 — a sub-collection identified by its parent → path
-GET /orders/17/items?category=electronics             — that sub-collection, filtered → query params</code></pre>
+<pre><code>GET /api/v1/orders/17                       — a single, uniquely identified resource → path
+GET /api/v1/orders?status=SHIPPED&sort=-createdAt&limit=50   — a filtered, ordered view of a collection → query params
+GET /api/v1/orders/17/items                 — a sub-collection identified by its parent → path
+GET /api/v1/products?category=electronics&inStock=true       — the catalog, filtered → query params</code></pre>
 
 <h2>3. HTTP status codes: precise semantics in the 4xx range</h2>
 <p>Returning the wrong status code isn't a cosmetic issue — clients (including retry middleware, circuit breakers, and monitoring) branch on the status code, not on the response body's prose. A 500 for a validation error tells a resilience layer "the server is unhealthy, back off and retry"; a 422 for the same error correctly tells it "this specific request is unfixable by retrying, surface it to the user."</p>
+
+<h3>The five status-code classes, at a glance</h3>
+<p>Before the 4xx detail below, it's worth having the whole taxonomy in view — every status code's first digit tells any HTTP-aware intermediary (proxy, gateway, browser, retry middleware) which of five broad categories a response falls into, without it needing to parse a single byte of the body:</p>
+<pre><code>1xx  Informational   — request received, protocol-level, processing continues
+       100 Continue                client may proceed to send the request body
+       101 Switching Protocols     e.g. upgrading an HTTP connection to WebSocket
+
+2xx  Success          — the request was received, understood, and accepted
+       200 OK                      generic success, body carries the result
+       201 Created                 a new resource now exists (POST /api/v1/orders)
+       202 Accepted                accepted for async processing, not yet done
+                                    (checkout accepted, inventory reservation in flight)
+       204 No Content              success, deliberately no response body
+                                    (DELETE /api/v1/carts/8841/items/3)
+
+3xx  Redirection      — the client must take an additional step to complete the request
+       301 Moved Permanently       resource now lives at a new URI, update bookmarks
+       304 Not Modified            cached representation is still valid (conditional GET)
+
+4xx  Client Error     — the request itself is the problem; retrying unchanged won't help
+       400 / 401 / 403 / 404 / 409 / 422  — see the table below
+
+5xx  Server Error     — the server failed to fulfill a valid request; may be transient
+       500 Internal Server Error   unhandled exception, generic catch-all
+       502 Bad Gateway             upstream service (e.g. payment-service) returned garbage
+       503 Service Unavailable     server temporarily can't handle the request (overload,
+                                    deploy in progress) — often paired with a Retry-After header
+       504 Gateway Timeout         an upstream call (order-service -> inventory-service)
+                                    exceeded its deadline</code></pre>
+<p>The 4xx/5xx boundary is the single most consequential line in this taxonomy for retry logic (see <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a>): a 5xx is a signal that the <em>server</em> failed and the same request might succeed later (transient overload, a crashed dependency), so retrying — ideally with backoff — is reasonable. A 4xx is a signal that the <em>request</em> is the problem, and retrying the exact same request will fail identically every time; a well-behaved client should not blindly retry a 4xx (400/404/409/422) the way it would a 503, though a 409 conflict specifically can sometimes be resolved by re-fetching state and retrying with corrected data, which is different from a blind retry of the same bytes.</p>
+
+<h3>Precise 4xx semantics</h3>
 <table>
   <tr><th>Code</th><th>Meaning</th><th>When to use it, precisely</th></tr>
   <tr><td>400 Bad Request</td><td>Malformed request</td><td>The request itself is syntactically broken — invalid JSON, wrong content-type, a required field of the wrong data type. The server couldn't even parse enough to evaluate business rules.</td></tr>
-  <tr><td>401 Unauthorized</td><td>Not authenticated</td><td>The caller's identity is missing or the credential is invalid/expired. Despite the name, this is about <em>authentication</em>, not authorization — "I don't know who you are."</td></tr>
-  <tr><td>403 Forbidden</td><td>Authenticated but not permitted</td><td>The server knows exactly who you are and you are not allowed to do this. Never return 403 when you actually mean "you're not logged in" — that's 401.</td></tr>
+  <tr><td>401 Unauthorized</td><td>Not authenticated</td><td>The caller's identity is missing or the credential is invalid/expired. Despite the name, this is about <em>authentication</em>, not authorization — "I don't know who you are." (See <a href="#/spring-security">spring-security</a> for the full authentication-vs-authorization mechanics.)</td></tr>
+  <tr><td>403 Forbidden</td><td>Authenticated but not permitted</td><td>The server knows exactly who you are and you are not allowed to do this — e.g. a Customer's JWT is valid, but they're trying to <code>POST /api/v1/admin/refunds</code>, which requires <code>ROLE_ADMIN</code>. Never return 403 when you actually mean "you're not logged in" — that's 401.</td></tr>
   <tr><td>404 Not Found</td><td>Resource doesn't exist (or you won't say)</td><td>Also legitimately used to hide the existence of a resource from unauthorized callers — returning 403 on someone else's private order confirms it exists; 404 reveals nothing.</td></tr>
-  <tr><td>409 Conflict</td><td>Request conflicts with current server state</td><td>The request is well-formed and permitted, but can't be applied right now given the resource's current state — a version mismatch on optimistic locking, trying to create a user with an email that already exists, trying to cancel an order that has already shipped.</td></tr>
-  <tr><td>422 Unprocessable Entity</td><td>Semantically invalid</td><td>Syntactically valid (parses fine, right types) but fails business validation — an end date before a start date, a discount percentage over 100. The distinction from 400 is subtle but matters: 400 means "I couldn't understand this," 422 means "I understood it perfectly and it's still wrong."</td></tr>
+  <tr><td>409 Conflict</td><td>Request conflicts with current server state</td><td>The request is well-formed and permitted, but can't be applied right now given the resource's current state — a version mismatch on optimistic locking, a Seller trying to create a Product SKU that already exists in their catalog, a Customer trying to cancel an Order that's already SHIPPED.</td></tr>
+  <tr><td>422 Unprocessable Entity</td><td>Semantically invalid</td><td>Syntactically valid (parses fine, right types) but fails business validation — a Coupon's <code>percentOff</code> over 100, a Review's <code>rating</code> outside 1–5. The distinction from 400 is subtle but matters: 400 means "I couldn't understand this," 422 means "I understood it perfectly and it's still wrong."</td></tr>
 </table>
 <div class="callout warn">
   <p>A common and costly mistake is collapsing every failure into 400 or, worse, always returning 200 with an <code>"error"</code> field in the body. This defeats every piece of HTTP-aware infrastructure sitting in front of your service — API gateways, client SDKs generated from <a href="#/api-design-versioning">OpenAPI</a>, and retry/circuit-breaker logic (see <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a>) all key off the status code to decide whether to retry, alert, or fail fast. A 200-wrapped error is invisible to all of them until someone inspects the body.</p>
@@ -113,76 +156,76 @@ GET /orders/17/items?category=electronics             — that sub-collection, f
   <tr><td>GET</td><td>Yes</td><td>Yes</td><td>Read-only by definition; repeating it changes nothing.</td></tr>
   <tr><td>PUT</td><td>No</td><td>Yes</td><td>PUT means "make the resource at this URI look exactly like this representation." Sending the same representation five times leaves the resource in the same final state as sending it once.</td></tr>
   <tr><td>DELETE</td><td>No</td><td>Yes</td><td>After the first delete the resource is gone; the second delete finds nothing to delete (typically 404 or a no-op 204). Server state after N deletes equals server state after 1 delete.</td></tr>
-  <tr><td>POST</td><td>No</td><td>No</td><td>POST means "create a new subordinate resource" or "execute a non-idempotent action." Two identical POSTs to <code>/orders</code> naturally create two orders — that's the whole reason it isn't idempotent by specification.</td></tr>
-  <tr><td>PATCH</td><td>No</td><td>Not guaranteed</td><td>Depends entirely on the semantics of the patch. <code>{"status": "SHIPPED"}</code> is idempotent (setting the same value twice is a no-op the second time); <code>{"$inc": {"quantity": 1}}</code> is not (each application changes the result).</td></tr>
+  <tr><td>POST</td><td>No</td><td>No</td><td>POST means "create a new subordinate resource" or "execute a non-idempotent action." Two identical POSTs to <code>/api/v1/orders</code> naturally create two orders — that's the whole reason it isn't idempotent by specification.</td></tr>
+  <tr><td>PATCH</td><td>No</td><td>Not guaranteed</td><td>Depends entirely on the semantics of the patch. <code>{"status": "SHIPPED"}</code> is idempotent (setting the same value twice is a no-op the second time); <code>{"$inc": {"stockQuantity": -1}}</code> is not (each application changes the result — decrementing inventory twice leaves stock two units lower, not one).</td></tr>
 </table>
 
 <h3>Why this matters for retries</h3>
-<p>Network failures are ambiguous by nature: if a client sends a request and the connection drops before a response arrives, the client cannot tell whether the server never received the request, received it but crashed before processing, or processed it successfully and the response was lost in transit. The only safe general strategy on a timeout is "retry" — but retrying is only safe without qualification when the method is idempotent. Blindly retrying a POST on a timeout is how you end up with two orders, two emails sent, or two payment charges for what the client believed was one action.</p>
+<p>Network failures are ambiguous by nature: if a client sends a request and the connection drops before a response arrives, the client cannot tell whether the server never received the request, received it but crashed before processing, or processed it successfully and the response was lost in transit. The only safe general strategy on a timeout is "retry" — but retrying is only safe without qualification when the method is idempotent. Blindly retrying <code>POST /api/v1/orders</code> on a timeout is how a Customer's checkout ends up placing two Orders, or how a flash-sale spike hammering checkout with client-side retry logic ends up double-charging a Payment for what the Customer believed was one purchase.</p>
 
 <h3>The Idempotency-Key pattern</h3>
 <p>Since POST is inherently non-idempotent by specification but many POST operations (creating a payment, placing an order) desperately need retry-safety in practice, the standard fix is to make idempotency an explicit, application-level contract layered on top of HTTP rather than relying on the method semantics:</p>
 <ol>
-  <li>The client generates a unique key (typically a UUID) once, at the moment the user initiates the logical operation — not once per HTTP attempt.</li>
+  <li>The client generates a unique key (typically a UUID) once, at the moment the Customer clicks "Place Order" — not once per HTTP attempt.</li>
   <li>The client sends this key on every attempt, usually as a header: <code>Idempotency-Key: 6f1c1a1e-...</code>.</li>
   <li>The server, before executing the side effect, checks whether it has already seen this key. If not, it executes the operation, stores the key alongside the result (and typically the request payload's hash, to detect misuse), and returns the result.</li>
   <li>If the server has seen the key before, it does <em>not</em> re-execute the side effect — it returns the stored result from the first execution, verbatim.</li>
 </ol>
-<pre><code>POST /payments
+<pre><code>POST /api/v1/orders
 Idempotency-Key: 6f1c1a1e-9b2e-4b7a-8e34-9d1a2b3c4d5e
-{ "amount": 4999, "currency": "USD", "orderId": 17 }
+{ "customerId": 8841, "items": [{"productId": "prod-42", "quantity": 2}] }
 
-// Server logic (conceptual)
+// Server logic (conceptual, inside order-service)
 key = request.header("Idempotency-Key")
 existing = idempotencyStore.get(key)
 if existing != null:
-    return existing.response, existing.statusCode   // no charge attempted again
+    return existing.response, existing.statusCode   // no second Order created, no second charge
 else:
-    result = chargeCard(request.body)                // executes exactly once
-    idempotencyStore.put(key, result, ttl = 24h)
-    return result</code></pre>
-<p>The store lookup and the side effect must be made atomic — typically via a unique constraint on the idempotency key column in the same transaction that inserts the payment row, or a distributed lock — otherwise two near-simultaneous retries can both pass the "not seen yet" check and both charge the card, which defeats the entire purpose. A TTL (commonly 24 hours) bounds how long the server needs to remember keys; after expiry, reusing an old key is treated as a brand-new operation, which is an acceptable trade-off since legitimate retries happen within seconds to minutes, not days.</p>
+    order = createOrderAndReserveInventory(request.body)   // executes exactly once
+    idempotencyStore.put(key, order, ttl = 24h)
+    return order, 201</code></pre>
+<p>The store lookup and the side effect must be made atomic — typically via a unique constraint on the idempotency key column in the same transaction that inserts the <code>Order</code> row, or a distributed lock — otherwise two near-simultaneous retries (the client's HTTP library retrying on timeout while the first attempt is still mid-flight) can both pass the "not seen yet" check and both create an Order, which defeats the entire purpose. A TTL (commonly 24 hours) bounds how long the server needs to remember keys; after expiry, reusing an old key is treated as a brand-new operation, which is an acceptable trade-off since legitimate retries happen within seconds to minutes, not days. This exact mechanism is what protects <code>payment-service</code>'s <code>Payment.idempotencyKey</code> field from a duplicate card capture on the same order — see <a href="#/payment-systems-idempotency">payment-systems-idempotency</a> for the full mechanics of applying this pattern specifically to money-moving operations, including how it composes with database-level unique constraints and distributed locks under real concurrent load.</p>
 <div class="callout tip">
-  <p>Notice what this pattern actually does architecturally: it converts a non-idempotent HTTP method into an idempotent <em>operation</em> by pushing deduplication into application state, keyed by something the client controls. This is the same underlying idea as deduplication in message-driven systems (<a href="#/microservice-patterns">microservice-patterns</a>) — "at-least-once delivery plus a dedup key equals effectively-once processing" — just applied at the HTTP layer instead of a message broker.</p>
+  <p>Notice what this pattern actually does architecturally: it converts a non-idempotent HTTP method into an idempotent <em>operation</em> by pushing deduplication into application state, keyed by something the client controls. This is the same underlying idea as deduplication in message-driven systems (<a href="#/microservice-patterns">microservice-patterns</a>) — "at-least-once delivery plus a dedup key equals effectively-once processing" — just applied at the HTTP layer instead of a message broker. A Kafka consumer processing <code>OrderPlaced</code> or <code>PaymentCaptured</code> events downstream of this same checkout flow needs the identical discipline: at-least-once delivery from the broker plus a dedup key (often the same idempotency key, carried through as an event field) to avoid, say, <code>notification-service</code> sending a Customer two "your order shipped" emails for one <code>OrderShipped</code> event redelivery.</p>
 </div>
 
 <h2>5. API versioning strategies</h2>
-<p>Versioning exists because backward compatibility is not always achievable — sometimes a resource's shape or a field's meaning has to change in a way that breaks existing clients, and you need a way to serve both the old and new contract simultaneously while clients migrate on their own schedule.</p>
+<p>Versioning exists because backward compatibility is not always achievable — sometimes a resource's shape or a field's meaning has to change in a way that breaks existing clients, and you need a way to serve both the old and new contract simultaneously while clients migrate on their own schedule. ShopSphere's <code>/products</code> catalog API is a good concrete case: a redesign that splits a single flat <code>price</code> field into <code>{basePrice, currency, taxIncluded}</code> to support international Sellers is a breaking shape change for every existing client of the catalog-service that expects a single numeric <code>price</code>.</p>
 <table>
   <tr><th>Strategy</th><th>Example</th><th>Strengths</th><th>Weaknesses</th></tr>
-  <tr><td>URI versioning</td><td><code>/v1/orders</code>, <code>/v2/orders</code></td><td>Extremely visible and discoverable; trivial to route at a gateway/load-balancer level without inspecting headers; easy to test with a browser or curl.</td><td>Violates the idea that a URI identifies a resource — <code>/v1/orders/17</code> and <code>/v2/orders/17</code> are "the same" order at two different addresses, which complicates caching and linking. Encourages whole-API version bumps even when only one resource changed.</td></tr>
+  <tr><td>URI versioning</td><td><code>/api/v1/products</code>, <code>/api/v2/products</code></td><td>Extremely visible and discoverable; trivial to route at a gateway/load-balancer level without inspecting headers; easy to test with a browser or curl.</td><td>Violates the idea that a URI identifies a resource — <code>/api/v1/products/42</code> and <code>/api/v2/products/42</code> are "the same" product at two different addresses, which complicates caching and linking. Encourages whole-API version bumps even when only the catalog resource changed.</td></tr>
   <tr><td>Header-based</td><td><code>Api-Version: 2</code> or a custom header</td><td>Keeps the URI stable as the true resource identifier; version is metadata about the request, not the resource's identity.</td><td>Invisible in logs, browser address bars, and casual curl testing unless you know to look; easy for a client to forget to set it and silently get default (often latest, sometimes oldest) behavior; harder to route at some gateway layers without deeper packet inspection.</td></tr>
-  <tr><td>Content negotiation (media type)</td><td><code>Accept: application/vnd.myapi.v2+json</code></td><td>The most "correct" from a REST purity standpoint — version is a property of the representation format, negotiated the same way HTTP negotiates JSON vs XML vs HTML.</td><td>Least ergonomic for API consumers to discover and set correctly; tooling support (Postman collections, quick manual testing) is weaker; still shares the header approach's invisibility problem.</td></tr>
+  <tr><td>Content negotiation (media type)</td><td><code>Accept: application/vnd.shopsphere.v2+json</code></td><td>The most "correct" from a REST purity standpoint — version is a property of the representation format, negotiated the same way HTTP negotiates JSON vs XML vs HTML.</td><td>Least ergonomic for API consumers to discover and set correctly; tooling support (Postman collections, quick manual testing) is weaker; still shares the header approach's invisibility problem.</td></tr>
 </table>
-<p>In practice, URI versioning dominates public APIs because its visibility lowers the support burden — a client can see <code>/v1/</code> in a stack trace or a support ticket and immediately know which contract is in play. Header and media-type versioning are more common internally, where the team controls both ends and can enforce header discipline through generated clients (see the <a href="#/api-design-versioning">OpenAPI</a> section below), and where keeping the URI stable matters more because internal tooling often treats the URI as a durable resource identifier.</p>
+<p>In practice, URI versioning dominates public APIs because its visibility lowers the support burden — a client can see <code>/api/v1/</code> in a stack trace or a support ticket and immediately know which contract is in play. For ShopSphere's <code>/products</code> catalog specifically, this matters more than for most resources: the catalog API is consumed by external Seller integrations (bulk inventory upload tools, price-sync scripts written by third-party Sellers' own engineering teams) who have no ongoing relationship with ShopSphere's platform team and would never reliably set a custom header correctly — a visible <code>/v1/</code> vs <code>/v2/</code> path is the only versioning signal likely to actually reach them. Header and media-type versioning are more common internally, where the team controls both ends and can enforce header discipline through generated clients (see the <a href="#/api-design-versioning">OpenAPI</a> section below), and where keeping the URI stable matters more because internal tooling often treats the URI as a durable resource identifier.</p>
 <div class="callout warn">
-  <p>Whichever strategy you pick, version the smallest thing that actually changed. Bumping an entire API from v1 to v2 because one endpoint's response shape changed forces every client of every <em>other</em> unaffected endpoint to migrate too, or forces you to run two nearly-identical copies of the whole service. Per-resource or per-endpoint versioning, while more bookkeeping, avoids this blast radius problem.</p>
+  <p>Whichever strategy you pick, version the smallest thing that actually changed. Bumping ShopSphere's entire API from v1 to v2 because the <code>/products</code> catalog's price shape changed forces every client of every <em>other</em> unaffected endpoint — <code>/orders</code>, <code>/cart</code>, <code>/reviews</code> — to migrate too, or forces the platform team to run two nearly-identical copies of the whole API surface. Versioning just <code>/api/v2/products</code> while leaving <code>/api/v1/orders</code>, <code>/api/v1/cart</code>, etc. untouched, while more bookkeeping (the OpenAPI spec now describes a mixed-version surface), avoids this blast radius problem entirely.</p>
 </div>
 
 <h2>6. Pagination: offset vs. cursor</h2>
 <h3>Offset-based pagination</h3>
-<pre><code>GET /orders?offset=200&limit=50</code></pre>
-<p>Simple to implement (<code>LIMIT 50 OFFSET 200</code> in SQL) and lets a client jump directly to "page 5." It has two structural problems that get worse as the dataset grows and changes:</p>
+<pre><code>GET /api/v1/products?category=electronics&offset=200&limit=50</code></pre>
+<p>Simple to implement (<code>LIMIT 50 OFFSET 200</code> in SQL) and lets a client jump directly to "page 5" of the catalog. It has two structural problems that get worse as the dataset grows and changes:</p>
 <ul>
   <li><strong>Performance degrades with offset size.</strong> Most databases implement <code>OFFSET</code> by scanning and discarding the first N rows before returning the next page — <code>OFFSET 1000000</code> means the database still touches a million rows it throws away. There's no way to seek directly to row 1,000,000 without an index that already orders rows by position, which generally doesn't exist.</li>
-  <li><strong>Consistency breaks under concurrent writes.</strong> If a row is inserted or deleted before the current offset while a client is paging through, every subsequent page shifts by one, causing the client to either see the same row twice or skip a row entirely — silently, with no error to signal it happened.</li>
+  <li><strong>Consistency breaks under concurrent writes.</strong> If a Product is delisted (deleted) from before the current offset while a client is paging through the catalog, every subsequent page shifts by one, causing the client to either see the same product twice or skip a product entirely — silently, with no error to signal it happened.</li>
 </ul>
 
 <h3>Cursor-based (keyset) pagination</h3>
-<pre><code>GET /orders?limit=50&after=eyJpZCI6IDIwMH0=   // opaque cursor encoding {"id": 200}
+<pre><code>GET /api/v1/orders?limit=50&after=eyJpZCI6IDIwMH0=   // opaque cursor encoding {"id": 200}
 
 -- underlying query, assuming id is the sort key and indexed
 SELECT * FROM orders WHERE id > 200 ORDER BY id ASC LIMIT 50</code></pre>
-<p>Instead of "skip N rows," the client sends an opaque cursor that encodes the last item it saw, and the server translates that into a <code>WHERE</code> clause on an indexed sort column. This fixes both offset problems at once: the query is an indexed range scan regardless of how deep into the collection the cursor points (constant-ish cost, not proportional to depth), and inserts or deletes anywhere outside the current page don't shift the client's position, because the cursor is anchored to a specific row's key rather than a numeric position that everything after it is relative to.</p>
-<p>The trade-off is that you give up random access — a client can't jump straight to "page 40" with a cursor, only "the next page after where I am," which is a fine trade for infinite-scroll feeds and API pagination but a real limitation for UIs that need a page-number jump control. Cursors should also be treated as opaque tokens (base64-encode and, ideally, sign them) rather than raw values, both to allow the encoding to evolve later and to prevent clients from constructing arbitrary offsets by hand.</p>
+<p>Instead of "skip N rows," the client sends an opaque cursor that encodes the last item it saw, and the server translates that into a <code>WHERE</code> clause on an indexed sort column. This fixes both offset problems at once: the query is an indexed range scan regardless of how deep into the collection the cursor points (constant-ish cost, not proportional to depth), and inserts or deletes anywhere outside the current page don't shift the client's position, because the cursor is anchored to a specific row's key rather than a numeric position that everything after it is relative to. This is exactly the pagination style you want for a Customer's order history (<code>GET /api/v1/customers/8841/orders</code>) — new Orders are constantly being inserted by other Customers system-wide, but that churn happening elsewhere in the table must never shift which page of <em>this</em> Customer's own order history they're currently looking at.</p>
+<p>The trade-off is that you give up random access — a client can't jump straight to "page 40" with a cursor, only "the next page after where I am," which is a fine trade for infinite-scroll catalog browsing and order-history APIs but a real limitation for admin UIs that need a page-number jump control. Cursors should also be treated as opaque tokens (base64-encode and, ideally, sign them) rather than raw values, both to allow the encoding to evolve later and to prevent clients from constructing arbitrary offsets by hand.</p>
 <div class="callout">
-  <p>The sort key backing a cursor must be unique and stable — sorting purely by <code>created_at</code> when multiple rows can share the same timestamp lets rows silently vanish from or duplicate across pages at the boundary. The standard fix is a composite cursor and sort key, such as <code>(created_at, id)</code>, so ties are broken deterministically.</p>
+  <p>The sort key backing a cursor must be unique and stable — sorting purely by <code>created_at</code> when multiple Orders can share the same timestamp (a flash-sale spike placing hundreds of orders within the same second) lets rows silently vanish from or duplicate across pages at the boundary. The standard fix is a composite cursor and sort key, such as <code>(created_at, id)</code>, so ties are broken deterministically.</p>
 </div>
 
 <h2>7. OpenAPI as a machine-readable contract</h2>
 <p>An OpenAPI (formerly Swagger) document describes an API's paths, methods, request/response schemas, status codes, and authentication requirements in a structured YAML or JSON file that both humans and tools can read:</p>
 <pre><code>paths:
-  /orders/{orderId}:
+  /api/v1/orders/{orderId}:
     get:
       summary: Fetch an order by ID
       parameters:
@@ -202,16 +245,17 @@ components:
   schemas:
     Order:
       type: object
-      required: [id, status, total]
+      required: [id, customerId, status, totalAmount]
       properties:
         id: { type: integer }
-        status: { type: string, enum: [PENDING, SHIPPED, CANCELLED] }
-        total: { type: number }</code></pre>
+        customerId: { type: integer }
+        status: { type: string, enum: [CREATED, PAID, SHIPPED, DELIVERED, CANCELLED] }
+        totalAmount: { type: number }</code></pre>
 <p>Because this is a formal schema rather than prose documentation, it can drive tooling that prose cannot:</p>
 <ul>
-  <li><strong>Generated client SDKs.</strong> Tools like OpenAPI Generator or Swagger Codegen turn the spec directly into typed client classes in Java, TypeScript, Python, etc., so consumers get compile-time checking against the actual contract instead of hand-writing HTTP calls against a wiki page that drifts out of date.</li>
+  <li><strong>Generated client SDKs.</strong> Tools like OpenAPI Generator or Swagger Codegen turn the spec directly into typed client classes in Java, TypeScript, Python, etc., so a third-party Seller's integration team gets compile-time checking against ShopSphere's actual catalog/order contract instead of hand-writing HTTP calls against a wiki page that drifts out of date.</li>
   <li><strong>Generated, always-current documentation.</strong> Swagger UI or Redoc render the spec into interactive docs that can never lag behind the code if the spec is generated from annotations in the source (Springdoc/springfox in a Spring Boot service, for instance) rather than maintained by hand in parallel.</li>
-  <li><strong>Contract testing.</strong> The spec becomes the executable source of truth that both the provider and consumer test against — a provider can validate that its real responses conform to the schema it publishes, and a consumer can validate its expectations against the same schema, catching drift before a breaking change reaches production rather than after a client crashes on an unexpected field. This is the same discipline discussed in <a href="#/testing-strategies">testing-strategies</a> under contract testing, and OpenAPI is what makes that contract concrete and machine-checkable instead of an informal agreement between teams.</li>
+  <li><strong>Contract testing.</strong> The spec becomes the executable source of truth that both the provider and consumer test against — <code>order-service</code> can validate that its real responses conform to the schema it publishes, and <code>notification-service</code> (which consumes order data to send shipment emails) can validate its expectations against that same schema, catching drift before a breaking change reaches production rather than after a client crashes on an unexpected field. This is the same discipline discussed in <a href="#/testing-strategies">testing-strategies</a> under contract testing, and OpenAPI is what makes that contract concrete and machine-checkable instead of an informal agreement between teams.</li>
 </ul>
 
 <h2>8. Designing for backward compatibility</h2>
@@ -225,7 +269,7 @@ components:
   <tr><td>Relaxing a validation constraint (widening an accepted range)</td><td>Tightening a validation constraint (narrowing an accepted range, now rejecting previously valid input)</td></tr>
   <tr><td>Adding a new, distinct error code alongside existing ones</td><td>Changing the status code returned for an existing, documented failure case</td></tr>
 </table>
-<p>The enum case deserves particular attention because it's the most common accidental break: a field documented as an enum feels closed, so client code frequently pattern-matches on it exhaustively (a <code>switch</code> with no default, or a <code>Map</code> lookup that throws on a miss). Adding <code>REFUNDED</code> to an order-status enum that used to be <code>{PENDING, SHIPPED, CANCELLED}</code> is "just adding a value" from the server's perspective but breaks every client that assumed the set was closed. The fix is contractual, not technical: document enums that may grow as open sets from day one, and require clients to have an explicit fallback branch for unrecognized values.</p>
+<p>The enum case deserves particular attention because it's the most common accidental break: a field documented as an enum feels closed, so client code frequently pattern-matches on it exhaustively (a <code>switch</code> with no default, or a <code>Map</code> lookup that throws on a miss). Adding <code>RETURNED</code> to an <code>Order.status</code> enum that used to be <code>{CREATED, PAID, SHIPPED, DELIVERED, CANCELLED}</code> is "just adding a value" from order-service's perspective but breaks every downstream client — <code>notification-service</code>'s status-to-email-template lookup, a Seller's own inventory-sync script parsing webhook payloads — that assumed the set was closed. The fix is contractual, not technical: document enums that may grow as open sets from day one, and require clients to have an explicit fallback branch for unrecognized values.</p>
 <div class="callout tip">
   <p>A useful discipline is to make the additive/breaking distinction part of code review for API changes specifically, backed by the OpenAPI spec: diff the spec between versions and treat any removal, type change, or new required field as requiring a deliberate version bump and a documented migration window, not something that ships silently in a routine deploy.</p>
 </div>
@@ -264,14 +308,19 @@ components:
 
 <details class="concept-qa">
 <summary>Why does URI versioning dominate public APIs even though it's arguably less "correct" from a strict REST standpoint?</summary>
-<div class="qa-body">Strictly, a URI is supposed to identify a resource, and /v1/orders/17 and /v2/orders/17 encoding "the same order" at two different addresses muddies that identity — header or media-type versioning keeps the URI stable and treats the version as metadata about the representation instead. But URI versioning wins in practice because it is maximally visible: it shows up in browser address bars, curl commands, stack traces, and support tickets without anyone needing to know to inspect a header. That visibility lowers the operational and support cost of running multiple versions simultaneously, which matters more for most organizations than the purity of resource identity — especially for public-facing APIs consumed by many independent teams who won't reliably set a custom header correctly.</div>
+<div class="qa-body">Strictly, a URI is supposed to identify a resource, and /v1/orders/17 and /v2/orders/17 encoding "the same order" at two different addresses muddies that identity — header or media-type versioning keeps the URI stable and treats the version as metadata about the representation instead. But URI versioning wins in practice because it is maximally visible: it shows up in browser address bars, curl commands, stack traces, and support tickets without anyone needing to know to inspect a header. That visibility lowers the operational and support cost of running multiple versions simultaneously, which matters more for most organizations than the purity of resource identity — especially for public-facing APIs consumed by many independent teams (like ShopSphere's third-party Seller integrations) who won't reliably set a custom header correctly.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does the 4xx/5xx boundary matter more for retry logic than the specific status code within each class?</summary>
+<div class="qa-body">The first digit of a status code is a deliberate, coarse signal about where the failure originates: 4xx says the problem is in the request itself (a Customer's malformed checkout payload, a Coupon code that doesn't exist), and 5xx says the problem is on the server's side (order-service crashed, payment-service timed out calling its own database). This distinction is exactly what a resilience layer (circuit breaker, retry-with-backoff middleware) needs to make a retry decision without understanding any application-specific semantics: retrying the identical bytes of a 4xx request will fail identically every time, because nothing about the server's state changed and the request was the defect — retrying just wastes a round trip and adds load for no benefit. A 5xx, by contrast, often reflects a transient condition (a momentary overload, a dependency blip) that may have cleared by the time a retry arrives, so backing off and retrying is a reasonable default. This is precisely why generic HTTP infrastructure — API gateways, load balancers, client SDK retry policies — can implement a single, universal rule ("retry 5xx with backoff, don't retry 4xx") without knowing anything about orders, payments, or ShopSphere's domain at all; the status-code class alone carries enough information to make the decision correctly.</div>
 </details>
 
 <h2>Related Topics</h2>
 <div class="related-grid">
   <div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'">
     <div class="rc-title">Resilience &amp; Fault Tolerance</div>
-    <div class="rc-sub">Bonus · retries only compose safely with idempotent operations</div>
+    <div class="rc-sub">Bonus · retries only compose safely with idempotent operations, and only for the 5xx class</div>
   </div>
   <div class="related-card" onclick="window.location.hash='/microservice-patterns'">
     <div class="rc-title">Microservice Patterns</div>
@@ -284,5 +333,13 @@ components:
   <div class="related-card" onclick="window.location.hash='/spring-core-mechanics'">
     <div class="rc-title">Spring Core Mechanics</div>
     <div class="rc-sub">Phase 1 · Spring MVC/WebFlux is where these HTTP semantics get implemented</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'">
+    <div class="rc-title">Payment Systems &amp; Idempotent Transactions</div>
+    <div class="rc-sub">Deep dive on the Idempotency-Key pattern applied specifically to Payment capture/refund, including the atomic-store mechanics only sketched here</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/security-hardening-owasp'">
+    <div class="rc-title">Security Hardening: Input Validation, Secrets Management &amp; OWASP Top 10</div>
+    <div class="rc-sub">400/422 validation-error handling here is the API-design half of the input-validation discipline OWASP hardening covers in depth</div>
   </div>
 </div>

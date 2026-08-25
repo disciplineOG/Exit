@@ -30,10 +30,10 @@
 </div>
 
 <h3>What CP and AP actually look like</h3>
-<p>Concretely, imagine a 5-node cluster split into a majority side (3 nodes) and a minority side (2 nodes) by a partition.</p>
+<p>Concretely, imagine ShopSphere's <code>inventory-service</code> replicated across a 5-node cluster spanning two data centers, split into a majority side (3 nodes) and a minority side (2 nodes) by a network partition, in the middle of a flash sale.</p>
 <ul>
-<li><strong>CP behavior</strong>: the minority side refuses to serve writes (and often reads) because it cannot confirm it has the latest data or reach quorum. Clients talking only to the minority side get errors or timeouts until the partition heals. ZooKeeper, etcd, and Google Spanner in its cross-region commit path are built this way — they would rather return an error than return a value that might be stale or that might conflict with a concurrent write on the other side.</li>
-<li><strong>AP behavior</strong>: both sides keep accepting reads and writes independently during the partition. Cassandra (with weaker consistency levels like <code>ONE</code> or <code>QUORUM</code> per-region) and DynamoDB's original design are built this way. The cost is that the two sides can now diverge — the same key might get written differently on each side — and the system needs a reconciliation strategy (last-write-wins by timestamp, vector clocks, CRDTs, or application-level merge logic) for when the partition heals.</li>
+<li><strong>CP behavior</strong>: the minority side refuses to serve writes (and often reads) because it cannot confirm it has the latest <code>availableQty</code>/<code>reservedQty</code> or reach <em>quorum</em> — a majority (more than half) of the replicas agreeing on a value before it's considered committed, which guarantees any two quorums overlap in at least one node and therefore can't silently disagree. Checkout requests routed to the minority side get errors or timeouts until the partition heals — customers see a "try again" error rather than a reservation that might oversell the last unit of a hot productId. ZooKeeper, etcd, and Google Spanner in its cross-region commit path are built this way — they would rather return an error than return a value that might be stale or that might conflict with a concurrent write on the other side.</li>
+<li><strong>AP behavior</strong>: both sides keep accepting checkout reservations independently during the partition. Cassandra (with weaker consistency levels like <code>ONE</code> or <code>QUORUM</code> per-region) and DynamoDB's original design are built this way. The cost is that the two sides can now diverge — the same productId's <code>reservedQty</code> might get incremented differently on each side, and stock can be oversold — so the system needs a reconciliation strategy for when the partition heals: last-write-wins by timestamp, a <em>vector clock</em> (a per-replica counter attached to each write so the system can detect, rather than guess, whether two writes were causally related or genuinely concurrent and conflicting), a <em>CRDT</em> (Conflict-free Replicated Data Type — a data structure, like a grow-only counter, whose merge operation is mathematically guaranteed to produce the same result regardless of the order updates arrive in, so conflicting replicas can be merged automatically with no coordination), or application-level merge logic, e.g. a background job that detects overbooked productIds and cancels the most recently placed conflicting orders.</li>
 </ul>
 
 <table>
@@ -43,6 +43,43 @@
 <tr><td>Cassandra (QUORUM reads/writes)</td><td>Tunable, defaults toward AP</td><td>Per-query consistency level lets you trade off, but base design favors availability</td></tr>
 <tr><td>DynamoDB (default)</td><td>AP</td><td>Accepts writes on both sides of a partition; resolves conflicts later</td></tr>
 </table>
+
+<h3>The CAP triangle</h3>
+<p>It helps to picture the three properties as vertices of a triangle: a partition forces you off the "CA" edge, and you must slide toward the C corner or the A corner. Only two of the three edges are ever actually reachable in a real, partition-prone network:</p>
+<pre><code>                        Consistency (C)
+                     every node agrees on
+                    the latest acknowledged
+                          write
+                            /\
+                           /  \
+                          /    \
+           CP  (reachable)      (reachable)  CA
+           give up Availability   give up Partition
+           during a partition     Tolerance -- not a
+           e.g. ZooKeeper, etcd,  real option once the
+           Spanner cross-region  network can actually
+           commit                partition (see callout
+                        /\        below)
+                       /  \
+                      /    \
+                     /      \
+    Availability (A) -------- Partition Tolerance (P)
+    every request gets     the system keeps working
+    a non-error response   despite dropped/delayed
+                            messages between nodes
+                    AP (reachable)
+                    give up Consistency during
+                    a partition -- e.g. Cassandra,
+                    DynamoDB, most CDN/cache layers
+
+ShopSphere during a checkout-time network split between
+the order-service region and the inventory-service region:
+  CP choice -> inventory-service in the unreachable region
+               refuses to confirm new reservations rather
+               than risk overselling stock it can't verify
+  AP choice -> inventory-service keeps accepting reservations
+               on both sides, and a reconciliation job fixes
+               any overbooked productId once the split heals</code></pre>
 
 <h2>2. PACELC: What CAP Doesn't Tell You</h2>
 <p>CAP only describes behavior during a partition — but partitions are rare compared to normal operation. Most of the time, your system is up, all nodes can reach each other, and yet you still face a trade-off: how many replicas do you wait for before acknowledging a write? <strong>PACELC</strong> (proposed by Daniel Abadi) extends CAP to cover this:</p>
@@ -54,7 +91,7 @@
 <tr><td>DynamoDB</td><td>PA — stays available</td><td>EL — favors low latency, eventual consistency by default</td></tr>
 <tr><td>MongoDB (default write concern)</td><td>PC — steps toward consistency</td><td>EC/EL tunable via write concern / read preference</td></tr>
 <tr><td>Cassandra</td><td>PA</td><td>EL by default, tunable to EC per query</td></tr>
-<tr><td>Spanner</td><td>PC</td><td>EC — pays latency (TrueTime commit wait) for strong consistency</td></tr>
+<tr><td>Spanner</td><td>PC</td><td>EC — pays latency (TrueTime commit wait — Spanner's atomic clocks and GPS receivers bound clock uncertainty across data centers tightly enough that it can simply wait out that uncertainty window before committing, so every commit is delayed by a few milliseconds in exchange for globally consistent timestamps) for strong consistency</td></tr>
 </table>
 
 <div class="callout tip">
@@ -66,16 +103,16 @@
 <p>ACID describes guarantees a single transactional system (classically a single relational database instance) gives you around a unit of work. It's worth knowing exactly what each letter buys you, because in a distributed system you will lose some of them by default and have to consciously re-earn them.</p>
 
 <h3>Atomicity</h3>
-<p>A transaction's operations either all happen or none do — there is no partial completion visible to anyone. <strong>Without it</strong>: imagine transferring money — debit account A, credit account B — as two separate statements with no transaction wrapper. If the process crashes after the debit but before the credit, money has vanished. Atomicity is what lets you treat "debit + credit" as a single indivisible unit; if any part fails, the database rolls back the parts that already ran.</p>
+<p>A transaction's operations either all happen or none do — there is no partial completion visible to anyone. <strong>Without it</strong>: imagine <code>payment-service</code> processing a refund — debit the merchant's payout balance, credit the customer's original payment method — as two separate statements with no transaction wrapper. If the process crashes after the debit but before the credit, money has vanished. Atomicity is what lets you treat "debit + credit" as a single indivisible unit; if any part fails, the database rolls back the parts that already ran.</p>
 
 <h3>Consistency</h3>
-<p>A transaction moves the database from one valid state to another valid state, respecting all declared constraints (foreign keys, unique constraints, check constraints, triggers). <strong>Without it</strong>: an order could reference a customer_id that doesn't exist in the customers table, or a "quantity" column could go negative despite a business rule that it never should. Note this "C" is unrelated to CAP's "C" — ACID consistency is about application-defined invariants; CAP consistency is about replicas agreeing on the latest value. Conflating the two is one of the most common terminology traps in this space.</p>
+<p>A transaction moves the database from one valid state to another valid state, respecting all declared constraints (foreign keys, unique constraints, check constraints, triggers). <strong>Without it</strong>: an <code>OrderItem</code> could reference a <code>productId</code> that doesn't exist in the catalog table, or an <code>Inventory</code> row's <code>availableQty</code> could go negative despite a business rule that it never should. Note this "C" is unrelated to CAP's "C" — ACID consistency is about application-defined invariants; CAP consistency is about replicas agreeing on the latest value. Conflating the two is one of the most common terminology traps in this space.</p>
 
 <h3>Isolation</h3>
-<p>Concurrent transactions appear to execute as if they ran one at a time, even though the database is actually interleaving their work for performance. <strong>Without it</strong>: two concurrent transactions could each read a bank balance of 100, each independently add 50, and each write back 150 — losing one of the updates entirely (a lost update), because neither transaction saw the other's write.</p>
+<p>Concurrent transactions appear to execute as if they ran one at a time, even though the database is actually interleaving their work for performance. <strong>Without it</strong>: two concurrent checkouts for the same productId could each read <code>availableQty = 1</code>, each independently decide there's enough stock, and each write back <code>availableQty = 0</code> — both orders confirm, but only one unit of physical stock actually existed. This is a lost update: neither transaction saw the other's write.</p>
 
 <h3>Durability</h3>
-<p>Once a transaction commits, it survives any subsequent crash — power loss, process kill, OS crash. <strong>Without it</strong>: a database could acknowledge a commit, then lose the data because it was only sitting in an OS page cache buffer that never made it to disk before a crash. Durability is why databases use write-ahead logs (WAL) — the log entry is fsynced to durable storage before the commit is acknowledged, so replay after a crash can reconstruct the committed state.</p>
+<p>Once a transaction commits, it survives any subsequent crash — power loss, process kill, OS crash. <strong>Without it</strong>: <code>order-service</code> could acknowledge an order as <code>PAID</code>, then lose that fact because it was only sitting in an OS page cache buffer that never made it to disk before a crash — the customer was charged, but the order record reverts to looking uncreated. Durability is why databases use write-ahead logs (WAL) — the log entry is fsynced to durable storage before the commit is acknowledged, so replay after a crash can reconstruct the committed state.</p>
 
 <div class="callout">
 <div class="callout-title">Durability has a knob, and it's usually turned down for latency</div>
@@ -94,22 +131,22 @@
 </table>
 
 <h3>Dirty read — prevented starting at Read Committed</h3>
-<pre><code>T1: UPDATE accounts SET balance = 50 WHERE id = 1;   -- not yet committed
-T2: SELECT balance FROM accounts WHERE id = 1;        -- reads 50
-T1: ROLLBACK;                                         -- balance is actually still 100</code></pre>
-<p>T2 read a value that was never actually committed. At Read Uncommitted, transactions can see each other's in-flight, uncommitted writes. This level is rarely used in practice precisely because it makes "reading garbage that gets rolled back" a normal possibility.</p>
+<pre><code>T1: UPDATE inventory SET available_qty = 0 WHERE product_id = 'prod-8841';  -- not yet committed
+T2: SELECT available_qty FROM inventory WHERE product_id = 'prod-8841';    -- reads 0, shows "out of stock"
+T1: ROLLBACK;                                        -- available_qty is actually still 1</code></pre>
+<p>T2 read a value that was never actually committed — a customer could have seen "out of stock" on a product that was, in fact, still available. At Read Uncommitted, transactions can see each other's in-flight, uncommitted writes. This level is rarely used in practice precisely because it makes "reading garbage that gets rolled back" a normal possibility.</p>
 
 <h3>Non-repeatable read — prevented starting at Repeatable Read</h3>
-<pre><code>T1: SELECT balance FROM accounts WHERE id = 1;   -- reads 100
-T2: UPDATE accounts SET balance = 200 WHERE id = 1; COMMIT;
-T1: SELECT balance FROM accounts WHERE id = 1;   -- reads 200, same transaction!</code></pre>
-<p>The same row read twice within one transaction returns different values because another transaction committed a change to it in between. Read Committed only guarantees you won't see uncommitted data — it says nothing about a row changing between two reads in the same transaction. Repeatable Read fixes this by ensuring that once T1 reads a row, it will see the same value for that row for the rest of the transaction (typically via multi-version concurrency control (MVCC): T1 keeps reading from the snapshot as of when the transaction, or in some engines the first statement, began).</p>
+<pre><code>T1: SELECT available_qty FROM inventory WHERE product_id = 'prod-8841';   -- reads 5
+T2: UPDATE inventory SET available_qty = 0 WHERE product_id = 'prod-8841'; COMMIT;
+T1: SELECT available_qty FROM inventory WHERE product_id = 'prod-8841';   -- reads 0, same transaction!</code></pre>
+<p>The same row read twice within one transaction returns different values because another transaction committed a change to it in between — a checkout flow that read stock twice within one transaction (once to validate, once to decrement) could see the numbers disagree. Read Committed only guarantees you won't see uncommitted data — it says nothing about a row changing between two reads in the same transaction. Repeatable Read fixes this by ensuring that once T1 reads a row, it will see the same value for that row for the rest of the transaction (typically via multi-version concurrency control (MVCC): T1 keeps reading from the snapshot as of when the transaction, or in some engines the first statement, began).</p>
 
 <h3>Phantom read — prevented at Serializable</h3>
 <pre><code>T1: SELECT COUNT(*) FROM orders WHERE status = 'PENDING';   -- returns 5
-T2: INSERT INTO orders (status) VALUES ('PENDING'); COMMIT;
+T2: INSERT INTO orders (status) VALUES ('PENDING'); COMMIT;  -- a new order just got created
 T1: SELECT COUNT(*) FROM orders WHERE status = 'PENDING';   -- returns 6</code></pre>
-<p>A phantom is a <em>new row</em> matching T1's filter that appears between two reads — different from a non-repeatable read, which is about an <em>existing</em> row changing. Repeatable Read locks or snapshots the rows it has already read, but a plain range predicate can still admit newly inserted rows in some implementations. Serializable closes this gap, typically via range locks (locking the predicate, not just matched rows) or, in modern MVCC engines like Postgres, via serializable snapshot isolation (SSI), which detects dangerous read/write dependency cycles between concurrent transactions and aborts one of them rather than locking proactively.</p>
+<p>A phantom is a <em>new row</em> matching T1's filter that appears between two reads — different from a non-repeatable read, which is about an <em>existing</em> row changing. This matters for something like an admin dashboard computing "pending order count" twice within one report-generation transaction, or a batch job scanning for all PENDING orders to process — a phantom means the second pass sees an order the first pass's count didn't account for. Repeatable Read locks or snapshots the rows it has already read, but a plain range predicate can still admit newly inserted rows in some implementations. Serializable closes this gap, typically via range locks (locking the predicate, not just matched rows) or, in modern MVCC engines like Postgres, via serializable snapshot isolation (SSI), which detects dangerous read/write dependency cycles between concurrent transactions and aborts one of them rather than locking proactively.</p>
 
 <div class="callout warn">
 <div class="callout-title">"Repeatable Read" doesn't mean the same thing everywhere</div>
@@ -126,22 +163,22 @@ T1: SELECT COUNT(*) FROM orders WHERE status = 'PENDING';   -- returns 6</code><
 <p>The trade is explicit: give up the guarantee that every read reflects the latest write, in exchange for lower latency and the ability to keep serving traffic even when some replicas are unreachable or lagging. This is why systems like Cassandra, DynamoDB, and most CDN/cache layers are BASE by default, and why <a href="#/database-architecture">database replication topology</a> choices (synchronous vs. asynchronous replication) directly determine how "eventual" eventual consistency actually is.</p>
 
 <h2>6. Two-Phase Commit: Distributed Atomicity, and Why It Blocks</h2>
-<p>If you need a single atomic transaction that spans multiple independent nodes (say, two different databases, or a database and a message queue), you need a distributed transaction protocol. <strong>Two-Phase Commit (2PC)</strong> is the classic approach.</p>
+<p>If you need a single atomic transaction that spans multiple independent nodes (say, two different databases, or a database and a message queue), you need a distributed transaction protocol. <strong>Two-Phase Commit (2PC)</strong> is the classic approach. Concretely for ShopSphere: if <code>order-service</code>, <code>payment-service</code>, and <code>inventory-service</code> each had their own database and you tried to make "create order + charge card + reserve stock" a single distributed transaction across all three, 2PC is the mechanism that would attempt it.</p>
 <h3>The protocol</h3>
 <ol>
-<li><strong>Phase 1 — Prepare</strong>: a coordinator sends a "prepare" message to every participant. Each participant does everything necessary to guarantee it <em>can</em> commit — acquiring locks, writing to its own durable log — then replies "yes" (voted to commit) or "no." Critically, after voting "yes," a participant must be able to commit no matter what happens next; it has surrendered the right to unilaterally abort.</li>
-<li><strong>Phase 2 — Commit or Abort</strong>: if all participants voted "yes," the coordinator logs the decision and sends "commit" to everyone. If any participant voted "no," or timed out, the coordinator sends "abort" to everyone. Participants apply the decision and release their locks.</li>
+<li><strong>Phase 1 — Prepare</strong>: a coordinator sends a "prepare" message to every participant — here, <code>order-service</code>, <code>payment-service</code>, and <code>inventory-service</code>. Each participant does everything necessary to guarantee it <em>can</em> commit — acquiring locks, writing to its own durable log — then replies "yes" (voted to commit) or "no." Critically, after voting "yes," a participant must be able to commit no matter what happens next; it has surrendered the right to unilaterally abort.</li>
+<li><strong>Phase 2 — Commit or Abort</strong>: if all participants voted "yes," the coordinator logs the decision and sends "commit" to everyone. If any participant voted "no" — say, <code>inventory-service</code> can't reserve the last unit — or timed out, the coordinator sends "abort" to everyone. Participants apply the decision and release their locks.</li>
 </ol>
 
 <div class="callout warn">
 <div class="callout-title">Why 2PC is fundamentally blocking</div>
-<p>Consider a participant that voted "yes" in phase 1, then the coordinator crashes before sending the phase 2 decision to anyone. That participant is now stuck: it cannot unilaterally commit (the coordinator might have decided to abort based on another participant's "no"), and it cannot unilaterally abort (the coordinator might have already told other participants to commit, and its own commit is contractually promised). Its only option is to hold its locks and <strong>wait</strong> for the coordinator to recover and tell it the decision. Every other transaction that needs those locked rows also blocks. This is the defining weakness of 2PC — a single coordinator crash at the wrong moment can freeze part of the system indefinitely, and no participant-side timeout can safely resolve it without risking inconsistency. (Three-Phase Commit and Paxos/Raft-based commit protocols address this by replicating the coordinator's decision so a new coordinator can be elected and safely resume, but that adds real complexity and latency.)</p>
+<p>Consider <code>payment-service</code> voting "yes" in phase 1 — it has authorized and durably logged the charge — and then the coordinator crashes before sending the phase 2 decision to anyone. <code>payment-service</code> is now stuck: it cannot unilaterally capture the charge (the coordinator might have decided to abort because <code>inventory-service</code> voted "no"), and it cannot unilaterally release its lock and walk away (the coordinator might have already told <code>order-service</code> and <code>inventory-service</code> to commit, and <code>payment-service</code>'s own commit is contractually promised). Its only option is to hold its lock on that row/resource and <strong>wait</strong> for the coordinator to recover and tell it the decision. Every other checkout that needs those same locked rows also blocks. This is the defining weakness of 2PC — a single coordinator crash at the wrong moment can freeze part of the system indefinitely, and no participant-side timeout can safely resolve it without risking inconsistency. (Three-Phase Commit and Paxos/Raft-based commit protocols address this by replicating the coordinator's decision so a new coordinator can be elected and safely resume, but that adds real complexity and latency.)</p>
 </div>
 
-<p>2PC also couples every participant's availability to every other's: if any one node in the transaction is slow or down, all locks across all nodes stay held. This is the opposite of the BASE philosophy, and it's why 2PC is rarely used across service boundaries in modern systems — it's mostly seen inside a single database engine, or via XA transactions across a small, tightly-controlled set of resources.</p>
+<p>2PC also couples every participant's availability to every other's: if <code>inventory-service</code> is slow or down, <code>payment-service</code>'s locks on the customer's card authorization stay held too, and vice versa. This is the opposite of the BASE philosophy, and it's why 2PC is rarely used across service boundaries in modern systems like ShopSphere's — it's mostly seen inside a single database engine, or via <em>XA transactions</em> (a standardized 2PC protocol that lets a single transaction coordinator drive a commit/rollback decision across a small, tightly-controlled set of resources, such as a JMS queue and a database, that both implement the XA interface) across such a set of resources. This is exactly why the checkout flow below uses a saga instead.</p>
 
 <h2>7. The Saga Pattern: 2PC's Practical Alternative</h2>
-<p>A <strong>saga</strong> replaces one large distributed transaction with a sequence of local transactions, each committing independently, plus a <strong>compensating transaction</strong> defined for each step to semantically undo it if a later step fails. Nothing is held locked across steps — each local transaction commits for real, immediately, in its own service's database. This trades atomicity (all-or-nothing, instantly) for eventual consistency (all-or-eventually-undone).</p>
+<p>A <strong>saga</strong> replaces one large distributed transaction with a sequence of local transactions, each committing independently, plus a <strong>compensating transaction</strong> defined for each step to semantically undo it if a later step fails. Nothing is held locked across steps — each local transaction commits for real, immediately, in its own service's database. This trades atomicity (all-or-nothing, instantly) for eventual consistency (all-or-eventually-undone). It is the standard alternative to 2PC precisely because of the blocking problem in section 6: no ShopSphere service ever sits holding a lock waiting on another service's coordinator to recover.</p>
 
 <h3>Choreography vs. orchestration</h3>
 <table>
@@ -153,30 +190,45 @@ T1: SELECT COUNT(*) FROM orders WHERE status = 'PENDING';   -- returns 6</code><
 <tr><td>Good fit</td><td>Small number of steps, simple reactions</td><td>Longer flows, need for observability/retries, complex branching</td></tr>
 </table>
 
+<h3>Choreography version of checkout, in ShopSphere events</h3>
+<p>In a choreographed design, no service calls another directly — each service publishes a domain event to a broker (typically <a href="#/async-messaging">Kafka</a>) after committing its own local transaction, and other services subscribe to the events they care about:</p>
+<pre><code>order-service:     creates Order(status=CREATED)     -> publishes OrderPlaced
+payment-service:   consumes OrderPlaced               -> charges card
+                    on success                        -> publishes PaymentCaptured
+                    on failure                         -> publishes PaymentFailed
+inventory-service: consumes PaymentCaptured            -> reserves stock
+                    on success                         -> publishes InventoryReserved
+                    on failure                         -> publishes InventoryReservationFailed
+order-service:     consumes InventoryReserved          -> Order(status=CONFIRMED)
+                    consumes InventoryReservationFailed -> Order(status=CANCELLED),
+                                                            publishes OrderCancelled
+payment-service:   consumes OrderCancelled              -> refunds the captured payment</code></pre>
+<p>Notice that no single service "knows" the whole saga — <code>payment-service</code> only knows "react to <code>OrderPlaced</code> by charging, and react to <code>OrderCancelled</code> by refunding"; it has no concept of "step 2 of 3." This is what "loose coupling" means concretely, and also exactly why choreography gets hard to reason about past a handful of steps: the full flow only exists implicitly, as the union of every service's individual event-reaction rules.</p>
+
 <div class="callout">
 <div class="callout-title">Compensating transactions must be idempotent — and why that's harder than it sounds</div>
-<p>A compensation might be triggered more than once — the orchestrator retries after a timeout, a message gets redelivered by an <a href="#/async-messaging">at-least-once messaging</a> layer, or a crash-recovery process replays an in-flight saga. If "refund payment" isn't idempotent, a redelivered compensation message could refund the customer twice. In practice this means every compensating action needs a way to recognize "I already did this for saga instance X, step Y" — usually a unique idempotency key derived from the saga/step identifiers, checked against a record of already-applied compensations before doing the work.</p>
+<p>A compensation might be triggered more than once — the orchestrator retries after a timeout, a message gets redelivered by an <a href="#/async-messaging">at-least-once messaging</a> layer, or a crash-recovery process replays an in-flight saga. If "refund payment" isn't idempotent, a redelivered <code>OrderCancelled</code> event could refund the customer twice. In practice this means every compensating action needs a way to recognize "I already did this for saga instance X, step Y" — usually a unique <a href="#/payment-systems-idempotency">idempotency key</a> derived from the saga/step identifiers (for ShopSphere's <code>Payment</code>, this is literally the <code>idempotencyKey</code> field), checked against a record of already-applied compensations before doing the work.</p>
 </div>
 
-<h3>Worked example: order → payment → inventory, with a failure and reverse compensation</h3>
-<p>Consider an order placement saga with three steps, orchestrated by an Order Saga Coordinator:</p>
+<h3>Worked example (orchestrated): order → payment → inventory, with a failure and reverse compensation</h3>
+<p>Consider an order placement saga with three steps, orchestrated by an Order Saga Coordinator sitting in front of <code>order-service</code>, <code>payment-service</code>, and <code>inventory-service</code>:</p>
 <pre><code>Step 1: Order Service      -> create order (status = PENDING)
 Step 2: Payment Service    -> charge customer's card
 Step 3: Inventory Service  -> reserve stock for the item(s)</code></pre>
 <p>Each step is a local transaction, committed immediately in that service's own database. Now suppose Step 3 fails — the item just went out of stock. The saga cannot simply stop; Steps 1 and 2 already committed real state (a persisted order, a real charge on a card). The coordinator must now run compensations for every <em>already-completed</em> step, strictly in reverse order:</p>
-<pre><code>Step 3: Reserve stock            -> FAILS (out of stock)
-Compensate Step 2: Refund payment            (undo the charge)
-Compensate Step 1: Cancel order (status = CANCELLED)   (undo the creation)</code></pre>
-<p>Reverse order matters because later steps may have been built assuming earlier steps' effects still hold — inventory reservation assumed a valid, paid order existed. Unwinding out of order (say, canceling the order before refunding) can leave the system in a state no compensation was designed to handle, such as a payment service trying to refund a charge tied to an order that no longer exists in a valid state as far as its own logic is concerned.</p>
+<pre><code>Step 3: Reserve stock (inventory-service)   -> FAILS (out of stock)
+Compensate Step 2: Refund payment (payment-service)         (undo the charge)
+Compensate Step 1: Cancel order (order-service, status = CANCELLED)   (undo the creation)</code></pre>
+<p>Reverse order matters because later steps may have been built assuming earlier steps' effects still hold — <code>inventory-service</code>'s reservation logic assumed a valid, paid order existed in <code>order-service</code>. Unwinding out of order (say, canceling the order before refunding) can leave the system in a state no compensation was designed to handle, such as <code>payment-service</code> trying to refund a charge tied to an order that no longer exists in a valid state as far as its own logic is concerned.</p>
 <p>Note also that "cancel order" is not literally "delete the row" — it's a genuine compensating action (a new state transition to CANCELLED), because the original create-order transaction already committed and is visible to other transactions; there is no rollback in the ACID sense once a local transaction has committed. This is the core semantic difference from 2PC: a saga's compensation is a forward-moving business operation that semantically reverses an effect, not a mechanical undo.</p>
 
 <div class="callout tip">
 <div class="callout-title">Sagas give up isolation, and you have to design around it</div>
-<p>Between Step 2 committing and Step 3 failing, any other part of the system that reads the order will see a PENDING order with a completed payment and no reserved inventory — a state that would never be externally visible under ACID isolation, where the whole multi-step transaction would be invisible until it fully committed. This is called a "dirty read" at the business level (not the SQL-anomaly sense from Section 4, but analogous), and it's why saga-based flows typically expose intermediate statuses explicitly (PENDING, PAYMENT_CONFIRMED, RESERVED, CONFIRMED, CANCELLED) rather than pretending the operation is atomic. Anything reading order state mid-saga needs to be written with the assumption that "not yet fully consistent" is a normal, expected condition, not an error.</p>
+<p>Between Step 2 committing and Step 3 failing, any other part of the system that reads the order will see a PENDING order with a completed payment and no reserved inventory — a state that would never be externally visible under ACID isolation, where the whole multi-step transaction would be invisible until it fully committed. This is called a "dirty read" at the business level (not the SQL-anomaly sense from Section 4, but analogous), and it's why saga-based flows typically expose intermediate statuses explicitly (PENDING, PAYMENT_CONFIRMED, RESERVED, CONFIRMED, CANCELLED) rather than pretending the operation is atomic. Anything reading order state mid-saga — including, for instance, a customer refreshing their order-status page, or an admin dashboard — needs to be written with the assumption that "not yet fully consistent" is a normal, expected condition, not an error.</p>
 </div>
 
 <h2>8. Distributed Locking and Redlock</h2>
-<p>A single-node mutex (like Java's <code>synchronized</code> or a <code>ReentrantLock</code>, covered in <a href="#/concurrency-multithreading">concurrency fundamentals</a>) only coordinates threads inside one JVM. Once you have multiple service instances across multiple machines that need mutual exclusion over a shared resource (e.g., "only one instance should run this scheduled job right now"), you need a lock whose state lives somewhere all instances can see — typically a shared store like Redis, ZooKeeper, or a database row.</p>
+<p>A single-node mutex (like Java's <code>synchronized</code> or a <code>ReentrantLock</code>, covered in <a href="#/concurrency-multithreading">concurrency fundamentals</a>) only coordinates threads inside one JVM. Once you have multiple service instances across multiple machines that need mutual exclusion over a shared resource — e.g., ShopSphere runs three replicas of <code>inventory-service</code> behind a load balancer, and a nightly job that reconciles <code>reservedQty</code> against actual shipments should run on exactly one of them, not all three simultaneously — you need a lock whose state lives somewhere all instances can see, typically a shared store like Redis, ZooKeeper, or a database row. See <a href="#/batch-processing-scheduled-jobs">batch processing &amp; scheduled jobs</a> for the broader problem of coordinating scheduled work across replicas.</p>
 
 <h3>Why a naive single-node lock (e.g., one Redis instance) isn't safe</h3>
 <p>A simple approach — <code>SET lock_key client_id NX PX 30000</code> against one Redis node — has two failure modes:</p>
@@ -222,8 +274,8 @@ Compensate Step 1: Cancel order (status = CANCELLED)   (undo the creation)</code
 </details>
 
 <details class="concept-qa">
-<summary>In the order-payment-inventory saga, why must compensations run in reverse order rather than, say, all in parallel?</summary>
-<div class="qa-body">Because later steps' local transactions may have been executed under the assumption that earlier steps' effects were valid and durable — inventory reservation logic might assume a real, paid order exists, and could behave unpredictably if that assumption is violated mid-compensation. Reverse order guarantees that when you compensate step N, steps 1..N-1 are still in their fully-completed state exactly as they were when step N originally ran, so the compensation logic for step N is undoing a well-defined, known state. Running compensations out of order or in parallel risks a compensation acting on a system that's already been partially unwound by another compensation, which is a scenario the compensating logic was never designed to handle.</div>
+<summary>In the ShopSphere order → payment → inventory checkout saga, why must compensations run in reverse order rather than, say, all in parallel?</summary>
+<div class="qa-body">Because later steps' local transactions may have been executed under the assumption that earlier steps' effects were valid and durable — <code>inventory-service</code>'s reservation logic might assume a real, paid order exists in <code>order-service</code>, and could behave unpredictably if that assumption is violated mid-compensation. Reverse order guarantees that when you compensate step N, steps 1..N-1 are still in their fully-completed state exactly as they were when step N originally ran, so the compensation logic for step N is undoing a well-defined, known state. Running compensations out of order or in parallel risks a compensation acting on a system that's already been partially unwound by another compensation — e.g. <code>payment-service</code> trying to refund a charge for an order that <code>order-service</code> has already marked CANCELLED and no longer treats as a valid target for a refund record — which is a scenario the compensating logic was never designed to handle.</div>
 </details>
 
 <details class="concept-qa">
@@ -236,10 +288,16 @@ Compensate Step 1: Cancel order (status = CANCELLED)   (undo the creation)</code
 <div class="qa-body">Because "eventually" specifies no bound on time, and different systems achieve convergence through very different mechanisms with very different practical latencies — background anti-entropy repair, read-repair triggered opportunistically during normal reads, hinted handoff replaying missed writes once a node comes back, or explicit conflict resolution via vector clocks or CRDTs. Two systems can both be honestly described as "eventually consistent" while one converges in tens of milliseconds under normal load and the other takes minutes under partition or high write pressure. This is why, in practice, you need to know the specific propagation mechanism and its typical/worst-case lag for your system, not just the label "eventually consistent," if you're relying on freshness for correctness anywhere.</div>
 </details>
 
+<details class="concept-qa">
+<summary>For the ShopSphere checkout saga, when would you choose choreography over orchestration, or vice versa?</summary>
+<div class="qa-body">Choreography fits when the number of steps is small and each service's reaction is simple and genuinely local to that service's own concerns — for example, if the only cross-service interaction were "payment-service reacts to OrderPlaced," a direct event subscription is simpler than standing up a dedicated coordinator for a single hop. Orchestration earns its complexity once the flow has multiple steps with real branching (partial refunds, retries with backoff, compensations that depend on which step failed), because at that point you want one place — the orchestrator's state machine — that shows the entire saga's current status and history for a given order, rather than having to reconstruct "what happened to order #4471" by tracing events across order-service's, payment-service's, and inventory-service's logs independently. Most production checkout flows past a trivial size end up choosing orchestration specifically for that debuggability and centralized retry/timeout logic, even though it means every participant now depends on the orchestrator being available and correct.</div>
+</details>
+
 <h2>Related Topics</h2>
 <div class="related-grid">
 <div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">Replication topology and how synchronous vs. asynchronous replication determines how "eventual" consistency really is</div></div>
 <div class="related-card" onclick="window.location.hash='/async-messaging'"><div class="rc-title">Async Messaging</div><div class="rc-sub">At-least-once delivery is exactly why saga compensations and event handlers must be idempotent</div></div>
+<div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'"><div class="rc-title">Payment Systems &amp; Idempotent Transactions</div><div class="rc-sub">Deep dive on the idempotencyKey mechanics that make saga compensations like "refund payment" safe to retry</div></div>
 <div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Concurrency &amp; Multithreading</div><div class="rc-sub">Single-node locking primitives that distributed locks like Redlock are trying to generalize across machines</div></div>
 <div class="related-card" onclick="window.location.hash='/hld-ecommerce-flash-sale'"><div class="rc-title">E-Commerce Flash Sale Design</div><div class="rc-sub">A concrete system where CAP trade-offs, inventory reservation sagas, and distributed locking all show up together</div></div>
 </div>

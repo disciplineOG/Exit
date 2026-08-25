@@ -17,87 +17,88 @@
 </div>
 
 <h2>1. Records: what the compiler actually generates</h2>
-<p>A record declaration like <code>record Point(int x, int y) {}</code> is a compressed way of writing a final class with a very specific, mechanically-generated shape. Understanding exactly what the compiler emits — not an approximation of it — is what lets you predict how a record behaves in serialization, equality checks, and reflection.</p>
+<p>A record declaration like <code>record Point(int x, int y) {}</code> is a compressed way of writing a final class with a very specific, mechanically-generated shape. Understanding exactly what the compiler emits — not an approximation of it — is what lets you predict how a record behaves in serialization, equality checks, and reflection. The same mechanics apply to a domain-shaped record like <code>record OrderItem(String productId, int quantity, BigDecimal unitPriceAtPurchase) {}</code>, which is how ShopSphere models one line of an <code>Order</code>.</p>
 
 <p>For <code>record Point(int x, int y) {}</code>, javac generates:</p>
 <ul>
   <li>A <strong>private final field</strong> for each component: <code>private final int x;</code> and <code>private final int y;</code>.</li>
   <li>A <strong>canonical constructor</strong> whose parameter list matches the component list exactly, in order: <code>Point(int x, int y)</code>. It assigns each parameter to its corresponding field.</li>
-  <li><strong>Accessor methods named after the components</strong>, not JavaBean-style getters: <code>x()</code> and <code>y()</code>, not <code>getX()</code> and <code>getY()</code>. This is deliberate — records are not beans, and the naming signals "this is a plain accessor over an immutable value," not "this may trigger side effects or lazy computation" the way a getter conventionally might.</li>
+  <li><strong>Accessor methods named after the components</strong>, not JavaBean-style getters: <code>x()</code> and <code>y()</code>, not <code>getX()</code> and <code>getY()</code>. This is deliberate — records are not beans, and the naming signals "this is a plain accessor over an immutable value," not "this may trigger side effects or lazy computation" the way a getter conventionally might. For <code>OrderItem</code> above, that means <code>quantity()</code> and <code>unitPriceAtPurchase()</code>, not <code>getQuantity()</code>.</li>
   <li><code>equals(Object)</code> and <code>hashCode()</code> that consider <strong>all components</strong>, generated to be consistent with each other (two records with equal components have equal hash codes).</li>
-  <li><code>toString()</code> that prints the record name and all components, e.g. <code>Point[x=3, y=4]</code>.</li>
+  <li><code>toString()</code> that prints the record name and all components, e.g. <code>Point[x=3, y=4]</code> (or <code>OrderItem[productId=prod-8841, quantity=2, unitPriceAtPurchase=19.99]</code>).</li>
   <li>The class itself is implicitly <code>final</code> and implicitly extends <code>java.lang.Record</code> (an abstract class), which means a record can never be extended and can never extend another class — it can only implement interfaces.</li>
 </ul>
 
 <div class="callout">
   <div class="callout-title">Why records exist instead of just "a class with less boilerplate"</div>
-  <p>The point of a record is not to save keystrokes on getters and constructors. It's to make a declaration like <code>record Money(BigDecimal amount, Currency currency)</code> mean something specific and load-bearing: <em>this type's entire identity is its components, it is immutable, and it carries no hidden state</em>. That guarantee is what the JVM, IDEs, and libraries like Jackson can rely on. A hand-written class with the same fields and methods only has that guarantee by convention — nothing stops someone from later adding a mutable cache field or overriding <code>equals</code> to ignore a component. A record's transparency is enforced by the language: you cannot add instance fields beyond the components, and you cannot override the field-based semantics without deliberately overriding the generated method.</p>
+  <p>The point of a record is not to save keystrokes on getters and constructors. It's to make a declaration like <code>record Money(BigDecimal amount, Currency currency)</code> — or, in ShopSphere terms, <code>record OrderItem(String productId, int quantity, BigDecimal unitPriceAtPurchase)</code> — mean something specific and load-bearing: <em>this type's entire identity is its components, it is immutable, and it carries no hidden state</em>. That guarantee is what the JVM, IDEs, and libraries like Jackson can rely on. A hand-written class with the same fields and methods only has that guarantee by convention — nothing stops someone from later adding a mutable cache field or overriding <code>equals</code> to ignore a component. A record's transparency is enforced by the language: you cannot add instance fields beyond the components, and you cannot override the field-based semantics without deliberately overriding the generated method. This matters concretely for <code>OrderItem</code>: once an order is <code>PAID</code>, its line items should never silently drift — <code>unitPriceAtPurchase</code> must stay frozen at what the customer was actually charged even if the <code>Product</code>'s current price changes later, and an immutable record makes that a structural guarantee rather than a "please don't mutate this" comment.</p>
 </div>
 
 <h3>1.1 Why records are for transparent carriers, not general-purpose classes</h3>
-<p>"Transparent" here means the public API and the internal state are the same thing — there is no encapsulation gap between what the record exposes and what it stores. This is exactly backwards from the encapsulation principle you'd apply to a normal domain class (hide fields, expose behavior), and that's intentional: records are for the specific case where the value <em>is</em> the data, like a coordinate, a money amount, a database row projection, or a network message payload. If you find yourself wanting private helper fields, mutable state, or an inheritance hierarchy, that's a signal the type is not a value carrier and should be a regular class instead.</p>
+<p>"Transparent" here means the public API and the internal state are the same thing — there is no encapsulation gap between what the record exposes and what it stores. This is exactly backwards from the encapsulation principle you'd apply to a normal domain class (hide fields, expose behavior), and that's intentional: records are for the specific case where the value <em>is</em> the data, like a coordinate, a money amount, a database row projection, a ShopSphere <code>Product</code> catalog snapshot, or a network message payload (a Kafka <code>OrderPlaced</code> event body, say). If you find yourself wanting private helper fields, mutable state, or an inheritance hierarchy, that's a signal the type is not a value carrier and should be a regular class instead — a <code>Seller</code> entity with mutable inventory-management behavior belongs in a regular class, while the immutable <code>Product</code> row it manages is a natural record.</p>
 
 <h3>1.2 Compact canonical constructors</h3>
 <p>Writing a full canonical constructor to add validation means repeating the entire parameter list and every assignment, which is exactly the kind of boilerplate records are trying to eliminate. The <strong>compact constructor</strong> syntax solves this: you write validation/normalization logic without restating the parameter list or the field assignments — the compiler inserts the assignments automatically after your compact constructor body runs.</p>
 
-<pre><code>public record Range(int low, int high) {
+<pre><code>public record Product(String id, String sellerId, String name,
+                       BigDecimal price, String category, int stockQuantity) {
 
     // Compact canonical constructor — no parameter list, no explicit assignments.
-    public Range {
-        if (low > high) {
-            throw new IllegalArgumentException("low (" + low + ") must be <= high (" + high + ")");
+    public Product {
+        if (price.signum() &lt; 0) {
+            throw new IllegalArgumentException("price cannot be negative: " + price);
+        }
+        if (stockQuantity &lt; 0) {
+            throw new IllegalArgumentException("stockQuantity cannot be negative: " + stockQuantity);
         }
         // You can reassign parameters here to normalize before the implicit
-        // field assignment happens. Below, "high" is clamped before storage.
-        high = Math.min(high, 1_000_000);
+        // field assignment happens. Below, price is rounded to cents before storage.
+        price = price.setScale(2, RoundingMode.HALF_UP);
     }
 }</code></pre>
 
-<p>Note the mechanics precisely: inside a compact constructor you can reassign the constructor's <em>parameters</em> (here, <code>low</code> and <code>high</code> are still local parameter variables at this point), but you cannot assign directly to <code>this.low</code> or <code>this.high</code> — the compiler forbids explicit field assignment in a compact constructor and inserts the field assignments itself, using whatever the parameters hold at the end of your block. This is what makes compact constructors safe for validation and normalization without letting you accidentally skip initializing a component.</p>
+<p>(<code>price.setScale(2, RoundingMode.HALF_UP)</code> is <code>BigDecimal</code>'s way of rounding to exactly 2 decimal places — i.e. whole cents — rounding a trailing 5 up rather than using banker's rounding, which is the conventional rule for currency amounts.) Note the mechanics precisely: inside a compact constructor you can reassign the constructor's <em>parameters</em> (here, <code>price</code> is still a local parameter variable at this point), but you cannot assign directly to <code>this.price</code> — the compiler forbids explicit field assignment in a compact constructor and inserts the field assignments itself, using whatever the parameters hold at the end of your block. This is what makes compact constructors safe for validation and normalization without letting you accidentally skip initializing a component — no seller can construct a <code>Product</code> with a negative price or negative stock, because the exception fires before any field is ever set.</p>
 
 <div class="callout warn">
   <div class="callout-title">A record can still have a non-canonical constructor</div>
-  <p>You can overload additional constructors, but every non-canonical constructor must delegate to the canonical constructor (directly or transitively via another constructor) as its first statement — the same rule that applies to <code>this(...)</code> chaining in ordinary classes. This preserves the guarantee that all validation logic in the canonical/compact constructor always runs, no matter which constructor a caller used.</p>
+  <p>You can overload additional constructors, but every non-canonical constructor must delegate to the canonical constructor (directly or transitively via another constructor) as its first statement — the same rule that applies to <code>this(...)</code> chaining in ordinary classes. This preserves the guarantee that all validation logic in the canonical/compact constructor always runs, no matter which constructor a caller used — a convenience overload like <code>Product(String id, String sellerId, String name, BigDecimal price, String category)</code> that defaults <code>stockQuantity</code> to <code>0</code> still can't bypass the price/stock validation above.</p>
 </div>
 
 <h3>1.3 Records and the class initialization lifecycle</h3>
 <p>A record compiles to an ordinary <code>final class</code> file at the bytecode level, so it goes through exactly the same static and instance initialization sequence covered on the <a href="#/jvm-architecture">JVM internals page</a>: static initializers and static field initializers run once, in textual order, the first time the class is actively used, guarded by the classloader's per-class initialization lock; then, for each instance, instance initializer blocks and instance field initializers run in textual order immediately before the constructor body, every time a canonical (or delegating) constructor is invoked. Nothing about the record shorthand changes that model — a compact constructor body is simply spliced in as the first part of the "constructor body" step, and the implicit field assignments happen after it, then any explicit trailing statements you wrote after the compact block's validation. If a record implements an interface with a static method, or has its own static fields (records can declare static fields and static methods — the restriction is only on <em>instance</em> fields beyond the components), classloading proceeds identically to any other class.</p>
 
 <h2>2. Sealed Classes and Interfaces</h2>
-<p>Before sealed types, Java's inheritance model was open by default: any class in the classpath could extend any non-final public class or implement any public interface. That openness is usually good for extensibility, but it's actively harmful when you're trying to model a <strong>closed set of variants</strong> — a type that represents "exactly these possibilities and no others," like a JSON value that's either a string, a number, a boolean, an array, or an object, and nothing else.</p>
+<p>Before sealed types, Java's inheritance model was open by default: any class in the classpath could extend any non-final public class or implement any public interface. That openness is usually good for extensibility, but it's actively harmful when you're trying to model a <strong>closed set of variants</strong> — a type that represents "exactly these possibilities and no others." ShopSphere's own domain is full of exactly this shape: an <code>Order</code> is always in exactly one of a small, fixed set of lifecycle states — <code>CREATED</code>, <code>PAID</code>, <code>SHIPPED</code>, <code>DELIVERED</code>, or <code>CANCELLED</code> — and it is never in some sixth state nobody anticipated, because the business process itself doesn't allow one.</p>
 
-<p>A <code>sealed</code> class or interface declares, via a <code>permits</code> clause, the exhaustive list of classes allowed to directly extend or implement it:</p>
+<p>A <code>sealed</code> class or interface declares, via a <code>permits</code> clause, the exhaustive list of classes allowed to directly extend or implement it. Modeled as a sealed hierarchy instead of a plain <code>enum</code> so that each state can carry the data that's only meaningful in that state (a <code>CANCELLED</code> order has a reason; a <code>SHIPPED</code> order has a carrier and tracking number; a plain <code>enum</code> constant cannot carry per-instance fields like this):</p>
 
-<pre><code>public sealed interface Shape permits Circle, Rectangle, Triangle {}
+<pre><code>public sealed interface OrderStatus
+        permits Created, Paid, Shipped, Delivered, Cancelled {}
 
-public final class Circle implements Shape {
-    public final double radius;
-    public Circle(double radius) { this.radius = radius; }
-}
+public record Created(Instant at) implements OrderStatus {}
+public record Paid(Instant at, String paymentId) implements OrderStatus {}
+public record Shipped(Instant at, String carrier, String trackingNumber) implements OrderStatus {}
+public record Delivered(Instant at) implements OrderStatus {}
+public record Cancelled(Instant at, String reason) implements OrderStatus {}</code></pre>
 
-public final class Rectangle implements Shape {
-    public final double width, height;
-    public Rectangle(double width, double height) {
-        this.width = width; this.height = height;
-    }
-}
+<p>Each permitted type here is a <code>record</code>, which is itself implicitly <code>final</code> (section 1) — that's what satisfies the sealing rule below without needing to write <code>final</code> explicitly. The hierarchy, as a tree, looks like this:</p>
 
-public final class Triangle implements Shape {
-    public final double base, height;
-    public Triangle(double base, double height) {
-        this.base = base; this.height = height;
-    }
-}</code></pre>
+<pre><code>sealed interface OrderStatus  (permits: exactly these 5, nothing else)
+  ├── record Created(Instant at)
+  ├── record Paid(Instant at, String paymentId)
+  ├── record Shipped(Instant at, String carrier, String trackingNumber)
+  ├── record Delivered(Instant at)
+  └── record Cancelled(Instant at, String reason)</code></pre>
 
-<p>Every class named in <code>permits</code> must itself declare how it participates in the sealing: it must be <code>final</code> (no further extension), <code>sealed</code> (it defines its own restricted set of subclasses), or <code>non-sealed</code> (it deliberately reopens extension to arbitrary subclasses from that point down). This is not optional boilerplate — the compiler rejects a permitted subclass that doesn't declare one of these three modifiers, because otherwise the "closed set" guarantee at the <code>Shape</code> level would be silently undermined by an unrestricted subclass three levels down.</p>
+<p>Every class named in <code>permits</code> must itself declare how it participates in the sealing: it must be <code>final</code> (no further extension), <code>sealed</code> (it defines its own restricted set of subclasses), or <code>non-sealed</code> (it deliberately reopens extension to arbitrary subclasses from that point down). This is not optional boilerplate — the compiler rejects a permitted subclass that doesn't declare one of these three modifiers, because otherwise the "closed set" guarantee at the <code>OrderStatus</code> level would be silently undermined by an unrestricted subclass three levels down.</p>
 
 <div class="callout">
   <div class="callout-title">Why this needs compiler enforcement, not just discipline</div>
-  <p>You could always simulate a closed hierarchy by convention — package-private constructors, documentation comments saying "do not extend this." But none of that is checked. A sealed hierarchy is checked at compile time and recorded in the class file (via a <code>PermittedSubclasses</code> attribute), which means <strong>tooling and the compiler itself</strong> can reason about completeness. That's the entire point: it turns "we intend this to be a closed set" into "the compiler can prove this is a closed set," which is the property that unlocks exhaustive switches in the next section.</p>
+  <p>You could always simulate a closed hierarchy by convention — package-private constructors, documentation comments saying "do not extend this." But none of that is checked. Before sealed types, ShopSphere's <code>OrderStatus</code> would likely have been an ordinary open interface, and nothing would have stopped a careless PR from adding a sixth implementation (say, a <code>PartiallyShipped</code> record for split fulfillment) without anyone updating every switch that pattern-matches over order status elsewhere in order-service. A sealed hierarchy is checked at compile time and recorded in the class file (via a <code>PermittedSubclasses</code> attribute), which means <strong>tooling and the compiler itself</strong> can reason about completeness. That's the entire point: it turns "we intend this to be a closed set" into "the compiler can prove this is a closed set," which is the property that unlocks exhaustive switches in the next section.</p>
 </div>
 
 <h3>2.1 permits and same-module / same-package constraints</h3>
-<p>Permitted subclasses must be knowable at compile time, so they're constrained to be co-located with the sealed type: either in the same module (for modular code) or, for classpath-based code, the same package. If all permitted subclasses are declared in the same source file or as nested classes of the sealed type, the <code>permits</code> clause can even be omitted — the compiler infers it from what it sees in that compilation unit.</p>
+<p>Permitted subclasses must be knowable at compile time, so they're constrained to be co-located with the sealed type: either in the same module (for modular code) or, for classpath-based code, the same package. If all permitted subclasses are declared in the same source file or as nested classes of the sealed type, the <code>permits</code> clause can even be omitted — the compiler infers it from what it sees in that compilation unit. In practice, order-service would keep <code>OrderStatus</code> and its five permitted records together in one <code>order.status</code> package (or one file), which is also exactly what makes it safe to omit an explicit <code>permits</code> clause on <code>OrderStatus</code> if you prefer — the compiler already sees every implementor in that same compilation unit.</p>
 
 <h2>3. Pattern Matching: instanceof, switch, and deconstruction</h2>
 
@@ -105,6 +106,7 @@ public final class Triangle implements Shape {
 <p>Before pattern matching, the idiomatic <code>instanceof</code> check required a redundant explicit cast immediately afterward, because the compiler didn't retain any relationship between the check and the subsequent use:</p>
 
 <pre><code>// Old style — the cast repeats information the instanceof check already proved.
+// obj here is some Object pulled off a Kafka OrderPlaced-style event payload.
 if (obj instanceof String) {
     String s = (String) obj;
     System.out.println(s.length());
@@ -117,12 +119,12 @@ if (obj instanceof String) {
 }
 
 // Flow-sensitive negation also works: the compiler tracks that if this
-// condition is true, obj was NOT a String, so returning/throwing means
-// s is definitely a String after this point too.
-if (!(obj instanceof String s)) {
+// condition is true, obj was NOT a Cancelled, so returning/throwing means
+// cancelled is definitely a Cancelled after this point too.
+if (!(obj instanceof Cancelled cancelled)) {
     return;
 }
-System.out.println(s.length()); // s is in scope and typed String here
+System.out.println("cancelled because: " + cancelled.reason()); // in scope, typed Cancelled here
 </code></pre>
 
 <p>This eliminates an entire category of bugs where the cast type silently drifts from the <code>instanceof</code> type during a refactor (someone changes the check but forgets to update the cast, producing a <code>ClassCastException</code> at runtime instead of a compile error).</p>
@@ -139,69 +141,85 @@ System.out.println(s.length()); // s is in scope and typed String here
     };
 }</code></pre>
 
-<p>Note that <code>case null</code> is legal directly in a pattern-matching switch — something that was illegal for traditional switches, which threw <code>NullPointerException</code> on a null selector. This matters because it removes the need for a separate null check before the switch, folding null-handling into the same exhaustiveness-checked construct.</p>
+<p>Note that <code>case null</code> is legal directly in a pattern-matching switch — something that was illegal for traditional switches, which threw <code>NullPointerException</code> on a null selector. This matters because it removes the need for a separate null check before the switch, folding null-handling into the same exhaustiveness-checked construct. Concretely, this matters for ShopSphere's <code>OrderItem.unitPriceAtPurchase</code> lookups, where a missing price should mean "not yet priced," not a crash:</p>
 
-<h3>3.3 Record deconstruction patterns</h3>
-<p>Because a record's canonical form is fully known (its components, in order, with fixed types), a <code>case</code> label can destructure a record's components directly, binding each one to a new variable without calling any accessor manually:</p>
-
-<pre><code>record Point(int x, int y) {}
-
-static String classify(Object obj) {
-    return switch (obj) {
-        case Point(int x, int y) when x == 0 && y == 0 -> "origin";
-        case Point(int x, int y) when x == y            -> "on the diagonal";
-        case Point(int x, int y)                        -> "point at " + x + "," + y;
-        default                                          -> "not a point";
+<pre><code>static String priceLabel(BigDecimal unitPriceAtPurchase) {
+    return switch (unitPriceAtPurchase) {
+        case null                          -> "not yet priced";
+        case BigDecimal p when p.signum() == 0 -> "free";
+        case BigDecimal p                  -> "$" + p;
     };
 }</code></pre>
 
-<p>Deconstruction patterns nest arbitrarily — a record whose component is itself another record can be destructured in one pattern, e.g. <code>case Line(Point(int x1, int y1), Point(int x2, int y2))</code>, which recursively unpacks both endpoints in a single case label.</p>
+<h3>3.3 Record deconstruction patterns</h3>
+<p>Because a record's canonical form is fully known (its components, in order, with fixed types), a <code>case</code> label can destructure a record's components directly, binding each one to a new variable without calling any accessor manually. Here, deconstructing ShopSphere's sealed <code>OrderStatus</code> hierarchy from section 2 to build a one-line summary for an order-history page:</p>
+
+<pre><code>static String summarize(OrderStatus status) {
+    return switch (status) {
+        case Created(var at)                         -> "placed at " + at;
+        case Paid(var at, var paymentId)              -> "paid (payment " + paymentId + ") at " + at;
+        case Shipped(var at, var carrier, var track)  -> "shipped via " + carrier + ", tracking " + track;
+        case Delivered(var at)                        -> "delivered at " + at;
+        case Cancelled(var at, var reason) when reason.isBlank() -> "cancelled at " + at + " (no reason given)";
+        case Cancelled(var at, var reason)            -> "cancelled at " + at + ": " + reason;
+    };
+}</code></pre>
+
+<p>Deconstruction patterns nest arbitrarily — a record whose component is itself another record can be destructured in one pattern, e.g. destructuring a <code>record OrderItem(Product product, int quantity)</code> as <code>case OrderItem(Product(var id, var name, var price, var category, var stock), var qty)</code>, which recursively unpacks the nested <code>Product</code>'s fields and the item's quantity in a single case label.</p>
 
 <h3>3.4 Guarded patterns (when clauses)</h3>
-<p>A type pattern alone can only discriminate on type, but you frequently need to refine further — "it's a <code>Point</code>, but specifically one at the origin." The <code>when</code> clause adds an arbitrary boolean guard evaluated only after the type/deconstruction pattern has already matched, as shown in the <code>classify</code> example above. This is what lets pattern-matching switches subsume a chain of <code>if (x instanceof T t && t.someCondition())</code> checks into one readable, exhaustively-checked construct.</p>
+<p>A type pattern alone can only discriminate on type, but you frequently need to refine further — "it's a <code>Cancelled</code> order, but specifically one with no reason recorded." The <code>when</code> clause adds an arbitrary boolean guard evaluated only after the type/deconstruction pattern has already matched, as shown in the <code>summarize</code> example above. This is what lets pattern-matching switches subsume a chain of <code>if (x instanceof T t && t.someCondition())</code> checks into one readable, exhaustively-checked construct.</p>
 
 <div class="callout tip">
   <div class="callout-title">Pattern order matters, just like exception catch clauses</div>
-  <p>Case labels are evaluated top to bottom, and the first match wins. A guarded pattern <code>case Point(int x, int y) when x == y</code> placed before an unguarded <code>case Point(int x, int y)</code> is fine, but if you reverse the order, the unguarded case shadows the guarded one and the compiler will flag it as unreachable — the same "more specific must come first" discipline you already apply when ordering <code>catch</code> blocks from subclass to superclass.</p>
+  <p>Case labels are evaluated top to bottom, and the first match wins. A guarded pattern <code>case Cancelled(var at, var reason) when reason.isBlank()</code> placed before an unguarded <code>case Cancelled(var at, var reason)</code> is fine, but if you reverse the order, the unguarded case shadows the guarded one and the compiler will flag it as unreachable — the same "more specific must come first" discipline you already apply when ordering <code>catch</code> blocks from subclass to superclass.</p>
 </div>
 
 <h2>4. Sealed types + pattern matching: compiler-enforced exhaustiveness</h2>
 <p>This is where the three features compose into something genuinely new for Java. When the selector of a <code>switch</code> expression has a sealed type, the compiler knows the complete set of permitted subtypes from the <code>permits</code> clause. If every permitted subtype has a corresponding <code>case</code>, the switch is provably exhaustive, and <strong>no <code>default</code> branch is required</strong> — in fact, for a switch <em>expression</em> (one that must produce a value), omitting a case for a permitted subtype without a <code>default</code> is a compile error, not a runtime gap.</p>
 
-<p>Consider modeling a computation result as a closed set of two outcomes, deliberately built to exercise generics, nested records, and multi-level sealing at once:</p>
+<p>Consider modeling the result of calling out to payment-service to capture a payment for a ShopSphere <code>Order</code> — a closed set of outcomes, deliberately built to exercise generics, nested records, and multi-level sealing at once:</p>
 
-<pre><code>public sealed interface Result&lt;T&gt; permits Success, Failure {}
+<pre><code>public sealed interface PaymentResult permits PaymentAccepted, PaymentRejected {}
 
-public record Success&lt;T&gt;(T value) implements Result&lt;T&gt; {}
+public record PaymentAccepted(String paymentId, BigDecimal amountCharged) implements PaymentResult {}
 
-public sealed interface Failure extends Result&lt;Object&gt;
-        permits ValidationFailure, TimeoutFailure {}
+public sealed interface PaymentRejected extends PaymentResult
+        permits InsufficientFunds, GatewayTimeout {}
 
-public record ValidationFailure(String field, String reason) implements Failure {}
-public record TimeoutFailure(long elapsedMillis) implements Failure {}
+public record InsufficientFunds(String cardLast4) implements PaymentRejected {}
+public record GatewayTimeout(long elapsedMillis) implements PaymentRejected {}
 
-static &lt;T&gt; String render(Result&lt;T&gt; result) {
+static String render(PaymentResult result) {
     return switch (result) {
-        case Success&lt;T&gt;(var value) ->
-            "ok: " + value;
-        case ValidationFailure(var field, var reason) when reason.isBlank() ->
-            "validation failed on " + field + " (no reason given)";
-        case ValidationFailure(var field, var reason) ->
-            "validation failed on " + field + ": " + reason;
-        case TimeoutFailure(var ms) when ms > 30_000 ->
-            "timed out badly after " + ms + "ms";
-        case TimeoutFailure(var ms) ->
-            "timed out after " + ms + "ms";
+        case PaymentAccepted(var paymentId, var amount) ->
+            "charged $" + amount + " (payment " + paymentId + ")";
+        case InsufficientFunds(var last4) when last4.isBlank() ->
+            "declined: insufficient funds (card unknown)";
+        case InsufficientFunds(var last4) ->
+            "declined: insufficient funds on card ending " + last4;
+        case GatewayTimeout(var ms) when ms > 30_000 ->
+            "payment gateway timed out badly after " + ms + "ms — do not retry automatically";
+        case GatewayTimeout(var ms) ->
+            "payment gateway timed out after " + ms + "ms — safe to retry with the same idempotencyKey";
     };
 }</code></pre>
 
-<p>Walk through why this compiles with no <code>default</code>: <code>Result&lt;T&gt;</code> permits exactly <code>Success</code> and <code>Failure</code>; <code>Failure</code> itself is sealed and permits exactly <code>ValidationFailure</code> and <code>TimeoutFailure</code>. The compiler flattens this two-level sealed hierarchy and confirms that <code>Success</code>, <code>ValidationFailure</code>, and <code>TimeoutFailure</code> — the only three concrete leaves — each have at least one unconditional (guard-free) case covering them. The guarded cases (<code>when reason.isBlank()</code>, <code>when ms > 30_000</code>) don't count toward exhaustiveness on their own, precisely because a guard can be false — which is why each guarded case here is paired with a fallback unguarded case for the same pattern.</p>
+<p>This is a two-level sealed hierarchy — a sealed interface (<code>PaymentRejected</code>) that is itself one of the permitted branches of an outer sealed interface (<code>PaymentResult</code>), rather than a flat list of leaves. As a tree:</p>
 
-<p>Now suppose someone extends the hierarchy: they add <code>permits ValidationFailure, TimeoutFailure, RateLimitedFailure</code> to <code>Failure</code>, and a new <code>record RateLimitedFailure(int retryAfterSeconds) implements Failure {}</code>, but never revisit <code>render</code>. Because <code>render</code>'s switch is exhaustive over a sealed type with no <code>default</code>, the compiler immediately reports an error at the switch — something like <code>the switch expression does not cover all possible input values</code> — pointing at the exact call site that needs updating, rather than letting the new variant silently fall through to a wrong branch or an <code>IllegalStateException</code> discovered later in production. This is the concrete payoff: adding a variant to a closed hierarchy turns every place that pattern-matches over it into a to-do list the compiler generates for you.
+<pre><code>sealed interface PaymentResult  (permits: exactly these 2, nothing else)
+  ├── record PaymentAccepted(String paymentId, BigDecimal amountCharged)
+  └── sealed interface PaymentRejected  (permits: exactly these 2, nothing else)
+        ├── record InsufficientFunds(String cardLast4)
+        └── record GatewayTimeout(long elapsedMillis)</code></pre>
+
+<p>Walk through why this compiles with no <code>default</code>: <code>PaymentResult</code> permits exactly <code>PaymentAccepted</code> and <code>PaymentRejected</code>; <code>PaymentRejected</code> itself is sealed and permits exactly <code>InsufficientFunds</code> and <code>GatewayTimeout</code>. The compiler flattens this two-level sealed hierarchy and confirms that <code>PaymentAccepted</code>, <code>InsufficientFunds</code>, and <code>GatewayTimeout</code> — the only three concrete leaves — each have at least one unconditional (guard-free) case covering them. The guarded cases (<code>when last4.isBlank()</code>, <code>when ms > 30_000</code>) don't count toward exhaustiveness on their own, precisely because a guard can be false — which is why each guarded case here is paired with a fallback unguarded case for the same pattern.</p>
+
+<p>Now suppose someone extends the hierarchy: payment-service starts distinguishing fraud holds from ordinary declines, so they add <code>permits InsufficientFunds, GatewayTimeout, FraudHold</code> to <code>PaymentRejected</code>, and a new <code>record FraudHold(String reviewCaseId) implements PaymentRejected {}</code>, but never revisit <code>render</code>. Because <code>render</code>'s switch is exhaustive over a sealed type with no <code>default</code>, the compiler immediately reports an error at the switch — something like <code>the switch expression does not cover all possible input values</code> — pointing at the exact call site that needs updating, rather than letting the new variant silently fall through to a wrong branch or an <code>IllegalStateException</code> discovered later in production, e.g. checkout code that treats every rejection identically and tells a customer "insufficient funds" when their payment was actually flagged for a fraud review. This is the concrete payoff: adding a variant to a closed hierarchy turns every place that pattern-matches over it into a to-do list the compiler generates for you.</p>
 
 <div class="callout warn">
   <div class="callout-title">This guarantee disappears the moment you add a catch-all</div>
-  <p>If <code>render</code> had a trailing <code>default -> "unknown failure"</code>, adding <code>RateLimitedFailure</code> would compile cleanly and silently route through <code>default</code> — exactly the bug sealed exhaustiveness exists to prevent. Add a <code>default</code> to a sealed-type switch only when you deliberately want new variants to degrade gracefully rather than force an update; otherwise, leaving it off is the feature, not an oversight.</p>
+  <p>If <code>render</code> had a trailing <code>default -> "payment declined"</code>, adding <code>FraudHold</code> would compile cleanly and silently route through <code>default</code> — exactly the bug sealed exhaustiveness exists to prevent. Add a <code>default</code> to a sealed-type switch only when you deliberately want new variants to degrade gracefully rather than force an update; otherwise, leaving it off is the feature, not an oversight.</p>
 </div>
 
 <table>
@@ -212,47 +230,52 @@ static &lt;T&gt; String render(Result&lt;T&gt; result) {
 <tr><td>record</td><td>No extra instance fields beyond components; final by implication</td><td>equals/hashCode/toString/accessors are all derivable from components alone</td></tr>
 </table>
 
+<div class="callout">
+  <div class="callout-title">The idempotencyKey referenced in the GatewayTimeout branch isn't incidental</div>
+  <p>Notice that the guarded <code>GatewayTimeout</code> branch above explicitly calls out "safe to retry with the same idempotencyKey." Modeling <code>PaymentResult</code> as a sealed type is what makes that distinction expressible and enforceable in the first place: a caller pattern-matching over <code>PaymentResult</code> can tell a genuine gateway timeout (safe to retry, because payment-service's own idempotency key deduplicates the retried attempt so the customer is never double-charged) apart from an insufficient-funds decline (never safe to blindly retry — the customer needs to act). Collapsing every failure into a single <code>PaymentException</code> or a boolean <code>success</code> flag would destroy exactly the information a correct retry policy needs. See the payment systems page for how idempotency keys make retries safe at the payment-provider level.</p>
+</div>
+
 <h2>5. Optional revisited: anti-patterns and the functional style it was designed for</h2>
 <p><code>Optional&lt;T&gt;</code> was added specifically to give method return types an explicit, type-checked way to say "this might not have a value," replacing the ambiguous convention of returning <code>null</code> and hoping every caller remembers to check. But <code>Optional</code> is frequently used in ways its designers explicitly warned against, because it superficially looks like "a nicer null" rather than what it actually is: a container meant to be composed functionally, similar in spirit to the <code>Stream</code> pipelines covered on the <a href="#/streams-functional">streams and functional programming page</a>.</p>
 
 <h3>5.1 Optional as a field</h3>
-<p><code>Optional</code> does not implement <code>Serializable</code>. A field of type <code>Optional&lt;String&gt;</code> on a class that gets serialized (via Java serialization, or even naively via some reflection-based frameworks) either fails outright or requires special-case handling that defeats the purpose of using <code>Optional</code> for clarity. Beyond serialization, an <code>Optional</code> field also doubles the ways "no value" can be represented: the field reference itself can be null (nobody stops you from writing <code>this.middleName = null;</code> instead of <code>Optional.empty()</code>), so you've added a wrapper without actually eliminating the null case you were trying to avoid.</p>
-<p><strong>Idiomatic replacement:</strong> use a plain, possibly-null field (with <code>@Nullable</code> annotations or clear documentation), and only wrap it in <code>Optional</code> at the accessor boundary if you want callers to be forced to handle absence:</p>
-<pre><code>public class Person {
-    private final String middleName; // may be null internally
+<p><code>Optional</code> does not implement <code>Serializable</code>. A field of type <code>Optional&lt;String&gt;</code> on a class that gets serialized (via Java serialization, or even naively via some reflection-based frameworks) either fails outright or requires special-case handling that defeats the purpose of using <code>Optional</code> for clarity. Beyond serialization, an <code>Optional</code> field also doubles the ways "no value" can be represented: the field reference itself can be null (nobody stops you from writing <code>this.appliedCoupon = null;</code> instead of <code>Optional.empty()</code>), so you've added a wrapper without actually eliminating the null case you were trying to avoid.</p>
+<p><strong>Idiomatic replacement:</strong> use a plain, possibly-null field (with <code>@Nullable</code> annotations or clear documentation), and only wrap it in <code>Optional</code> at the accessor boundary if you want callers to be forced to handle absence — here, a ShopSphere <code>Order</code> that may or may not have had a <code>Coupon</code> applied at checkout:</p>
+<pre><code>public class Order {
+    private final Coupon appliedCoupon; // may be null internally — most orders have none
 
-    public Optional&lt;String&gt; middleName() {
-        return Optional.ofNullable(middleName);
+    public Optional&lt;Coupon&gt; appliedCoupon() {
+        return Optional.ofNullable(appliedCoupon);
     }
 }</code></pre>
 
 <h3>5.2 Optional as a method parameter</h3>
 <p>Making a parameter <code>Optional&lt;T&gt;</code> pushes the wrapping cost onto every caller, including callers who have a perfectly ordinary, always-present value — they now have to write <code>Optional.of(value)</code> just to call your method. It also allows a second, unwanted way to express "no argument": passing <code>null</code> itself instead of <code>Optional.empty()</code>, which <code>Optional</code>-typed parameters do nothing to prevent.</p>
-<p><strong>Idiomatic replacement:</strong> use method overloading for the "this argument may be omitted" case:</p>
-<pre><code>// Instead of: void search(String query, Optional&lt;String&gt; region)
+<p><strong>Idiomatic replacement:</strong> use method overloading for the "this argument may be omitted" case — here, catalog-search-service's search endpoint, where a <code>category</code> filter is optional but a query string is always required:</p>
+<pre><code>// Instead of: void search(String query, Optional&lt;String&gt; category)
 void search(String query) {
     search(query, null);
 }
 
-void search(String query, String region) {
-    String effectiveRegion = (region != null) ? region : "GLOBAL";
+void search(String query, String category) {
+    String effectiveCategory = (category != null) ? category : "ALL";
     // ...
 }</code></pre>
 
 <h3>5.3 isPresent()/get() instead of the functional style</h3>
-<p>Writing <code>if (opt.isPresent()) { return opt.get().toUpperCase(); } else { return "DEFAULT"; }</code> reproduces exactly the imperative null-check structure <code>Optional</code> was meant to replace — it's a null check with extra ceremony. <code>Optional</code>'s actual API is a small set of combinators designed to be chained:</p>
+<p>Writing <code>if (opt.isPresent()) { return opt.get().percentOff(); } else { return 0; }</code> reproduces exactly the imperative null-check structure <code>Optional</code> was meant to replace — it's a null check with extra ceremony. <code>Optional</code>'s actual API is a small set of combinators designed to be chained. All four rows below use <code>Optional&lt;Coupon&gt;</code> from the <code>Order.appliedCoupon()</code> accessor in section 5.1:</p>
 <table>
 <tr><th>Anti-pattern</th><th>Idiomatic replacement</th><th>Why it's better</th></tr>
-<tr><td><code>if (opt.isPresent()) return opt.get().toUpperCase(); else return "DEFAULT";</code></td><td><code>opt.map(String::toUpperCase).orElse("DEFAULT")</code></td><td>One expression; no branch to accidentally get wrong; reads as a pipeline</td></tr>
-<tr><td><code>if (opt.isPresent()) { doSomething(opt.get()); }</code></td><td><code>opt.ifPresent(this::doSomething)</code></td><td>No manual unwrap; the lambda only runs when a value exists</td></tr>
+<tr><td><code>if (opt.isPresent()) return opt.get().percentOff(); else return 0;</code></td><td><code>opt.map(Coupon::percentOff).orElse(0)</code></td><td>One expression; no branch to accidentally get wrong; reads as a pipeline</td></tr>
+<tr><td><code>if (opt.isPresent()) { notifyCouponApplied(opt.get()); }</code></td><td><code>opt.ifPresent(this::notifyCouponApplied)</code></td><td>No manual unwrap; the lambda only runs when a value exists</td></tr>
 <tr><td><code>if (!opt.isPresent()) throw new IllegalStateException(); return opt.get();</code></td><td><code>opt.orElseThrow(() -> new IllegalStateException())</code> (or no-arg <code>orElseThrow()</code> for <code>NoSuchElementException</code>)</td><td>Expresses "required value or a specific failure" as one call</td></tr>
-<tr><td>Nested <code>if (opt.isPresent())</code> around another Optional-returning call</td><td><code>opt.flatMap(this::lookupSecondThing)</code></td><td>Avoids <code>Optional&lt;Optional&lt;T&gt;&gt;</code> and nested conditionals</td></tr>
+<tr><td>Nested <code>if (opt.isPresent())</code> around another Optional-returning call</td><td><code>opt.flatMap(this::lookupActiveCouponRules)</code></td><td>Avoids <code>Optional&lt;Optional&lt;T&gt;&gt;</code> and nested conditionals</td></tr>
 </table>
 <p>The unifying idea is the same discipline that makes <code>Stream</code> pipelines composable: treat <code>Optional</code> as a zero-or-one-element container you transform with <code>map</code>/<code>filter</code>/<code>flatMap</code> and only terminate with <code>orElse</code>/<code>orElseGet</code>/<code>orElseThrow</code>, never by manually branching on presence and reaching in with <code>get()</code>.</p>
 
 <div class="callout tip">
   <div class="callout-title">Optional and sealed Result types solve overlapping but distinct problems</div>
-  <p><code>Optional&lt;T&gt;</code> only tells you value-or-nothing; it carries no information about <em>why</em> there's nothing. The sealed <code>Result&lt;T&gt;</code> pattern from section 4 is what you reach for when the failure case itself carries structured data (a validation reason, a timeout duration) that callers need to branch on. Don't force a rich failure into <code>Optional.empty()</code> and lose that information — model it as a sealed type and pattern-match instead.</p>
+  <p><code>Optional&lt;T&gt;</code> only tells you value-or-nothing; it carries no information about <em>why</em> there's nothing. The sealed <code>PaymentResult</code> pattern from section 4 is what you reach for when the failure case itself carries structured data (which card, which timeout, which fraud case) that callers need to branch on. Don't force a rich failure into <code>Optional.empty()</code> and lose that information — an <code>Optional&lt;PaymentResult&gt;</code> that's empty on both "the gateway rejected the charge" and "the gateway timed out" throws away exactly the distinction a retry policy needs; model it as a sealed type and pattern-match instead.</p>
 </div>
 
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
@@ -284,12 +307,12 @@ void search(String query, String region) {
 
 <details class="concept-qa">
 <summary>If a sealed interface's permitted subtype is itself sealed, how does the compiler check exhaustiveness through both levels?</summary>
-<div class="qa-body">The compiler recursively expands the hierarchy: for a switch over the top-level sealed type, it walks each permitted subtype, and if that subtype is itself sealed (non-final), it recurses into its own permits list instead of treating it as a single leaf, continuing until it reaches only final classes, records, or non-sealed types (which it cannot fully enumerate, since non-sealed reopens extension). The switch is exhaustive only if every reachable final/record leaf across that whole recursive expansion has a matching case, as demonstrated in the Result/Failure example.</div>
+<div class="qa-body">The compiler recursively expands the hierarchy: for a switch over the top-level sealed type, it walks each permitted subtype, and if that subtype is itself sealed (non-final), it recurses into its own permits list instead of treating it as a single leaf, continuing until it reaches only final classes, records, or non-sealed types (which it cannot fully enumerate, since non-sealed reopens extension). The switch is exhaustive only if every reachable final/record leaf across that whole recursive expansion has a matching case, as demonstrated in the PaymentResult/PaymentRejected example, where the compiler flattens PaymentResult's two permitted branches down through PaymentRejected's own two permitted branches to arrive at three total leaves.</div>
 </details>
 
 <details class="concept-qa">
 <summary>Why does record deconstruction in a switch pattern require knowing the record's canonical component order, and what happens if you get it wrong?</summary>
-<div class="qa-body">A deconstruction pattern like case Point(int x, int y) matches positionally against the canonical constructor's parameter order, not by name lookup against accessor methods. If you write case Point(int y, int x) intending to swap semantics, the compiler doesn't reorder anything — it still binds the first pattern variable to the first canonical component and the second to the second; only the local variable names you chose are swapped, which can silently produce logically inverted code that still compiles, since the variable names are just labels you pick. This is why the type of each bound variable must be compile-time compatible with the corresponding component's declared type — that's the check the compiler performs — but there is no protection against a human choosing confusing names for the position.</div>
+<div class="qa-body">A deconstruction pattern like case Shipped(var at, var carrier, var trackingNumber) matches positionally against the canonical constructor's parameter order, not by name lookup against accessor methods. If you write case Shipped(var trackingNumber, var carrier, var at) intending to relabel things, the compiler doesn't reorder anything based on your chosen names — it still binds the first pattern variable to the first canonical component (which is actually the Instant at), the second to the second (carrier), and so on; only the local variable names you chose are different, which can silently produce logically inverted code that still compiles, since the variable names are just labels you pick and the compiler only checks that each bound variable's declared type is compatible with the corresponding component's actual type (a String-typed pattern variable bound against the Instant component would be a compile error, catching some but not all misordering). There is no protection against a human choosing confusing names for the position — only against binding a variable of the wrong type to a position.</div>
 </details>
 
 <h2>Related Topics</h2>
@@ -309,5 +332,9 @@ void search(String query, String region) {
   <div class="related-card" onclick="window.location.hash='/collections-internals'">
     <div class="rc-title">Collections Internals</div>
     <div class="rc-sub">Related track · records as immutable keys rely on the same equals/hashCode contract collections depend on</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'">
+    <div class="rc-title">Payment Systems &amp; Idempotent Transactions</div>
+    <div class="rc-sub">Related track · the PaymentResult sealed hierarchy models exactly the outcomes an idempotent retry policy needs to distinguish</div>
   </div>
 </div>

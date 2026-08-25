@@ -1,0 +1,256 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Extended Bonus · Bonus</p>
+<h1>Data Privacy &amp; Compliance: GDPR &amp; PCI-DSS</h1>
+<div class="topic-tags">
+<span class="tag">Right to Erasure</span>
+<span class="tag">Anonymization vs Deletion</span>
+<span class="tag">Data Minimization</span>
+<span class="tag">Consent Tracking</span>
+<span class="tag">PCI-DSS Scope Reduction</span>
+<span class="tag">Tokenization</span>
+<span class="tag">Encryption at Rest / in Transit</span>
+<span class="tag">Access Audit Logging</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Privacy and payment-security regulation stop being abstract legal text the moment you're the engineer who has to implement "delete this customer's data" against a schema where <code>Order</code> rows foreign-key to <code>Customer</code>, or decide whether a new checkout field needs to be encrypted, or explain to an auditor exactly who queried a customer's payment history last quarter and why. GDPR and PCI-DSS are not optional best practices layered on top of "real" engineering — they are constraints on the schema, the data flow, and the access model that, if ignored, produce systems that are either illegal to operate in the EU, unable to pass a card-network audit, or both. The genuinely useful skill here isn't memorizing article numbers — it's recognizing, at design time, which ShopSphere tables need a deletion strategy that isn't <code>DELETE</code>, which fields must never reach ShopSphere's own database at all, and which reads need to be logged as carefully as the writes. Getting this wrong doesn't just risk a fine — it means the system was built on a data model that is structurally incompatible with the law it operates under, and retrofitting that after launch is far more expensive than designing for it up front.</p>
+</div>
+
+<h2>1. GDPR From a Backend Engineer's Chair</h2>
+<p>The GDPR (General Data Protection Regulation) is EU law, but it applies to ShopSphere the moment ShopSphere has even one EU customer — jurisdiction follows the data subject, not ShopSphere's own headquarters. Stripped of legal framing, it reduces to a small number of engineering-relevant obligations: ShopSphere must know what personal data it holds and why, must be able to produce or delete a specific customer's data on request, must not collect more than it needs, and must be able to prove a customer actually agreed to whatever ShopSphere is doing with their data beyond fulfilling their orders.</p>
+<h3>1.1 What counts as personal data in ShopSphere's schema</h3>
+<p>"Personal data" is anything that can identify a natural person, directly or indirectly. This is broader than the fields ShopSphere might instinctively think of as sensitive:</p>
+<table>
+<tr><th>ShopSphere field</th><th>Personal data?</th><th>Why</th></tr>
+<tr><td><code>Customer.email</code>, <code>Customer.name</code></td><td>Yes — directly identifying</td><td>Uniquely identifies a specific person on their own</td></tr>
+<tr><td><code>Order.shippingAddress</code></td><td>Yes</td><td>Identifies where a specific person lives/receives goods</td></tr>
+<tr><td><code>Payment.provider</code> transaction reference</td><td>Yes, indirectly</td><td>Combined with <code>Order.customerId</code> it re-identifies a person's purchase</td></tr>
+<tr><td><code>Review.comment</code> text</td><td>Potentially yes</td><td>Free text can contain a name, an address, or other self-disclosed identifying detail</td></tr>
+<tr><td><code>Product.category</code>, <code>Product.price</code></td><td>No</td><td>Describes the catalog, not a person — identical regardless of who's browsing</td></tr>
+<tr><td>Server-side request logs keyed by <code>customerId</code> + IP</td><td>Yes</td><td>An IP address is itself considered personal data under GDPR when it can be linked to an individual</td></tr>
+</table>
+<p>The practical consequence: a "delete this customer's data" request is never scoped to just the <code>customers</code> table. It potentially touches <code>orders</code>, <code>reviews</code>, application logs, analytics events, and anywhere else a <code>customerId</code>-keyed record ended up — which is exactly why data minimization (section 1.3) and knowing your own data flows matter more than any single deletion mechanism.</p>
+
+<h3>1.2 The Right to Erasure Is Not <code>DELETE FROM customers WHERE id = ?</code></h3>
+<p>GDPR Article 17 gives a data subject the right to have their personal data erased. The naive implementation — running a hard <code>DELETE</code> against the <code>customers</code> row — breaks immediately in ShopSphere's schema, for a reason that has nothing to do with GDPR and everything to do with relational integrity: <code>Order.customerId</code> is a foreign key into <code>customers</code>. Deleting the parent row either fails outright (if the foreign key is enforced with no cascade), or — far worse — cascades and silently deletes every <code>Order</code>, <code>OrderItem</code>, and <code>Payment</code> record tied to that customer.</p>
+<div class="callout warn">
+<div class="callout-title">Why cascading the delete is not just a bug, it's a second compliance violation</div>
+<p>ShopSphere has independent legal obligations to <em>retain</em> financial records — tax law and, separately, PCI-DSS audit requirements typically mandate keeping transaction records for several years regardless of what the customer wants erased. A cascading hard delete of a <code>Customer</code> row that takes their <code>Order</code> and <code>Payment</code> history down with it doesn't just lose business data — it can violate financial record-keeping law in the act of trying to comply with privacy law. GDPR itself anticipates this conflict directly: Article 17(3) exempts erasure where retention is necessary for compliance with a separate legal obligation. The correct read is "erase what identifies this person," not "erase every row that happens to reference them."</p>
+</div>
+<p>The pattern that actually satisfies both obligations at once is <strong>anonymization instead of deletion</strong> for any row that other legally-required records depend on: keep the <code>Order</code>/<code>Payment</code> rows (satisfying financial retention), but irreversibly strip or replace every field on the <code>Customer</code> row — and any denormalized copies of it — that could re-identify the person.</p>
+<pre><code>-- WRONG: violates FK integrity or silently destroys retained financial records
+DELETE FROM customers WHERE id = 8841;
+
+-- RIGHT: anonymize the Customer row in place; Order/Payment history survives,
+-- but no longer points back to an identifiable person
+UPDATE customers
+SET email = CONCAT('deleted-user-', id, '@erased.shopsphere.internal'),
+    name = 'Erased Customer',
+    phone = NULL,
+    date_of_birth = NULL,
+    deleted_at = NOW(),
+    is_erased = TRUE
+WHERE id = 8841;
+
+-- Denormalized copies must be scrubbed too - e.g. a shippingAddress snapshot
+-- stored directly on each historical Order at checkout time
+UPDATE orders
+SET shipping_name = 'Erased Customer',
+    shipping_address_line1 = '[erased]',
+    shipping_address_line2 = NULL
+WHERE customer_id = 8841;
+
+-- Review text is free-form and may self-disclose identity - redact, don't leave it
+UPDATE reviews SET comment = '[removed]' WHERE customer_id = 8841;</code></pre>
+<p>Note what's deliberately preserved: <code>Order.id</code>, <code>Order.totalAmount</code>, <code>Order.status</code>, and <code>OrderItem</code> rows remain untouched, because they're needed for revenue reporting, tax records, and dispute handling, and none of them are personal data about the customer once the customer-identifying fields are gone. The <code>is_erased</code> flag matters operationally too: application code (support tooling, admin dashboards) needs to know this account is a tombstone and stop surfacing it as a normal active customer, rather than the anonymization being discovered accidentally when someone notices the email looks strange.</p>
+<h3>1.3 Data Minimization: Not Collecting What You Don't Need</h3>
+<p>GDPR's data minimization principle (Article 5(1)(c)) says: collect only what's necessary for the stated purpose, nothing "just in case it's useful later." For ShopSphere, this is a concrete schema-design discipline, not an aspiration:</p>
+<table>
+<tr><th>Temptation</th><th>Why it violates minimization</th><th>Better ShopSphere design</th></tr>
+<tr><td>Store a Customer's full date of birth to gate age-restricted products</td><td>Full DOB is more precise than needed and is itself sensitive personal data</td><td>Store a boolean <code>isOverAgeRestriction</code> confirmed at signup, or an age bracket, not the raw DOB</td></tr>
+<tr><td>Log full request bodies (including <code>Payment</code> and <code>Customer</code> fields) for every API call "for debugging"</td><td>Debug logs become an uncontrolled, long-lived copy of personal data outside the primary data model's access controls</td><td>Structured logging that explicitly excludes PII fields, or logs only the <code>orderId</code>/<code>customerId</code> reference, not the payload — see <a href="#/observability-production">observability</a> for the logging pipeline this flows through</td></tr>
+<tr><td>Keep every abandoned <code>Cart</code> indefinitely to "maybe" build a recommendation feature someday</td><td>Retention with no defined purpose or expiry is the textbook minimization violation</td><td>Define a retention window (e.g. 90 days) and expire abandoned carts automatically; if a recommendation feature is later built, design its own bounded retention for that stated purpose</td></tr>
+</table>
+<p>The engineering upside of minimization is easy to underrate: every field ShopSphere doesn't collect is a field that can never leak in a breach, never needs an erasure path, and never needs to be reasoned about in an audit. Minimization isn't just a compliance checkbox — it directly shrinks the system's attack surface and its long-term maintenance burden.</p>
+<h3>1.4 Consent Tracking</h3>
+<p>GDPR requires that certain processing — most commonly marketing communications and non-essential analytics/tracking — have explicit, recorded, revocable consent. Consent is not a single global flag; it's purpose-specific and must be provable after the fact, which means it needs its own auditable record, not just a boolean on the <code>Customer</code> row overwritten in place on every change:</p>
+<pre><code>-- A consent record is append-only, not a single mutable flag,
+-- because "prove what the customer agreed to, and when" requires history
+CREATE TABLE customer_consent (
+    id BIGINT PRIMARY KEY,
+    customer_id BIGINT NOT NULL,
+    purpose VARCHAR(64) NOT NULL,      -- e.g. 'MARKETING_EMAIL', 'PERSONALIZED_ADS'
+    granted BOOLEAN NOT NULL,
+    consent_version VARCHAR(16) NOT NULL, -- which privacy-policy version was shown
+    recorded_at TIMESTAMP NOT NULL,
+    source VARCHAR(32) NOT NULL        -- 'SIGNUP_CHECKBOX', 'ACCOUNT_SETTINGS', ...
+);</code></pre>
+<p>Processing that's strictly necessary for the contract the customer already entered into — charging their <code>Payment</code> for an <code>Order</code> they placed, sending a shipping notification for that same order — does not need this consent mechanism at all; GDPR's "necessary for performance of a contract" and "legitimate interest" legal bases cover that without an opt-in checkbox. Consent tracking exists specifically for processing that goes <em>beyond</em> fulfilling the transaction the customer initiated — marketing emails, cross-selling based on browsing history, sharing data with third-party ad networks. Conflating the two is a common mistake: gating an order-confirmation email behind a marketing-consent checkbox is both bad UX and legally unnecessary, since fulfilling a placed order doesn't require separate consent.</p>
+
+<h2>2. PCI-DSS: Keeping Raw Card Data Out of ShopSphere Entirely</h2>
+<p>PCI-DSS (Payment Card Industry Data Security Standard) is not a law — it's a contractual security standard imposed by the card networks (Visa, Mastercard, etc.) on anyone who stores, processes, or transmits cardholder data. Any system in "scope" for PCI-DSS is subject to a long, expensive list of controls: network segmentation, quarterly vulnerability scans, penetration testing, strict key-management procedures, and an annual audit. The single most important architectural decision ShopSphere can make is to <strong>never be in scope in the first place</strong>, rather than being in scope and trying to satisfy every control.</p>
+<h3>2.1 Why ShopSphere should never see a raw PAN</h3>
+<p>The Primary Account Number (PAN — the card number itself) is the specific piece of data that puts a system in PCI scope. If ShopSphere's <code>payment-service</code> ever receives, processes, logs, or stores a raw 16-digit card number, then every system that number touches on its way through ShopSphere's infrastructure — the load balancer, the API gateway, application logs, the database, backups of that database, any message queue the number transits — is now in PCI scope too, because scope is defined by everywhere cardholder data flows, not just where it's permanently stored.</p>
+<pre><code>Scope if ShopSphere touches raw PANs directly:
+
+  Browser -> API Gateway -> payment-service -> orders DB
+              (in scope)      (in scope)         (in scope)
+                                   |
+                                   v
+                          application logs, message
+                          queues, backups  (ALL in scope)
+
+Scope if ShopSphere tokenizes via the payment gateway:
+
+  Browser -> Payment Gateway's hosted field / SDK  (gateway is in scope, not ShopSphere)
+                     |
+                     v  (returns an opaque token, never the PAN)
+  ShopSphere's payment-service  -----------------------------> orders DB
+       (handles only the token - OUT of PCI scope for PAN storage)</code></pre>
+<p>The standard, correct pattern is <strong>tokenization at the edge</strong>: the customer's card details are entered directly into a form or SDK hosted by the payment gateway itself (Stripe Elements, a hosted payment page, an SDK that tokenizes client-side before the number ever reaches ShopSphere's servers). The gateway returns ShopSphere an opaque token — a string that means nothing outside that gateway's own vault and cannot be reversed back into a PAN by anyone who doesn't hold the gateway's keys. ShopSphere's <code>Payment</code> table stores that token, never the card number:</p>
+<pre><code>// Payment entity - note there is no cardNumber, cvv, or expiryDate field anywhere.
+// ShopSphere never has these values in memory, in a variable, in a log line, or in a column.
+class Payment {
+    Long id;
+    Long orderId;
+    String provider;              // "stripe", "adyen", ...
+    String providerToken;         // opaque reference, e.g. "pm_1Hh1abC..." - meaningless outside the gateway
+    PaymentStatus status;         // PENDING / CAPTURED / FAILED / REFUNDED
+    String idempotencyKey;        // see payment-systems-idempotency for why this exists
+}
+
+// order-service never sees a card number - it calls payment-service with the token
+// the gateway already issued, and payment-service forwards that token back to the
+// SAME gateway to actually charge it. No raw PAN transits ShopSphere's own network at all.
+paymentService.charge(order.getId(), providerToken, order.getTotalAmount());</code></pre>
+<div class="callout tip">
+<div class="callout-title">Tokenization changes what a ShopSphere breach can expose</div>
+<p>This is the entire point of scope reduction, made concrete: if ShopSphere's database is ever breached, an attacker who dumps the <code>payments</code> table gets a list of opaque, gateway-specific tokens that are worthless without also compromising the payment gateway's own vault — a completely separate, independently-hardened system built for exactly this purpose. If ShopSphere had instead stored raw PANs directly, the exact same breach would hand the attacker usable card numbers outright. Tokenization doesn't just reduce audit paperwork — it changes the actual blast radius of a ShopSphere-side compromise from "catastrophic, cardholder data stolen" to "an outage while tokens are rotated."</p>
+</div>
+<h3>2.2 The four SAQ scope levels, conceptually</h3>
+<p>PCI-DSS defines Self-Assessment Questionnaire (SAQ) types corresponding to how much a merchant's own systems touch cardholder data — the exact letter designations aren't the point here; the shape of the trade-off is:</p>
+<table>
+<tr><th>Approach</th><th>Where the PAN ever exists</th><th>ShopSphere's compliance burden</th></tr>
+<tr><td>Fully outsourced (redirect or hosted iframe/SDK)</td><td>Only inside the gateway's own hosted page/fields — never inside anything ShopSphere serves or runs</td><td>Minimal — a short self-assessment; the bulk of PCI-DSS's technical controls are the gateway's responsibility, not ShopSphere's</td></tr>
+<tr><td>ShopSphere's own frontend embeds the gateway's JS SDK to collect card fields, tokenizes client-side before submission</td><td>Only transiently in the customer's browser, inside the gateway's own embedded field, never sent to ShopSphere's servers</td><td>Still low — ShopSphere's servers never receive a PAN, though the frontend integration must be done correctly (right SDK usage, no accidental logging of form values)</td></tr>
+<tr><td>ShopSphere collects card details in its own form and forwards them to the gateway's API itself</td><td>Transits ShopSphere's own backend before reaching the gateway</td><td>Substantial — ShopSphere's servers now handle raw PANs in transit, pulling significant infrastructure into scope even without persisting anything</td></tr>
+<tr><td>ShopSphere stores raw PANs in its own database</td><td>Persisted inside ShopSphere's own infrastructure</td><td>Maximum — full PCI-DSS Level 1 controls apply: encryption key management, network segmentation, quarterly scans, annual on-site audit</td></tr>
+</table>
+<p>ShopSphere should target the first or second row for essentially every integration — there is almost no legitimate reason for a marketplace like ShopSphere to need the third or fourth. The business capability (charging a customer, refunding an order, retrying a failed payment) is fully achievable using only gateway-issued tokens.</p>
+<h3>2.3 What PCI-DSS still requires even after tokenization</h3>
+<p>Reducing scope doesn't reduce it to zero. Even a token-only ShopSphere still has PCI-relevant obligations, because tokens and transaction metadata still need protecting:</p>
+<ul>
+<li><strong>Never log a token alongside enough context to make it independently useful</strong> — access logs and application logs should treat <code>providerToken</code> with the same care as a credential, not print it in plaintext to a log aggregator with broad read access.</li>
+<li><strong>Use TLS for every hop that could carry payment-related traffic</strong>, including internal service-to-service calls between <code>order-service</code> and <code>payment-service</code> — see section 3.</li>
+<li><strong>Restrict who and what can call <code>payment-service</code>'s charge/refund endpoints</strong> — the same <code>@PreAuthorize("hasRole('ADMIN')")</code>-style ownership and role checks covered in <a href="#/spring-security">Spring Security</a> apply directly to refund endpoints, and are themselves part of satisfying PCI-DSS's access-control requirements, not a separate concern.</li>
+</ul>
+
+<h2>3. Encryption at Rest and in Transit</h2>
+<p>Encryption doesn't prevent unauthorized access by itself — it makes data that <em>is</em> accessed without authorization useless without also having the key. That distinction matters: encrypting a database column doesn't stop a legitimate application query from returning the plaintext value to an authorized caller; it stops someone who steals the raw disk, the backup file, or a database dump from being able to read it without separately compromising key management too.</p>
+<h3>3.1 In transit</h3>
+<p>Every network hop that could carry a <code>Customer</code>'s personal data or any payment-related reference must run over TLS: browser to ShopSphere's API gateway, gateway to <code>order-service</code>, <code>order-service</code> to <code>payment-service</code>, and any Kafka traffic carrying events like <code>PaymentCaptured</code> or <code>OrderPlaced</code> that include a <code>customerId</code> or order total. The common mistake is treating internal service-to-service traffic as implicitly trusted because it "stays inside the cluster" — a network boundary is not an authentication or confidentiality boundary, and an attacker who gains a foothold anywhere inside that internal network can otherwise read every unencrypted internal call in plaintext.</p>
+<h3>3.2 At rest</h3>
+<p>"At rest" covers the database files themselves, backups, and any data warehouse or analytics copy. There are two distinct layers, and conflating them is a common design mistake:</p>
+<table>
+<tr><th>Layer</th><th>What it protects against</th><th>What it does NOT protect against</th></tr>
+<tr><td>Full-disk / storage-level encryption (e.g. encrypted EBS volumes, transparent database encryption)</td><td>Someone who steals the physical disk or an unauthorized raw file copy of the database</td><td>Anyone with legitimate database credentials — the database engine itself decrypts transparently for any authenticated query</td></tr>
+<tr><td>Column-level / application-level encryption (encrypting a specific field, like a stored shipping address, before it's written)</td><td>Anyone with raw database access but without the application's encryption key — including a DBA, a misconfigured read replica, or a leaked backup</td><td>Nothing automatically — the application must explicitly encrypt before write and decrypt after read; queries that need to filter/search on that field can no longer do so directly against the encrypted value</td></tr>
+</table>
+<p>ShopSphere should use storage-level encryption as a baseline everywhere (it's usually a cheap, near-zero-effort platform setting), and add column-level encryption specifically for the highest-sensitivity fields where "even someone with raw DB access shouldn't casually read this in plaintext" matters — a stored shipping address or phone number is a reasonable candidate; a <code>Product.category</code> is not, because encrypting it would only add cost and break the ability to filter the catalog by category with no corresponding security benefit. This is the same reasoning as data minimization in section 1.3: apply protection proportionally to actual sensitivity, not uniformly to everything.</p>
+<div class="callout warn">
+<div class="callout-title">Encryption is not a substitute for tokenization</div>
+<p>A tempting but wrong shortcut: "we'll just encrypt the card number column instead of tokenizing through the gateway." This still puts ShopSphere's own database in PCI scope, because ShopSphere's own application code holds the decryption key and can produce the plaintext PAN on demand — PCI-DSS scope is defined by where cardholder data <em>can be recovered</em>, not just where it's stored in an encoded form. Tokenization (section 2.1) removes the PAN from ShopSphere's systems entirely; encryption merely obscures it while it's still there. They solve different problems and are not interchangeable for PCI purposes.</p>
+</div>
+
+<h2>4. Audit Logging Access, Not Just Changes</h2>
+<p>Most applications log writes — an <code>Order</code> was cancelled, a <code>Payment</code> was refunded — because writes change state and someone will eventually ask "who did this." Compliance regimes go further: PCI-DSS explicitly requires logging <em>access</em> to cardholder data (who viewed it, when, from where), and GDPR's accountability principle expects an organization to be able to answer "who inside the company looked at this specific customer's data, and why" even when nothing was modified at all. A read that was never logged is, from an audit standpoint, indistinguishable from a read that never happened — which is exactly the gap an insider-misuse investigation or a data-subject access request can expose.</p>
+<h3>4.1 What an access-audit record needs</h3>
+<pre><code>-- Distinct from application/business logs: this table exists specifically to answer
+-- "who looked at this customer's sensitive data, and why" after the fact
+CREATE TABLE data_access_audit (
+    id BIGINT PRIMARY KEY,
+    accessed_at TIMESTAMP NOT NULL,
+    actor_id VARCHAR(64) NOT NULL,       -- the Admin/support-agent principal, from the JWT (see spring-security)
+    actor_role VARCHAR(32) NOT NULL,
+    resource_type VARCHAR(32) NOT NULL,  -- 'CUSTOMER', 'ORDER', 'PAYMENT'
+    resource_id BIGINT NOT NULL,
+    action VARCHAR(32) NOT NULL,         -- 'VIEW', 'EXPORT', 'REFUND'
+    justification VARCHAR(255)           -- e.g. linked support-ticket id
+);</code></pre>
+<p>The mechanical way to produce this without scattering manual logging calls through every controller is the same cross-cutting-concern pattern <a href="#/spring-security">Spring Security</a>'s filter chain and method-security AOP already use: an interceptor or aspect wrapped around any endpoint that reads a <code>Customer</code>'s order/payment history writes an audit record automatically, using the already-authenticated principal from <code>SecurityContextHolder</code> — the same object <code>@PreAuthorize</code> expressions read <code>authentication.principal.customerId</code> from — rather than relying on each controller author to remember to log it by hand.</p>
+<pre><code>@Around("@annotation(AuditableAccess)")
+public Object auditDataAccess(ProceedingJoinPoint pjp) throws Throwable {
+    Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+    Object result = pjp.proceed(); // the actual read happens regardless; this only records it
+    auditLogRepository.save(new DataAccessAudit(
+        auth.getName(), extractResourceId(pjp), "VIEW", Instant.now()));
+    return result;
+}
+
+@AuditableAccess
+@PreAuthorize("hasRole('ADMIN')")
+public Order getOrderForSupportTicket(Long orderId) {
+    return orderRepository.findById(orderId); // an Admin viewing a customer's order for support
+}</code></pre>
+<p>Why this matters as its own, separate compliance requirement rather than a nice-to-have: without it, ShopSphere has no way to detect or prove the absence of an Admin browsing a customer's order/payment history out of curiosity rather than for a legitimate support case, and no way to answer a data-subject access request's implicit "who at ShopSphere has looked at my data" question. The audit log is also, deliberately, a target for stricter access control itself — it should not be writable or deletable by the same Admin accounts whose access it's recording, or it stops being trustworthy as evidence.</p>
+<div class="callout">
+<div class="callout-title">Audit logging pairs directly with the observability pipeline, but is not the same thing</div>
+<p>General application logs and metrics (covered in <a href="#/observability-production">Observability in Production</a>) exist to answer "is the system healthy, and why did this request fail" — they're operational, typically short-retention, and often deliberately exclude PII to reduce exposure (section 1.3). A compliance access-audit log exists to answer a different question — "who accessed this specific person's data, and was that appropriate" — and by design needs to retain exactly the actor/resource linkage that operational logs try to avoid. Routing both through the same pipeline is fine mechanically, but they need different retention policies, different access controls on the log data itself, and different consumers (an SRE dashboard vs. a compliance officer's report).</p>
+</div>
+
+<h2>5. Putting It Together: A ShopSphere Data-Handling Decision Table</h2>
+<table>
+<tr><th>Decision point</th><th>Wrong instinct</th><th>Compliant ShopSphere pattern</th></tr>
+<tr><td>Customer requests account deletion</td><td><code>DELETE FROM customers WHERE id = ?</code></td><td>Anonymize the <code>Customer</code> row and any denormalized copies; retain <code>Order</code>/<code>Payment</code> rows for legally-required financial retention (section 1.2)</td></tr>
+<tr><td>Collecting checkout data</td><td>Store full DOB, store raw card number, log entire request bodies</td><td>Store only what the specific feature needs; tokenize card data via the gateway; exclude PII from debug logs (sections 1.3, 2.1)</td></tr>
+<tr><td>Charging a customer's card</td><td>ShopSphere's backend receives and forwards the raw PAN to the gateway itself</td><td>Client-side tokenization via the gateway's SDK/hosted fields; ShopSphere only ever handles the resulting token (section 2.1)</td></tr>
+<tr><td>Storing a shipping address</td><td>Plaintext column, relying only on disk-level encryption</td><td>Disk-level encryption as baseline, plus application-level encryption for the address field specifically, given its sensitivity (section 3.2)</td></tr>
+<tr><td>An Admin views a customer's order history for a support case</td><td>No record that the view ever happened</td><td>An access-audit interceptor logs actor, resource, action, and justification independent of whether anything was modified (section 4)</td></tr>
+<tr><td>Sending marketing emails</td><td>Assume placing an order implies consent to marketing</td><td>Separate, purpose-specific, revocable consent record distinct from the transactional relationship (section 1.4)</td></tr>
+</table>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why can't ShopSphere satisfy GDPR's right to erasure with a plain DELETE on the Customer row, and what does anonymization actually preserve versus remove?</summary>
+<div class="qa-body">A plain DELETE either fails outright because Order.customerId is a foreign key referencing the Customer row, or — if cascading deletes are configured — succeeds by also destroying every Order, OrderItem, and Payment record tied to that customer, which conflicts with ShopSphere's separate legal obligation to retain financial and transaction records for a statutory period. GDPR itself anticipates this: Article 17(3) allows refusing erasure of data still needed for compliance with another legal obligation, which financial retention is. The correct approach is anonymization: keep the Order/Payment rows exactly as they are (id, totalAmount, status, items — none of which is personal data about the customer once identifying fields are gone), but irreversibly overwrite every field on the Customer row, and any denormalized copies of customer fields stored directly on historical Order rows, with non-identifying placeholder values, and mark the account as erased so application code stops treating it as a normal active customer. This satisfies both obligations simultaneously: the person can no longer be identified from the data, but the financial record their transaction contributed to still exists intact.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What specifically does tokenizing card payments through a gateway achieve that encrypting a stored card number column does not?</summary>
+<div class="qa-body">PCI-DSS scope is defined by everywhere cardholder data can be recovered in usable form, not merely everywhere it's stored in some encoded shape. If ShopSphere encrypts a card number column itself, ShopSphere's own application code necessarily holds the decryption key and can produce the plaintext PAN on demand — which means ShopSphere's database, backups, and every service with access to that key are still in full PCI scope, because the data is recoverable there. Tokenization is structurally different: the actual card number never reaches ShopSphere's systems at all — it's captured directly by the payment gateway's own hosted field or SDK, and ShopSphere receives back an opaque token that is meaningless outside that gateway's own vault. ShopSphere's database can be fully breached and an attacker gets only tokens that require also compromising the gateway's independently-secured infrastructure to turn into anything usable. Encryption protects data that's still present; tokenization removes the sensitive data from your systems in the first place, which is why it, not encryption, is what actually reduces PCI-DSS audit scope.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does data minimization matter as an engineering practice, independent of the legal requirement to follow it?</summary>
+<div class="qa-body">Every field of personal data ShopSphere collects becomes a liability that persists for as long as the data exists: it's a field that must be included in any erasure/anonymization logic, a field that must be protected by encryption and access control, a field that appears in backups and potentially in debug logs, and a field that, if breached, is one more piece of information an attacker gains about a real person. Collecting only what a specific feature actually needs — an age-restriction boolean instead of a full date of birth, a bounded-retention abandoned-cart record instead of an indefinite one — directly shrinks all of those surfaces simultaneously. This is why minimization isn't just a checkbox for an audit; it's a design discipline that reduces the size and complexity of every other compliance mechanism (erasure, encryption, audit logging) that has to be built and maintained around whatever data actually exists in the system.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does GDPR treat "consent to place an order" and "consent to receive marketing emails" as two entirely separate things, and what's the practical schema consequence?</summary>
+<div class="qa-body">GDPR recognizes several distinct legal bases for processing personal data, and "necessary for performance of a contract" already covers everything required to actually fulfill an order the customer chose to place — charging their payment method for that order, sending them a shipping confirmation for that specific order — without needing a separate opt-in, because the customer's own action of placing the order already implies that processing. Marketing communications and other uses that go beyond fulfilling the specific transaction the customer initiated are not covered by that same basis, and require their own affirmative, revocable, purpose-specific consent that must be provable after the fact — including which version of the privacy policy was in effect and exactly when it was granted or withdrawn. The schema consequence is that consent cannot live as a single mutable boolean on the Customer row, because overwriting it in place destroys the history needed to prove what was agreed to and when; it needs its own append-only record per purpose, so that later disputes or audits can be answered from history rather than from whatever the flag happens to say right now.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is logging who read a customer's order/payment history considered a compliance requirement in its own right, separate from logging who modified it?</summary>
+<div class="qa-body">Write logging exists because state changes need an accountable trail — someone will eventually ask who cancelled an order or issued a refund, and that's answerable from ordinary application audit trails most systems already have. Read access has no natural trail at all by default: a SELECT query leaves no row-level evidence that it ever happened, unless something explicitly records it. PCI-DSS explicitly requires logging access to cardholder data specifically because the risk it's defending against is misuse by someone who already has legitimate credentials — an insider browsing payment data out of curiosity rather than for a job-related reason is not a bug or an unauthorized breach in the technical sense, it's a policy violation that's invisible without an access log. GDPR's accountability principle creates a parallel obligation: being able to answer "who at this company has looked at my data" is itself part of demonstrating compliance, independent of whether anything was ever modified. Without an access-audit mechanism, a read that violated policy and a read that never happened are indistinguishable after the fact, which means there's no way to detect, investigate, or prove the absence of exactly the kind of misuse these regulations are trying to prevent.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What's the difference between storage-level (disk) encryption and application-level (column) encryption, and when does ShopSphere need both rather than just one?</summary>
+<div class="qa-body">Storage-level encryption operates below the database engine — it protects the raw bytes on disk, so anyone who steals a physical drive, an unauthorized raw file copy, or an unencrypted backup snapshot gets ciphertext, but the database engine itself decrypts transparently for any authenticated query, meaning anyone with legitimate database credentials sees plaintext exactly as if encryption weren't there. Application-level encryption operates above the database — the application encrypts a specific field before writing it and decrypts after reading it, using a key the database itself never holds, so even someone with full, legitimate SQL access to the raw table sees ciphertext for that column unless they also have the application's encryption key. ShopSphere needs storage-level encryption as a cheap baseline everywhere, since it defends against a real and common threat (stolen disks, leaked backups) at near-zero engineering cost. It additionally needs application-level encryption specifically on the small set of fields where "even a DBA or a compromised read-replica shouldn't casually see this in plaintext" is worth the cost of losing the ability to query/filter directly on that field — a stored shipping address is a reasonable candidate, whereas encrypting something like Product.category would add real cost (breaking catalog filtering) for no corresponding security benefit, since category isn't personal data at all.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Concretely, what would go wrong if ShopSphere's own frontend collected raw card numbers in its own HTML form and POSTed them to ShopSphere's backend, which then forwarded them to the payment gateway's API?</summary>
+<div class="qa-body">The moment a raw PAN transits ShopSphere's own backend, every system that request passes through becomes part of PCI-DSS's defined scope: the load balancer and API gateway terminating that request, the application server process handling it, any logging middleware that might capture request bodies, any message queue the payment flow happens to touch, and the network segments all of those run on. This is true even if ShopSphere never persists the card number to a database at all — scope is defined by where cardholder data flows, not just where it's stored at rest. Practically, this means ShopSphere would need to pass a full PCI-DSS audit covering all of that infrastructure: network segmentation between payment-handling systems and everything else, strict logging controls to guarantee the PAN never lands in a log file, quarterly vulnerability scans, and an annual assessment — a large, ongoing operational burden. The fix is to never let the PAN reach ShopSphere's servers in the first place: the gateway's own hosted field or client-side SDK captures the card details directly in the customer's browser and returns ShopSphere only an opaque token, so ShopSphere's backend never receives, transmits, or could even accidentally log the actual card number.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/security-hardening-owasp'"><div class="rc-title">Security Hardening: Input Validation, Secrets Management &amp; OWASP Top 10</div><div class="rc-sub">Encryption keys, gateway credentials, and audit-log integrity are exactly the secrets and trust boundaries hardening practices protect</div></div>
+<div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'"><div class="rc-title">Payment Systems &amp; Idempotent Transactions</div><div class="rc-sub">The same Payment/token model that keeps ShopSphere out of PCI scope also needs idempotency keys to avoid duplicate charges/refunds</div></div>
+<div class="related-card" onclick="window.location.hash='/observability-production'"><div class="rc-title">Observability in Production</div><div class="rc-sub">Operational logging and compliance access-audit logging share a pipeline but serve different purposes, retention, and audiences</div></div>
+<div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">Anonymization-over-deletion and foreign-key-aware erasure are schema design decisions, not bolt-on afterthoughts</div></div>
+<div class="related-card" onclick="window.location.hash='/spring-security'"><div class="rc-title">Spring Security: OAuth2, OIDC, JWT, RBAC</div><div class="rc-sub">The same authenticated-principal and role-check mechanics gate refund endpoints and drive who gets audit-logged accessing customer data</div></div>
+</div>

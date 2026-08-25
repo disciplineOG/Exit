@@ -16,7 +16,46 @@
 </div>
 
 <h2>1. Thread Lifecycle</h2>
-<p>A <code>java.lang.Thread</code> moves through a small state machine, exposed directly via <code>Thread.getState()</code> as the enum <code>Thread.State</code>. Understanding the exact transitions matters because tools like thread dumps, profilers, and deadlock detectors report exactly these states, and misreading them leads to wrong diagnoses (e.g., confusing "waiting on a lock" with "waiting on a condition").</p>
+<p>A <code>java.lang.Thread</code> moves through a small state machine, exposed directly via <code>Thread.getState()</code> as the enum <code>Thread.State</code>. Understanding the exact transitions matters because tools like thread dumps, profilers, and deadlock detectors report exactly these states, and misreading them leads to wrong diagnoses (e.g., confusing "waiting on a lock" with "waiting on a condition"). Picture a pool of checkout-worker threads in ShopSphere's order-service during a flash sale — at any instant, some are NEW (just created for a burst), most are RUNNABLE (either actually executing on a core or sitting in the OS run queue waiting their turn), some are BLOCKED (queued behind a <code>synchronized</code> block that decrements shared inventory counters), some are WAITING/TIMED_WAITING (parked on a queue with no work to pull), and finished ones are TERMINATED.</p>
+<pre><code>                 new Thread(() -> reserveInventory(orderId))
+                              |
+                              v
+                        +-----------+
+                        |    NEW    |   object created, start() not yet called
+                        +-----------+
+                              |
+                          start()
+                              v
+                     +-----------------+
+              +----->|    RUNNABLE     |<-------------------------+
+              |      | (running, or    |                          |
+              |      |  ready & queued |                          |
+              |      |  for a core)    |                          |
+              |      +-----------------+                          |
+              |         |    |     |                              |
+              |   enters|    |     |calls sleep()/wait(ms)/        |
+              |  synchronized|     |join(ms)/parkNanos()           |
+              |  block held  |     v                               |
+              |  by another  |  +------------------+   timeout    |
+              |  thread      |  |  TIMED_WAITING    |----elapses---+
+              |     |        |  +------------------+
+              |     v        |         ^
+              |  +---------+ |         | wait(ms)/sleep(ms) again
+              |  | BLOCKED | |         |
+              |  +---------+ |  calls wait()/join()/park() (no timeout)
+              |     |        |         |
+              | lock acquired|         v
+              |     |        |  +------------------+  notify()/notifyAll()/
+              +-----+        +->|     WAITING       |  unpark()/joined thread
+                                +------------------+  finishes ---+
+                                         |                        |
+                                         +------------------------+
+                                                  |
+                                     run() returns or throws
+                                                  v
+                                          +--------------+
+                                          | TERMINATED   |   terminal - no restart
+                                          +--------------+</code></pre>
 <table>
 <tr><th>State</th><th>Meaning</th><th>How you enter it</th><th>How you leave it</th></tr>
 <tr><td>NEW</td><td>Thread object created, not yet started</td><td><code>new Thread(...)</code></td><td><code>start()</code> is called → RUNNABLE</td></tr>
@@ -65,31 +104,47 @@
 <h3>Locking escalation (historical JVM internals)</h3>
 <p>HotSpot historically optimized intrinsic locks through three tiers, escalating only under contention, because most locks in real programs are never actually contended:</p>
 <ul>
-<li><strong>Biased locking:</strong> if a lock is only ever acquired by one thread, the JVM "biases" the object's mark word toward that thread so re-acquisition is just a cheap check, no CAS. Biased locking was disabled by default and then removed in JDK 15+ (JEP 374) because modern JIT escape analysis and lock elision made it deliver little benefit while adding complexity to the safepoint machinery needed to revoke a bias.</li>
-<li><strong>Lightweight (thin) locking:</strong> under light, non-overlapping contention, acquisition is done via a compare-and-swap on the object header — no OS-level mutex, no thread suspension.</li>
+<li><strong>Biased locking:</strong> if a lock is only ever acquired by one thread, the JVM "biases" the <em>mark word</em> — a header field embedded in every object that stores its lock state, identity hash code, and GC age bits — toward that thread so re-acquisition is just a cheap check, with no compare-and-swap (CAS) needed. Biased locking was disabled by default and then removed in JDK 15+ (JEP 374) because modern JIT escape analysis and lock elision made it deliver little benefit while adding complexity to the safepoint machinery — the mechanism the JVM uses to briefly stop every thread at a consistent point so it can safely inspect or modify shared state like the bias owner — needed to revoke a bias.</li>
+<li><strong>Lightweight (thin) locking:</strong> under light, non-overlapping contention, acquisition is done via a compare-and-swap (CAS) — an atomic CPU instruction meaning "write this new value into that memory location only if it still holds the value I last read; otherwise fail and let the caller retry" — on the object header, with no OS-level mutex and no thread suspension.</li>
 <li><strong>Heavyweight locking:</strong> under real contention (a thread finds the lock already CAS'd by another), the lock "inflates" to an OS-level monitor, and losing threads are actually suspended by the OS scheduler and placed on a wait queue, which is far more expensive (a syscall, a context switch) than the CAS path.</li>
 </ul>
 <p>The practical takeaway is not the tier names but the shape of the cost curve: uncontended synchronized is nearly free on modern JVMs; contended synchronized gets expensive fast because of OS-level suspension/wakeup, which is exactly the cost profile that motivates minimizing critical-section size and, later, motivates virtual threads' different scheduling model.</p>
 
 <h2>4. volatile — Visibility Without Atomicity</h2>
-<p>A <code>volatile</code> field gives you the happens-before guarantee from the table above (every read sees the latest write) and prevents the compiler/CPU from reordering accesses to it relative to surrounding code (it acts as a memory barrier). What it does <strong>not</strong> give you is atomicity for compound operations. <code>counter++</code> on a volatile <code>int</code> is read-modify-write — three separate steps — and two threads can each read the same value before either writes back, losing an increment. Visibility of the latest value doesn't help if the very act of computing the next value isn't atomic.</p>
+<p>A <code>volatile</code> field gives you the happens-before guarantee from the table above (every read sees the latest write) and prevents the compiler/CPU from reordering accesses to it relative to surrounding code (it acts as a memory barrier). What it does <strong>not</strong> give you is atomicity for compound operations. <code>counter++</code> on a volatile <code>int</code> is read-modify-write — three separate steps — and two threads can each read the same value before either writes back, losing an increment.</p>
+<div class="callout warn">
+<div class="callout-title">The flash-sale inventory bug: volatile alone does not make a decrement safe</div>
+<p>Suppose ShopSphere caches a hot product's available stock in a field to avoid a database round trip on every checkout attempt during a flash sale:</p>
+<pre><code>class InventoryCache {
+    private volatile int availableQty; // visibility guaranteed, atomicity is NOT
+
+    boolean tryReserve() {
+        if (availableQty > 0) {   // read
+            availableQty--;       // read-modify-write: NOT atomic
+            return true;
+        }
+        return false;
+    }
+}</code></pre>
+<p>Every thread always sees the <em>latest</em> value of <code>availableQty</code> thanks to volatile's happens-before edge — but "latest value visible" says nothing about the gap between reading it and writing the decremented value back. Two checkout threads can both read <code>availableQty == 1</code>, both pass the <code>&gt; 0</code> check, both decrement, and both report success — ShopSphere just oversold a unit of stock it didn't have. The fix is not a "more volatile" field; it's an atomic compound operation, either <code>AtomicInteger.decrementAndGet()</code> guarded by a check, or a CAS loop via <code>AtomicInteger.updateAndGet(q -> q > 0 ? q - 1 : q)</code>, or simply doing the check-and-decrement inside a <code>synchronized</code> block. Visibility of the latest value doesn't help if the very act of computing the next value isn't atomic.</p>
+</div>
 <div class="callout warn">
 <div class="callout-title">The double-checked-locking bug without volatile</div>
-<p>The classic broken singleton:</p>
-<pre><code>class Singleton {
-    private static Singleton instance;
-    static Singleton getInstance() {
-        if (instance == null) {                 // 1st check, no lock
-            synchronized (Singleton.class) {
-                if (instance == null) {          // 2nd check, locked
-                    instance = new Singleton();  // BUG if field isn't volatile
+<p>The classic broken singleton — here, a per-JVM cache of category metadata that every request path in ShopSphere's catalog-service reads:</p>
+<pre><code>class CategoryMetadataCache {
+    private static CategoryMetadataCache instance;
+    static CategoryMetadataCache getInstance() {
+        if (instance == null) {                          // 1st check, no lock
+            synchronized (CategoryMetadataCache.class) {
+                if (instance == null) {                   // 2nd check, locked
+                    instance = new CategoryMetadataCache(); // BUG if field isn't volatile
                 }
             }
         }
         return instance;
     }
 }</code></pre>
-<p>The bug: <code>new Singleton()</code> is not one atomic step. It decomposes into (a) allocate memory, (b) run the constructor to initialize fields, (c) assign the reference into <code>instance</code>. Without <code>volatile</code>, the JIT/CPU may reorder (b) and (c) — a second thread reading <code>instance</code> outside the lock (the first, unlocked check) can observe a non-null reference whose constructor hasn't finished running, and dereference a half-initialized object. Declaring the field <code>private static volatile Singleton instance;</code> forbids that reordering and publishes the fully-constructed object safely. This is precisely why the JMM's rules about reordering aren't academic — this bug produced real, hard-to-reproduce <code>NullPointerException</code>s and corrupted state in JVMs before JSR-133 (Java 5) even for developers who used volatile, because the pre-2004 memory model didn't guarantee this case was fixed by volatile at all.</p>
+<p>The bug: <code>new CategoryMetadataCache()</code> is not one atomic step. It decomposes into (a) allocate memory, (b) run the constructor to initialize fields, (c) assign the reference into <code>instance</code>. Without <code>volatile</code>, the JIT/CPU may reorder (b) and (c) — a second thread reading <code>instance</code> outside the lock (the first, unlocked check) can observe a non-null reference whose constructor hasn't finished running, and dereference a half-initialized object. Declaring the field <code>private static volatile CategoryMetadataCache instance;</code> forbids that reordering and publishes the fully-constructed object safely. This is precisely why the JMM's rules about reordering aren't academic — this bug produced real, hard-to-reproduce <code>NullPointerException</code>s and corrupted state in JVMs before JSR-133 (Java 5) even for developers who used volatile, because the pre-2004 memory model didn't guarantee this case was fixed by volatile at all.</p>
 </div>
 
 <h2>5. Explicit Locks and ReadWriteLock</h2>
@@ -102,10 +157,54 @@
 <tr><td>Multiple wait-sets per lock</td><td>No — one implicit condition per monitor</td><td><code>newCondition()</code> — separate <code>await()</code>/<code>signal()</code> queues for distinct wait conditions</td></tr>
 <tr><td>Must release in <code>finally</code></td><td>Automatic on block exit</td><td>Manual — forgetting <code>finally { lock.unlock(); }</code> leaks the lock permanently</td></tr>
 </table>
-<p><code>ReadWriteLock</code> (typically <code>ReentrantReadWriteLock</code>) splits a lock into a shared read lock and an exclusive write lock: any number of readers can hold the read lock concurrently as long as no writer holds the write lock, and a writer excludes all readers and other writers. This is a meaningful win specifically for read-heavy, write-rare workloads (a cache, a configuration snapshot) — under `synchronized`, every read serializes behind every other read even though reads don't conflict with each other; under a read-write lock, only reads-vs-writes and writes-vs-writes serialize.</p>
+<p><code>ReadWriteLock</code> (typically <code>ReentrantReadWriteLock</code>) splits a lock into a shared read lock and an exclusive write lock: any number of readers can hold the read lock concurrently as long as no writer holds the write lock, and a writer excludes all readers and other writers. This is a meaningful win specifically for read-heavy, write-rare workloads (a cache, a configuration snapshot) — under <code>synchronized</code>, every read serializes behind every other read even though reads don't conflict with each other; under a read-write lock, only reads-vs-writes and writes-vs-writes serialize.</p>
+<div class="callout">
+<div class="callout-title">Cart mutation: why a plain field on Cart isn't automatically thread-safe</div>
+<p>A customer's <code>Cart</code> normally sees single-threaded access from one browser tab, but ShopSphere still has to guard against real concurrent mutation: a "add to cart" click racing a background price-refresh job that re-validates cart contents, or a customer with two open tabs both clicking "add" on different products at once. If <code>Cart</code> just wraps a plain <code>ArrayList&lt;CartItem&gt;</code>, two threads calling <code>cart.getItems().add(...)</code> concurrently can corrupt the backing array — <code>ArrayList</code> gives no thread-safety guarantee at all, and a lost update or an <code>ArrayIndexOutOfBoundsException</code> from a torn resize is a realistic outcome, not a theoretical one. The fix is to make the mutation path explicit and locked rather than hoping the collection protects itself:</p>
+<pre><code>class Cart {
+    private final List&lt;CartItem&gt; items = new ArrayList&lt;&gt;();
+    private final ReentrantLock lock = new ReentrantLock();
+
+    void addItem(CartItem item) {
+        lock.lock();
+        try {
+            Optional&lt;CartItem&gt; existing = items.stream()
+                .filter(i -&gt; i.getProductId().equals(item.getProductId()))
+                .findFirst();
+            if (existing.isPresent()) {
+                existing.get().incrementQuantity(item.getQuantity());
+            } else {
+                items.add(item);
+            }
+        } finally {
+            lock.unlock(); // must be in finally - see section 5's table above
+        }
+    }
+}</code></pre>
+<p>A <code>ReentrantLock</code> (or an equivalent <code>synchronized</code> block) around the whole read-check-then-mutate sequence is required precisely because "check if the product is already in the cart, then either bump its quantity or append" is a compound operation with the exact same race shape as the classic check-then-act race in section 8 — without a lock spanning the entire sequence, two concurrent <code>addItem</code> calls for the same new product can both miss each other's in-flight insert and append two separate <code>CartItem</code>s instead of one with quantity 2.</p>
+</div>
 
 <h2>6. The Executors Framework</h2>
 <p>Manually managing <code>Thread</code> objects doesn't scale: thread creation is expensive (each platform thread reserves a stack, typically 512KB–1MB, and maps to an OS thread), so unbounded thread creation under load exhausts memory and OS scheduling capacity long before it exhausts CPU. The executor framework decouples "submitting a task" from "how and when it runs" via <code>ExecutorService</code>.</p>
+<h3>The interface/class shape</h3>
+<pre><code>Executor                                  (single method: execute(Runnable))
+  └── ExecutorService                     (+ submit, invokeAll, shutdown, Future-returning tasks)
+        ├── ScheduledExecutorService      (+ schedule, scheduleAtFixedRate, scheduleWithFixedDelay)
+        └── ThreadPoolExecutor            (the concrete, configurable pool implementation)
+              ├── ScheduledThreadPoolExecutor
+              └── ForkJoinPool            (work-stealing pool; backs parallel streams
+                                            and, by default, the virtual-thread carrier pool)
+
+Factories in java.util.concurrent.Executors wrap a ThreadPoolExecutor with preset
+core/max size + queue type - each factory below is really just a specific
+ThreadPoolExecutor constructor call:
+
+  newFixedThreadPool(n)        -> ThreadPoolExecutor(n, n, ..., LinkedBlockingQueue)   // unbounded queue
+  newCachedThreadPool()        -> ThreadPoolExecutor(0, MAX, 60s, SynchronousQueue)    // unbounded threads
+  newSingleThreadExecutor()    -> ThreadPoolExecutor(1, 1, ..., LinkedBlockingQueue)   // + wrapper, no resize
+  newScheduledThreadPool(n)    -> ScheduledThreadPoolExecutor(n)
+  newVirtualThreadPerTaskExecutor() -> creates one new virtual thread per submitted task (Java 21+)</code></pre>
+<p>Every factory in the left column boils down to the same underlying <code>ThreadPoolExecutor</code> with different constructor arguments — there is exactly one real pool implementation to understand, and the factories are just named presets over it, which is why the table below expresses each factory in terms of the same three knobs: core/max thread count, queue type, and keep-alive.</p>
 <table>
 <tr><th>Factory</th><th>Backing pool</th><th>Behavior</th></tr>
 <tr><td><code>newFixedThreadPool(n)</code></td><td>Fixed core/max size <code>n</code></td><td>Unbounded <code>LinkedBlockingQueue</code> by default — tasks queue indefinitely if all <code>n</code> threads are busy</td></tr>
@@ -115,7 +214,7 @@
 </table>
 <div class="callout warn">
 <div class="callout-title">Fixed pool + unbounded queue is a slow-motion outage</div>
-<p><code>Executors.newFixedThreadPool(n)</code> uses an unbounded <code>LinkedBlockingQueue</code>. If the arrival rate of tasks exceeds the rate the <code>n</code> threads can drain them — even briefly, during a downstream slowdown — tasks queue up rather than being rejected. The pool never grows beyond <code>n</code> threads (there's no backpressure signal), memory grows unbounded holding queued task objects and whatever they closed over, and latency for queued tasks grows without limit even after the surge passes, because the queue has to drain in FIFO order. The fix is to construct the pool manually with <code>ThreadPoolExecutor</code>, use a <em>bounded</em> queue (e.g., <code>ArrayBlockingQueue</code>), and supply a <code>RejectedExecutionHandler</code> (such as <code>CallerRunsPolicy</code> to apply backpressure onto the submitting thread, or a custom handler that fails fast) so that overload becomes a visible, bounded failure instead of an invisible, unbounded memory and latency leak. This composes directly with <a href="#/resilience-fault-tolerance">bulkheading</a> — sizing and isolating pools per dependency is exactly how you stop one slow downstream call from exhausting a shared thread pool.</p>
+<p><code>Executors.newFixedThreadPool(n)</code> uses an unbounded <code>LinkedBlockingQueue</code>. Picture order-service sizing a fixed pool of <code>n</code> worker threads to call payment-service during checkout. If the arrival rate of checkout requests exceeds the rate the <code>n</code> threads can drain them — even briefly, because payment-service is running slow during a flash sale — requests queue up rather than being rejected. The pool never grows beyond <code>n</code> threads (there's no backpressure signal), memory grows unbounded holding queued task objects (each one closing over an <code>Order</code> and its <code>Payment</code> request), and latency for queued checkouts grows without limit even after the surge passes, because the queue has to drain in FIFO order — customers who clicked "pay" ten minutes ago are still waiting behind everyone who clicked more recently. The fix is to construct the pool manually with <code>ThreadPoolExecutor</code>, use a <em>bounded</em> queue (e.g., <code>ArrayBlockingQueue</code>), and supply a <code>RejectedExecutionHandler</code> (such as <code>CallerRunsPolicy</code> to apply backpressure onto the submitting thread, or a custom handler that fails fast and returns "checkout temporarily unavailable" instead of an invisible, unbounded memory and latency leak). This composes directly with <a href="#/resilience-fault-tolerance">bulkheading</a> — sizing and isolating pools per dependency is exactly how you stop payment-service's slowness from exhausting order-service's shared thread pool and taking down browsing and cart operations too.</p>
 </div>
 
 <h2>7. CompletableFuture — Composable Asynchronous Pipelines</h2>
@@ -132,7 +231,7 @@
 
 <h2>8. Classic Concurrency Hazards</h2>
 <h3>Race condition</h3>
-<p>Any situation where the correctness of a result depends on the relative timing of threads. Example: two threads both execute <code>if (map.get(key) == null) map.put(key, compute());</code> — both can see <code>null</code>, both compute, and one overwrites the other's work (or worse, two different instances end up live if the value is stateful). Fix: use an atomic check-and-set primitive — <code>ConcurrentHashMap.computeIfAbsent(key, k -> compute())</code> — which performs the check and insert atomically under the map's internal per-bucket locking, rather than composing two separate calls in application code.</p>
+<p>Any situation where the correctness of a result depends on the relative timing of threads. Example: two checkout threads both execute <code>if (inventoryCache.get(productId) == null) inventoryCache.put(productId, loadFromDb(productId));</code> — both can see <code>null</code> for a hot productId during a flash sale, both hit the database, and one overwrites the other's freshly-loaded value (or worse, two different <code>Inventory</code> objects end up referenced from different places if callers cached the return value separately). Fix: use an atomic check-and-set primitive — <code>ConcurrentHashMap.computeIfAbsent(productId, id -> loadFromDb(id))</code> — which performs the check and insert atomically under the map's internal per-bucket locking (see <a href="#/collections-internals">ConcurrentHashMap internals</a>), rather than composing two separate calls in application code.</p>
 <h3>Deadlock and the Coffman conditions</h3>
 <p>Deadlock requires all four of these simultaneously; breaking any one prevents it:</p>
 <ol>
@@ -141,15 +240,16 @@
 <li><strong>No preemption:</strong> a held resource can't be forcibly taken away; it's only released voluntarily.</li>
 <li><strong>Circular wait:</strong> a cycle of threads exists, each waiting for a resource held by the next.</li>
 </ol>
-<pre><code>// Thread A                          // Thread B
-synchronized (accountA) {            synchronized (accountB) {
-    synchronized (accountB) {            synchronized (accountA) {
-        transfer(accountA, accountB);        transfer(accountB, accountA);
-    }                                     }
-}                                     }
-// A holds accountA, waits for accountB.
-// B holds accountB, waits for accountA. Circular wait -> deadlock.</code></pre>
-<p>The standard prevention technique is <strong>lock ordering</strong>: define a total order over lock acquisition (e.g., always lock the account with the smaller <code>accountId</code> first, regardless of which side of the transfer it's on) so that circular wait becomes structurally impossible — every thread acquires locks in the same global sequence, so no cycle can form. <code>tryLock</code> with a timeout is a complementary defense: if a thread can't acquire a second lock within a bound, it releases what it holds and retries, which breaks "no preemption" at the cost of needing retry logic.</p>
+<pre><code>// Thread A: refund an Order, reversing stock back into a warehouse's Inventory
+// Thread B: reserve stock from the same warehouse's Inventory for a new Order
+synchronized (inventoryWarehouseA) {       synchronized (orderBeingCancelled) {
+    synchronized (orderBeingCancelled) {       synchronized (inventoryWarehouseA) {
+        restock(inventoryWarehouseA, orderBeingCancelled);  reserve(inventoryWarehouseA, orderBeingCancelled);
+    }                                       }
+}                                           }
+// A holds inventoryWarehouseA, waits for orderBeingCancelled.
+// B holds orderBeingCancelled, waits for inventoryWarehouseA. Circular wait -> deadlock.</code></pre>
+<p>The standard prevention technique is <strong>lock ordering</strong>: define a total order over lock acquisition (e.g., always lock the entity with the smaller id first — <code>warehouseId</code> before <code>orderId</code>, regardless of which code path is doing the locking) so that circular wait becomes structurally impossible — every thread acquires locks in the same global sequence, so no cycle can form. <code>tryLock</code> with a timeout is a complementary defense: if a thread can't acquire a second lock within a bound, it releases what it holds and retries, which breaks "no preemption" at the cost of needing retry logic.</p>
 <h3>Livelock</h3>
 <p>Threads are not blocked — they're actively running — but they keep changing state in response to each other without making progress. Classic analogy: two people in a hallway both stepping aside in the same direction repeatedly. In code, this happens when a deadlock-avoidance retry policy is too symmetric: both threads detect potential contention, both back off, both retry at the same moment, indefinitely. Fix: introduce randomized backoff (jitter) so retries desynchronize.</p>
 <h3>Starvation</h3>
@@ -171,21 +271,27 @@ synchronized (accountA) {            synchronized (accountB) {
 <tr><td>CPU-bound (parsing, hashing, in-memory computation, ML inference)</td><td>No benefit</td><td>There's no idle waiting to eliminate — you're still bounded by the number of physical cores; virtual threads add scheduling overhead for zero gain</td></tr>
 <tr><td>Code with <code>synchronized</code> blocks around blocking calls</td><td>Can be actively worse</td><td>See pinning below</td></tr>
 </table>
+<div class="callout tip">
+<div class="callout-title">ShopSphere flash sale: platform threads vs. virtual threads under checkout load</div>
+<p>A flash sale spikes checkout traffic to, say, 50,000 concurrent in-flight requests, each handling a customer's checkout by calling inventory-service to reserve stock, then payment-service to capture payment, then writing the confirmed <code>Order</code> — each call spends most of its time waiting on network I/O, not computing anything. On a thread-per-request model with platform threads, a service can realistically field only a few thousand of these concurrently before OS thread limits and stack memory dominate; the rest queue behind a fixed-size pool exactly as described in the fixed-pool warning above, and checkout latency climbs even though every individual downstream call is fast. Rewriting the same handler to run on virtual threads (e.g., via <code>Executors.newVirtualThreadPerTaskExecutor()</code> or a servlet container configured to dispatch each request onto a virtual thread) changes nothing about the code — it's still the same synchronous, blocking-looking calls to inventory-service and payment-service — but each in-flight checkout now costs a parked heap object while waiting on I/O instead of a fully-reserved OS thread, so tens of thousands of concurrent checkouts can be in flight against a small, fixed pool of carrier threads that stays busy doing the CPU work (serialization, validation, computing the order total) that actually needs a core. The database connection pool or payment-service's own capacity, not the web tier's thread count, becomes the real bottleneck — which is usually the more honest bottleneck to be hitting.</p>
+</div>
 <h3>Carrier pinning — the trap</h3>
 <p>If a virtual thread blocks <em>while holding a monitor acquired via <code>synchronized</code></em> (not <code>ReentrantLock</code>), the JVM cannot safely unmount it — the continuation-capture mechanism doesn't (pre-JDK 24) know how to suspend a thread mid-monitor-hold and resume it possibly on a different OS thread while preserving native monitor semantics. The virtual thread stays <strong>pinned</strong> to its carrier for the duration of the blocking call. If enough virtual threads pin their carriers simultaneously (e.g., a hot code path wraps a JDBC call in a legacy <code>synchronized</code> method), you can exhaust the small, fixed carrier pool and effectively serialize everything behind it — which is worse than not adopting virtual threads at all, because the failure mode looks like a mysterious throughput cliff rather than an obvious thread-pool-exhaustion error. The practical fix is replacing <code>synchronized</code> around any blocking operation with <code>ReentrantLock</code>, which is compose-friendly with virtual thread unmounting. You can detect pinning with <code>-Djdk.tracePinnedThreads=full</code>, which logs a stack trace every time a virtual thread pins its carrier.</p>
 <h3>Structured concurrency</h3>
 <p>Plain <code>ExecutorService.submit</code> calls for a group of related subtasks have no structural relationship — if one fails, the others keep running unless you write explicit cancellation plumbing, and error handling means manually collecting exceptions from each future. Structured concurrency (incubating via <code>StructuredTaskScope</code>) treats a set of forked subtasks as a single unit of work with a defined lifetime: they're forked within a scope, the scope's <code>join()</code> waits for completion according to a policy, and exiting the scope (including via exception) guarantees every subtask forked within it has either completed or been cancelled — no subtask can outlive the block that spawned it. This eliminates a specific class of bug where a cancelled or failed parent operation leaves orphaned child tasks still running and consuming resources.</p>
-<pre><code>try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
-    Supplier&lt;User&gt; userTask = scope.fork(() -> fetchUser(id));
-    Supplier&lt;Orders&gt; orderTask = scope.fork(() -> fetchOrders(id));
+<pre><code>// ShopSphere: rendering an order-confirmation page needs both the Customer
+// profile and the Order's line items - fetch them concurrently, but as one unit.
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    Supplier&lt;Customer&gt; customerTask = scope.fork(() -> customerService.fetch(customerId));
+    Supplier&lt;Order&gt; orderTask = scope.fork(() -> orderService.fetch(orderId));
 
     scope.join();           // waits for both, or returns early on first failure
     scope.throwIfFailed();  // propagates the failure if either task failed
 
     // Both succeeded — safe to use both results.
-    return render(userTask.get(), orderTask.get());
+    return render(customerTask.get(), orderTask.get());
 } // scope close cancels any still-running fork automatically on the way out</code></pre>
-<p><code>ShutdownOnFailure</code> cancels sibling subtasks as soon as one fails, propagating a single well-defined exception instead of leaving the failure to surface later, disconnected from its cause, when something eventually calls <code>.get()</code> on an orphaned future. This is the same instinct as fail-fast error propagation in <a href="#/resilience-fault-tolerance">resilience patterns</a> — don't let a failed dependency's siblings keep doing wasted or inconsistent work.</p>
+<p><code>ShutdownOnFailure</code> cancels sibling subtasks as soon as one fails — if <code>orderService.fetch</code> throws because the order was deleted, the still-in-flight call to <code>customerService.fetch</code> is cancelled immediately rather than left running and consuming a connection for a result nobody will use — propagating a single well-defined exception instead of leaving the failure to surface later, disconnected from its cause, when something eventually calls <code>.get()</code> on an orphaned future. This is the same instinct as fail-fast error propagation in <a href="#/resilience-fault-tolerance">resilience patterns</a> — don't let a failed dependency's siblings keep doing wasted or inconsistent work.</p>
 
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
 <details class="concept-qa">
@@ -210,7 +316,7 @@ synchronized (accountA) {            synchronized (accountB) {
 </details>
 <details class="concept-qa">
 <summary>Why does wrapping a blocking call in a synchronized block specifically break the benefit of virtual threads, when a ReentrantLock around the same call doesn't?</summary>
-<div class="qa-body">The unmounting mechanism needs to capture the virtual thread's execution state as a continuation and later resume it, potentially on a different carrier thread. Native monitor locks acquired via synchronized are tied to the OS thread that acquired them in the JVM's internal locking implementation (at least prior to the JDK 24 changes that relaxed this) — the JVM has no safe way to suspend a thread mid-monitor-hold and later resume the equivalent logical thread on a different OS thread while preserving the monitor's semantics. So instead of unmounting, the JVM leaves the virtual thread pinned to its current carrier for the entire blocking operation, which reintroduces the exact one-OS-thread-per-blocked-task cost virtual threads exist to eliminate. ReentrantLock is implemented in ordinary Java code using AbstractQueuedSynchronizer and parking primitives that the virtual thread scheduler already understands how to suspend and resume, so it doesn't cause pinning.</div>
+<div class="qa-body">The unmounting mechanism needs to capture the virtual thread's execution state as a continuation and later resume it, potentially on a different carrier thread. Native monitor locks acquired via synchronized are tied to the OS thread that acquired them in the JVM's internal locking implementation (at least prior to the JDK 24 changes that relaxed this) — the JVM has no safe way to suspend a thread mid-monitor-hold and later resume the equivalent logical thread on a different OS thread while preserving the monitor's semantics. So instead of unmounting, the JVM leaves the virtual thread pinned to its current carrier for the entire blocking operation, which reintroduces the exact one-OS-thread-per-blocked-task cost virtual threads exist to eliminate. ReentrantLock is implemented in ordinary Java code using <code>AbstractQueuedSynchronizer</code> (AQS) — a JDK framework class that implements the queue-and-park machinery shared by nearly every <code>java.util.concurrent</code> lock, letting each lock subclass just define its own acquire/release condition — and parking primitives that the virtual thread scheduler already understands how to suspend and resume, so it doesn't cause pinning.</div>
 </details>
 <details class="concept-qa">
 <summary>What specific problem does structured concurrency solve that a plain ExecutorService with a manual list of Futures does not?</summary>
@@ -223,4 +329,5 @@ synchronized (accountA) {            synchronized (accountB) {
 <div class="related-card" onclick="window.location.hash='/collections-internals'"><div class="rc-title">Collections Internals</div><div class="rc-sub">Days 6–10 · ConcurrentHashMap's internal locking is the atomic check-and-set primitive that avoids the classic race condition</div></div>
 <div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience & Fault Tolerance</div><div class="rc-sub">Bulkheads and fail-fast propagation apply the same backpressure and isolation principles at the distributed-system level</div></div>
 <div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Happens-before within one JVM is the single-node analog of the ordering and consistency guarantees distributed systems must provide across nodes</div></div>
+<div class="related-card" onclick="window.location.hash='/jvm-profiling-troubleshooting'"><div class="rc-title">JVM Performance Profiling & Production Troubleshooting</div><div class="rc-sub">Thread dumps are exactly the NEW/RUNNABLE/BLOCKED/WAITING states from section 1 rendered for a real, stuck production JVM</div></div>
 </div>

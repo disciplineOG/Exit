@@ -1,0 +1,292 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Extended Bonus · Spring / Bonus</p>
+<h1>Batch Processing &amp; Scheduled Jobs</h1>
+<div class="topic-tags">
+<span class="tag">@Scheduled</span>
+<span class="tag">Spring Batch</span>
+<span class="tag">Chunk-Oriented Processing</span>
+<span class="tag">Idempotency &amp; Restartability</span>
+<span class="tag">Job Repository</span>
+<span class="tag">Distributed Locking</span>
+<span class="tag">ShedLock</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Almost every non-trivial backend eventually grows a class of work that doesn't fit the request/response model: nightly reconciliation, report generation, cleanup of stale data, bulk recomputation after a pricing rule changes. The naive version — a <code>@Scheduled</code> method with a <code>for</code> loop over every row — works fine in a demo and then fails in three specific, predictable ways in production: it runs on every one of your N horizontally-scaled instances simultaneously instead of once, it holds an entire day's dataset in memory and OOMs as the dataset grows, and when it dies halfway through (a deploy, a timeout, a crash), re-running it either does nothing (silently incomplete) or re-does everything from the start (silently duplicating side effects like a seller payout). None of these are exotic edge cases — for ShopSphere, a reconciliation job that fails halfway and gets re-run naively is the difference between "a boring retry" and "a seller getting paid twice for the same order." The material in this page — chunking, idempotency, restart metadata, distributed locks — exists entirely to convert "a script that usually works" into a job whose failure modes are bounded and understood in advance.</p>
+</div>
+
+<h2>1. Two Different Problems: @Scheduled vs Spring Batch</h2>
+<p>Spring offers two genuinely different tools here, and reaching for the wrong one is the most common mistake on this topic. <code>@Scheduled</code> is a timer: it runs a method on a schedule, full stop. It has no concept of "how much work is left," "resume from where I stopped," or "process this in bounded-size pieces." Spring Batch is a framework for processing a large, bounded dataset in discrete, trackable, restartable steps — it has an explicit model for exactly the things <code>@Scheduled</code> has no opinion about.</p>
+<table>
+<tr><th></th><th><code>@Scheduled</code></th><th>Spring Batch</th></tr>
+<tr><td>What it actually is</td><td>A timer that invokes a method — a thin wrapper over a <code>TaskScheduler</code>/<code>ScheduledExecutorService</code></td><td>A framework with a domain model for large, structured, resumable data-processing jobs</td></tr>
+<tr><td>Unit of work</td><td>Whatever the method body does — no built-in structure</td><td>A <code>Job</code> made of ordered <code>Step</code>s, each step chunked into fixed-size read/process/write cycles</td></tr>
+<tr><td>State / progress tracking</td><td>None — the method either finishes or it doesn't, nothing is recorded</td><td>A <code>JobRepository</code> persists every execution's status, parameters, and each step's read/write/skip counts to a database</td></tr>
+<tr><td>Restart after a crash</td><td>Not supported — you re-run the whole method from scratch</td><td>First-class: a failed <code>JobExecution</code> can be restarted, and completed steps are skipped automatically (see section 4)</td></tr>
+<tr><td>Memory profile</td><td>Whatever you write — typically "load it all into a <code>List</code>," which is fine at small scale and a liability at large scale</td><td>Bounded by design — chunk-oriented processing (section 3) never holds more than one chunk in memory regardless of total dataset size</td></tr>
+<tr><td>Right fit for ShopSphere</td><td>Expiring unused <code>Coupon</code>s nightly, pinging a health-check endpoint, refreshing a small in-memory cache</td><td>Reconciling a full day of <code>Order</code>/<code>Payment</code> records against the payment gateway; regenerating every Seller's monthly payout report from millions of <code>OrderItem</code> rows</td></tr>
+</table>
+<div class="callout">
+<div class="callout-title">The deciding question: does this job need to survive its own failure?</div>
+<p>If a job's dataset is small enough that "just re-run the whole thing" is an acceptable recovery strategy, and there's nothing meaningfully expensive or non-idempotent inside it, <code>@Scheduled</code> is simpler and correct — building a Spring Batch job for expiring a few hundred stale <code>Coupon</code> rows a night is over-engineering. The moment the job (a) processes enough rows that loading them all into memory or re-processing them all from scratch is expensive, or (b) has side effects that are dangerous to repeat (crediting a Seller's payout, capturing a refund), Spring Batch's chunking and restart bookkeeping stop being nice-to-haves and become the actual mechanism that makes the job safe to run in production at all.</p>
+</div>
+
+<h2>2. @Scheduled: Simple Periodic Jobs</h2>
+<p>A method annotated <code>@Scheduled</code> on a Spring-managed bean runs on a background thread pool according to a fixed rate, a fixed delay, or a cron expression. It requires <code>@EnableScheduling</code> on a configuration class — without it, the annotation is silently inert, since scheduling is opt-in infrastructure, not something every Spring context needs by default.</p>
+<pre><code>@Configuration
+@EnableScheduling
+public class SchedulingConfig { }
+
+@Component
+public class CouponExpiryJob {
+
+    private final CouponRepository couponRepository;
+
+    // Runs every night at 2:00 AM server time - cron: sec min hour day month weekday
+    @Scheduled(cron = "0 0 2 * * *")
+    public void expireUnusedCoupons() {
+        int expired = couponRepository.deactivateWhereValidUntilBefore(Instant.now());
+        log.info("Expired {} unused ShopSphere coupons", expired);
+    }
+}</code></pre>
+<h3>2.1 fixedRate vs fixedDelay vs cron</h3>
+<table>
+<tr><th>Attribute</th><th>Meaning</th><th>ShopSphere example</th></tr>
+<tr><td><code>fixedRate = 60000</code></td><td>Start a new invocation every 60s <em>measured from the start</em> of the previous invocation — if a run takes longer than the interval, the next one queues up immediately behind it rather than overlapping (single-threaded scheduler by default)</td><td>Polling a payment gateway's webhook-retry queue every minute</td></tr>
+<tr><td><code>fixedDelay = 60000</code></td><td>Wait 60s <em>after the previous invocation finishes</em> before starting the next — guarantees runs never overlap and always leaves a full gap</td><td>Refreshing a denormalized catalog search index, where you never want two refreshes racing each other</td></tr>
+<tr><td><code>cron = "0 0 2 * * *"</code></td><td>Run at specific wall-clock times, expressed as a 6-field cron expression (seconds included, unlike Unix cron's 5 fields)</td><td>Nightly coupon expiry, end-of-day reconciliation kickoff, monthly payout report generation</td></tr>
+</table>
+<div class="callout warn">
+<div class="callout-title">The default scheduler is single-threaded — one slow job blocks every other @Scheduled method</div>
+<p>Out of the box, Spring runs all <code>@Scheduled</code> methods on a single-threaded <code>TaskScheduler</code>. This means a slow job — say, a poorly-written report generator that takes ten minutes — doesn't just run slowly, it <em>delays every other scheduled method in the entire application</em> by ten minutes, because they're all queued behind it on the same one thread. This is almost never what you want once an application has more than one scheduled job. The fix is to register a properly-sized <code>ThreadPoolTaskScheduler</code> bean (Spring will pick it up automatically in place of the default), sized to the number of genuinely concurrent scheduled jobs you expect to run.</p>
+</div>
+
+<h2>3. Spring Batch: The Job / Step / Chunk Model</h2>
+<p>Spring Batch structures a large processing task as a hierarchy: a <code>Job</code> is made of one or more <code>Step</code>s, executed in order (or conditionally); each <code>Step</code> is typically <strong>chunk-oriented</strong> — it reads records one at a time via an <code>ItemReader</code>, transforms each one via an <code>ItemProcessor</code>, and once it has accumulated a fixed-size batch ("chunk") of processed items, writes the whole chunk at once via an <code>ItemWriter</code>, all inside a single database transaction per chunk.</p>
+<pre><code>Job  "dailyOrderReconciliationJob"
+ └── Step  "reconcileOrdersStep"        (chunk-oriented, chunk size = 500)
+       ├── ItemReader&lt;Order&gt;             reads one Order at a time from order-service's DB
+       ├── ItemProcessor&lt;Order,ReconciliationResult&gt;   calls payment-service, compares amounts
+       └── ItemWriter&lt;ReconciliationResult&gt;            batch-writes 500 results per transaction
+ └── Step  "flagMismatchesStep"          (runs only if reconcileOrdersStep completed)
+       └── ... notifies admin-service of any Order/Payment amount mismatches found above</code></pre>
+<h3>3.1 The four building blocks</h3>
+<table>
+<tr><th>Component</th><th>Responsibility</th><th>ShopSphere example</th></tr>
+<tr><td><code>ItemReader&lt;T&gt;</code></td><td>Produces one item at a time; returns <code>null</code> to signal "no more input" — this is the sole termination condition chunk processing relies on</td><td><code>JdbcPagingItemReader&lt;Order&gt;</code> streaming yesterday's <code>Order</code> rows page by page, so the full day's orders are never all resident in memory at once</td></tr>
+<tr><td><code>ItemProcessor&lt;I,O&gt;</code></td><td>Transforms, validates, or filters a single item; returning <code>null</code> from <code>process()</code> filters that item out of the chunk entirely (it is silently skipped, not written)</td><td>Calling payment-service's records for a given <code>orderId</code>, comparing <code>Order.totalAmount</code> against the captured <code>Payment</code> amount, producing a <code>ReconciliationResult</code> (or filtering out orders with no corresponding payment yet, e.g. still <code>CREATED</code>)</td></tr>
+<tr><td><code>ItemWriter&lt;T&gt;</code></td><td>Receives an entire chunk (a <code>List&lt;T&gt;</code>, not one item) and writes it in bulk, inside the chunk's transaction</td><td>A <code>JdbcBatchItemWriter</code> bulk-inserting 500 <code>ReconciliationResult</code> rows in one batched SQL statement rather than 500 individual inserts</td></tr>
+<tr><td><code>Job</code> / <code>Step</code></td><td>The orchestration and bookkeeping layer — <code>Step</code> drives the read/process/write loop for one chunk-oriented unit of work; <code>Job</code> sequences one or more <code>Step</code>s and is what gets launched, tracked, and restarted</td><td><code>dailyOrderReconciliationJob</code>, launched nightly by a small <code>@Scheduled</code> trigger (see section 6) that just calls <code>JobLauncher.run(job, jobParameters)</code></td></tr>
+</table>
+<h3>3.2 The chunk-oriented read/process/write loop</h3>
+<p>This diagram is the actual mechanism worth internalizing — everything else on this page (idempotency, restart, skip/retry policies) is a consequence of how this loop is structured:</p>
+<pre><code>Step execution (chunk size = 500)
+┌──────────────────────────────────────────────────────────────────┐
+│  loop:                                                            │
+│    chunk = []                                                     │
+│    repeat up to 500 times:                                        │
+│        item = reader.read()          // one Order at a time       │
+│        if item == null: break out of BOTH loops (input exhausted) │
+│        result = processor.process(item)   // transform/validate   │
+│        if result != null: chunk.add(result)                       │
+│                                                                     │
+│    ── begin transaction ──                                        │
+│    writer.write(chunk)               // one bulk write, N=500     │
+│    update JobRepository: mark these 500 items' read/write count   │
+│    ── commit transaction ──                                       │
+│                                                                     │
+│  goto loop (next chunk of up to 500), until reader.read() == null │
+└──────────────────────────────────────────────────────────────────┘</code></pre>
+<p>The critical property this structure buys you: <strong>the transaction boundary is the chunk, not the whole step</strong>. If chunk #40 (items 19,501–20,000) fails partway through processing, only that chunk's transaction rolls back — chunks #1 through #39 are already committed and durable. This is precisely what bounds both memory (never more than one chunk's worth of items resident at once, regardless of whether the total dataset is 10,000 or 10,000,000 rows) and blast radius (a failure loses at most one chunk's worth of progress, not the whole job) at the same time.</p>
+<pre><code>@Bean
+public Step reconcileOrdersStep(JobRepository jobRepository,
+                                 PlatformTransactionManager txManager,
+                                 ItemReader&lt;Order&gt; orderReader,
+                                 ItemProcessor&lt;Order, ReconciliationResult&gt; reconciliationProcessor,
+                                 ItemWriter&lt;ReconciliationResult&gt; resultWriter) {
+    return new StepBuilder("reconcileOrdersStep", jobRepository)
+            .&lt;Order, ReconciliationResult&gt;chunk(500, txManager)   // 500 items per transaction
+            .reader(orderReader)
+            .processor(reconciliationProcessor)
+            .writer(resultWriter)
+            .faultTolerant()
+            .skip(PaymentGatewayTimeoutException.class)
+            .skipLimit(50)          // tolerate up to 50 transient gateway timeouts before failing the step
+            .build();
+}
+
+@Bean
+public Job dailyOrderReconciliationJob(JobRepository jobRepository, Step reconcileOrdersStep) {
+    return new JobBuilder("dailyOrderReconciliationJob", jobRepository)
+            .start(reconcileOrdersStep)
+            .build();
+}</code></pre>
+<p><code>.faultTolerant().skip(...).skipLimit(50)</code> tells the step "if processing a single item throws this specific exception, log it, skip that one item, and keep going — but only up to 50 such skips before giving up and failing the whole step." This is the deliberate distinction between an error in <em>one item</em> (a single order whose payment-service call timed out — worth skipping and retrying tomorrow) versus a systemic failure (the payment-service is entirely down — worth failing the whole job loudly rather than silently skipping thousands of items).</p>
+
+<h2>4. Idempotency and Restartability</h2>
+<p>These are two separate but tightly linked properties, and Spring Batch's design assumes you need both together — restart support is only safe to rely on if the job is also idempotent, and idempotency alone isn't enough without the framework's help remembering where it left off.</p>
+<ul>
+<li><strong>Idempotent</strong> means: running the same unit of work twice produces the same end state as running it once — no duplicated side effect. For ShopSphere's reconciliation job, this means re-processing <code>orderId=9931</code> a second time must not credit a Seller's payout balance twice, or write a second duplicate <code>ReconciliationResult</code> row.</li>
+<li><strong>Restartable</strong> means: after a failed run, the job can be re-launched and will resume from where it stopped, rather than starting the entire dataset over from item 1.</li>
+</ul>
+<h3>4.1 How Spring Batch tracks restart state — the JobRepository</h3>
+<p>Every <code>Job</code> launch creates a <code>JobExecution</code> row (and, per step, a <code>StepExecution</code> row) in the <code>JobRepository</code>'s backing database tables (<code>BATCH_JOB_EXECUTION</code>, <code>BATCH_STEP_EXECUTION</code>, etc. — created by a schema script Spring Batch ships). Each <code>StepExecution</code> persists an <code>ExecutionContext</code>: a small key-value bag a chunk-oriented reader can use to record exactly how far it got (e.g., a paging reader persists the current page number or the last-read primary key after every committed chunk). When a failed job is relaunched with the <em>same</em> job parameters, Spring Batch recognizes the existing incomplete <code>JobExecution</code>, and a restart-aware reader resumes from its persisted <code>ExecutionContext</code> instead of starting at row 1 — completed steps from the failed run are skipped entirely, and the failed step resumes mid-way through its chunk sequence.</p>
+<pre><code>// Simplified shape of what JobRepository persists per step, after each committed chunk
+StepExecution {
+  stepName: "reconcileOrdersStep",
+  status: FAILED,
+  readCount: 19500,        // chunks 1-39 fully committed before the failure
+  writeCount: 19500,
+  executionContext: { "order.reader.current.page": 39 }   // paging reader's bookmark
+}</code></pre>
+<div class="callout warn">
+<div class="callout-title">Restartability is a property of the reader's bookmark — idempotency is a property of the writer's side effects. You need both.</div>
+<p>Restart support only tells the reader where to resume reading from — it does nothing, on its own, to protect against double-processing the specific items in the chunk that was in flight (not yet committed) at the moment of failure. If chunk #40 was being processed when the job crashed mid-write, that chunk's transaction rolled back entirely (section 3.2), so on restart the reader correctly re-reads items 19,501–20,000 from scratch — but the <em>processor</em> for those items might, for instance, have already called payment-service's non-idempotent "capture" endpoint once before crashing. Restarting and re-processing that chunk without the write itself being idempotent would capture payment a second time. This is exactly why the idempotency techniques below (idempotency keys, upserts, natural dedup keys) are not optional polish on top of restart support — restart support is what makes double-processing a live possibility in the first place (by design, it re-runs exactly the in-flight chunk), and idempotency is the only thing that makes that re-run safe.</p>
+</div>
+<h3>4.2 Making the reconciliation/payout writer idempotent</h3>
+<p>The concrete technique: give every unit of work a stable, deterministic identity, and make the write either a no-op or an upsert when that identity has already been recorded — the same idempotency-key pattern used for payment capture (see the dedicated <a href="#/payment-systems-idempotency">Payment Systems &amp; Idempotent Transactions</a> page for the general mechanism). For ShopSphere's daily reconciliation and monthly seller-payout jobs specifically:</p>
+<pre><code>// ReconciliationResult carries a deterministic key: reconciliation is scoped to
+// (orderId, reconciliationDate) - re-running the same date for the same order
+// is defined to always produce the same key.
+@Component
+public class ReconciliationResultWriter implements ItemWriter&lt;ReconciliationResult&gt; {
+
+    private final JdbcTemplate jdbc;
+
+    @Override
+    public void write(Chunk&lt;? extends ReconciliationResult&gt; chunk) {
+        for (ReconciliationResult r : chunk) {
+            // INSERT ... ON CONFLICT (order_id, reconciliation_date) DO NOTHING
+            // re-running this chunk after a crash simply no-ops for rows already written
+            jdbc.update("""
+                INSERT INTO reconciliation_result (order_id, reconciliation_date, status, amount_diff)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (order_id, reconciliation_date) DO NOTHING
+                """, r.orderId(), r.reconciliationDate(), r.status(), r.amountDiff());
+        }
+    }
+}
+
+// Seller payout: the payout ledger entry's own primary key IS the idempotency key -
+// crediting the same (sellerId, payoutPeriod) twice is structurally impossible, not just
+// discouraged, because the second insert violates a unique constraint and is caught/ignored.
+@Component
+public class SellerPayoutWriter implements ItemWriter&lt;PayoutLine&gt; {
+    private final PayoutLedgerRepository ledger;
+
+    @Override
+    public void write(Chunk&lt;? extends PayoutLine&gt; chunk) {
+        for (PayoutLine line : chunk) {
+            if (!ledger.existsBySellerIdAndPayoutPeriod(line.sellerId(), line.payoutPeriod())) {
+                ledger.save(new PayoutEntry(line.sellerId(), line.payoutPeriod(), line.amount()));
+            }
+            // already exists -> this exact (seller, period) payout was already recorded;
+            // re-running this chunk after a restart is a safe no-op, never a double credit
+        }
+    }
+}</code></pre>
+<p>Notice the two different idempotency mechanisms in play, both valid: a database-level uniqueness constraint plus <code>ON CONFLICT DO NOTHING</code> (idempotent at the storage layer, no application check needed), and an explicit existence check before writing (idempotent at the application layer). Either works; what matters is that the key used to detect "have I already done this" is <em>derived from the business data itself</em> (<code>orderId</code> + date, or <code>sellerId</code> + payout period) rather than from anything about the specific run of the job — a retried run and the original run compute the exact same key for the exact same logical unit of work, which is the actual definition of idempotency being satisfied here.</p>
+
+<h2>5. Coordinating Scheduled Jobs Across Multiple Instances</h2>
+<p>ShopSphere runs order-service (and every other service) as multiple horizontally-scaled instances/pods for availability and throughput. This is exactly the setup where a naive <code>@Scheduled</code> method becomes a correctness bug rather than a convenience: <code>@Scheduled</code> has no cluster awareness whatsoever — every single instance runs its own independent Spring context, its own independent scheduler thread, and fires the annotated method on its own local clock. With 5 pods running order-service, a nightly coupon-expiry job configured with <code>@Scheduled(cron = "0 0 2 * * *")</code> does not run once at 2 AM — it runs <strong>five times</strong>, once per pod, all within the same second.</p>
+<div class="callout warn">
+<div class="callout-title">Why "just idempotent" isn't automatically a full fix here either</div>
+<p>Making <code>expireUnusedCoupons()</code> idempotent (safe to run twice) helps, but running it 5x concurrently is still wasteful — five pods hitting the same database rows with the same UPDATE at the same instant, five times the load for one logical job, and for jobs that call external systems (a report emailed to sellers, a webhook fired to notification-service), idempotency at the data layer doesn't stop the email or webhook from firing five times. The right fix is preventing four of the five pods from running the job at all, not just making it harmless if they do.</p>
+</div>
+<h3>5.1 Distributed locking with ShedLock</h3>
+<p>ShedLock is a small library purpose-built for exactly this problem: it wraps a scheduled method so that, at trigger time, every instance races to acquire a lock row in a shared external store (a SQL table, Redis, MongoDB, ZooKeeper — anything all instances can already reach), and only the instance that wins actually executes the method body; every other instance sees the lock already held and simply skips its own execution for this cycle.</p>
+<pre><code>@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = "10m")
+public class SchedulingConfig {
+
+    @Bean
+    public LockProvider lockProvider(DataSource dataSource) {
+        // shared lock table, reachable by every ShopSphere order-service pod
+        return new JdbcTemplateLockProvider(
+            JdbcTemplateLockProvider.Configuration.builder()
+                .withJdbcTemplate(new JdbcTemplate(dataSource))
+                .usingDbTime() // use the DB's clock, not each pod's local clock, to avoid clock-skew races
+                .build());
+    }
+}
+
+@Component
+public class CouponExpiryJob {
+
+    @Scheduled(cron = "0 0 2 * * *")
+    @SchedulerLock(name = "expireUnusedCoupons", lockAtLeastFor = "1m", lockAtMostFor = "10m")
+    public void expireUnusedCoupons() {
+        // only ONE of ShopSphere's order-service pods actually executes this body per cron firing -
+        // the other pods' @Scheduled trigger fires locally too, but ShedLock's proxy sees the
+        // lock row already held and returns immediately without calling the real method
+        int expired = couponRepository.deactivateWhereValidUntilBefore(Instant.now());
+        log.info("Expired {} unused coupons", expired);
+    }
+}</code></pre>
+<h3>5.2 Why lockAtLeastFor and lockAtMostFor both matter</h3>
+<table>
+<tr><th>Parameter</th><th>Protects against</th><th>Concretely, for expireUnusedCoupons</th></tr>
+<tr><td><code>lockAtMostFor</code></td><td>A pod that acquires the lock and then crashes or hangs before releasing it — without an upper bound, the lock would be held forever and no pod could ever run this job again</td><td>10 minutes: comfortably longer than the job ever actually takes, so it never expires mid-run under normal conditions, but short enough that a crashed pod's stale lock self-heals within 10 minutes rather than permanently wedging the job</td></tr>
+<tr><td><code>lockAtLeastFor</code></td><td>Clock skew between pods causing a <em>second</em> pod to acquire the lock milliseconds after the first pod released it, if the first pod's job finished unusually fast — without a floor, "the lock is free again" and "another pod's cron trigger just fired" can race</td><td>1 minute: even if <code>expireUnusedCoupons()</code> finishes in 200ms, the lock is held for a full minute regardless, so a second pod whose clock is very slightly ahead can't sneak in and run the same logical job cycle a second time</td></tr>
+</table>
+<p>Both settings exist because a distributed lock's failure modes are different from a single-JVM lock's failure modes: a single-JVM lock is released deterministically when a thread exits a synchronized block, but a lock held in an external store, by a process that could die at any instant without ever running its own cleanup code, needs an externally-enforced expiry (<code>lockAtMostFor</code>) as the actual safety net — not "trust the holder to always release it."</p>
+<h3>5.3 ShedLock vs a full distributed coordination system</h3>
+<p>It's worth being precise about what ShedLock is and isn't. It's a best-effort mutual-exclusion mechanism for scheduled tasks — it is explicitly not a general-purpose distributed lock suitable for protecting arbitrary critical sections of business logic (there are narrow race windows around lock expiry it does not try to close with the rigor a true consensus-based lock would), and it's not a job orchestrator — it has no concept of retries, dependencies between jobs, or chunked processing at all. For that reason it composes naturally with Spring Batch rather than replacing any part of it: ShedLock decides <em>whether this pod is the one that gets to launch the job this cycle</em>; Spring Batch's <code>JobRepository</code> and chunking (sections 3–4) handle everything about how that one job execution proceeds, fails, and restarts once it's running.</p>
+<pre><code>@Scheduled(cron = "0 0 1 * * *")
+@SchedulerLock(name = "dailyOrderReconciliationTrigger", lockAtMostFor = "2h")
+public void triggerReconciliationJob() throws Exception {
+    // ShedLock ensures only one order-service pod calls JobLauncher.run() for tonight's date;
+    // Spring Batch's own JobRepository then independently ensures that if THIS run crashes
+    // partway through, relaunching with the same jobParameters resumes rather than restarts.
+    JobParameters params = new JobParametersBuilder()
+            .addLocalDate("reconciliationDate", LocalDate.now().minusDays(1))
+            .toJobParameters();
+    jobLauncher.run(dailyOrderReconciliationJob, params);
+}</code></pre>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does chunk-oriented processing commit per chunk rather than per item or for the entire step at once?</summary>
+<div class="qa-body">Committing per item would mean a transaction (with all its overhead - a round trip, lock acquisition, WAL flush) for every single row, which is prohibitively slow at any real scale - reconciling a million orders as a million individual transactions would dominate the job's total runtime with transaction overhead rather than actual work. Committing the entire step as one giant transaction solves the throughput problem but reintroduces a different one: an entire day's or month's worth of work sits uncommitted in a single transaction until the very last row is written, which means the database has to hold locks and undo/redo information for the whole thing, memory for tracking that transaction's state grows unbounded with dataset size, and a single failure anywhere in the step throws away all the work done so far, no matter how much of it had already succeeded. Chunking splits the difference deliberately: transactions are large enough (hundreds or thousands of rows) to amortize per-transaction overhead, but small enough that a failure only loses one chunk's uncommitted work, and the total memory held at any moment is bounded by chunk size, not total dataset size, regardless of whether the underlying dataset is a thousand rows or a hundred million.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What specifically does Spring Batch's restart mechanism resume, and what does it NOT protect you from automatically?</summary>
+<div class="qa-body">On restart with the same job parameters, Spring Batch's JobRepository finds the existing incomplete JobExecution, skips any Step that already completed successfully, and for the step that failed, hands a restart-aware ItemReader its previously persisted ExecutionContext (e.g., a bookmark like "last read primary key" or "current page number") so it resumes reading from that point rather than from the very first row. What it does not do is protect the failed step's in-flight chunk from being re-processed: the chunk that was actively being read/processed/written at the moment of failure gets rolled back entirely (nothing in it was committed) and will be re-read and re-processed from scratch on restart. If the processor or writer for that chunk had any non-idempotent side effect - calling an external API that captures a payment, sending an email - restarting will trigger that side effect again for every item in that one chunk, unless the writer itself is built to detect and no-op on already-completed work. Restart support and idempotent writes are two separate mechanisms that have to both be present; restart support alone only solves "don't redo the 39 chunks that already fully committed," not "don't redo the one chunk that was interrupted mid-flight."</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is a database-level unique constraint plus ON CONFLICT DO NOTHING often a better idempotency mechanism than an application-level existence check?</summary>
+<div class="qa-body">An application-level check ("does a ReconciliationResult already exist for this orderId and date? if not, insert one") has a race window: between the SELECT that checks existence and the subsequent INSERT, another process (or, concretely, another in-flight retry of the same chunk after a restart under concurrent execution) could insert the same logical row, and now there are two rows representing the same reconciliation, or the second insert throws a constraint violation that has to be caught and handled anyway. Enforcing uniqueness with a database constraint on the natural key (order_id, reconciliation_date) and using ON CONFLICT DO NOTHING (or the equivalent upsert syntax) closes that race entirely, because the uniqueness check and the insert attempt happen atomically as one operation inside the database engine itself, not as two separate round trips from the application that something else can interleave with. This is also strictly less code to get right: there's no check-then-act sequence to reason about, just a single statement whose behavior is correct under concurrent execution by construction.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is @Scheduled fundamentally unsafe for a job with side effects once a service runs as multiple instances, even if the job itself is idempotent?</summary>
+<div class="qa-body">@Scheduled has no concept of "the cluster" at all - each instance's Spring context runs its own independent scheduler on its own independent clock, so a cron expression fires on every single instance, every time, with no coordination between them by design. If a service is scaled to 5 pods, a nightly job fires 5 times, once per pod, all around the same moment. Idempotency at the data layer (an ON CONFLICT DO NOTHING insert, for instance) means the redundant 4 runs don't corrupt data, but it doesn't eliminate the waste of doing the same read-heavy or compute-heavy work 5 times over, and critically it does nothing to stop side effects that aren't naturally idempotent from the caller's perspective - an email sent to every Seller with their payout report, or a webhook fired to notification-service, fires once per pod regardless of what the database ends up looking like afterward, because the act of sending is not itself gated by any database check. The actual fix has to prevent the redundant executions from happening at all, which is what a distributed lock (ShedLock) does - it's solving a different problem than idempotency, one layer earlier in the pipeline.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does ShedLock need both lockAtLeastFor and lockAtMostFor instead of just releasing the lock when the method returns?</summary>
+<div class="qa-body">A single-JVM lock (a Java <code>synchronized</code> block or <code>ReentrantLock</code>) is released deterministically by the runtime the instant the thread exits the guarded section, even if that section throws - the JVM guarantees this. A lock held in an external store (a database row, a Redis key) by a process running on a separate machine has no such guarantee: that process can crash, get OOM-killed, or lose network connectivity at any instant, including mid-method, with no opportunity to run any cleanup code that would release the lock. Without an externally-enforced expiry, a single crashed pod holding the lock would permanently wedge the scheduled job for every other pod, forever - lockAtMostFor is exactly that safety net, an upper bound after which the lock is considered abandoned and available again regardless of whether its holder is still alive. lockAtLeastFor addresses a separate, subtler race: if the job finishes very quickly and releases the lock immediately, and a second pod's clock is running even slightly ahead, that second pod could acquire the lock and re-run the same logical job cycle within the same cron firing window. Forcing the lock to be held for a minimum duration regardless of how fast the work actually finished closes that specific clock-skew race.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does an ItemProcessor returning null filter an item out silently, and when is that the right behavior versus using the skip/retry machinery instead?</summary>
+<div class="qa-body">Returning null from ItemProcessor.process() is Spring Batch's designed mechanism for "this item is not an error, it simply does not belong in this step's output" - the item is dropped from the chunk before it ever reaches the ItemWriter, with no exception thrown and no skip count incremented, because nothing went wrong. This is the right tool when filtering is an expected, routine part of the step's logic - for example, a reconciliation processor skipping orders still in CREATED status because there is legitimately no payment record to compare yet; that's not a failure, it's simply out of scope for today's reconciliation pass. The skip/retry machinery (.faultTolerant().skip(SomeException.class).skipLimit(n)) exists for a categorically different situation: processing actually failed for that item (an exception was thrown, e.g. a payment-gateway timeout), and you're making a deliberate policy decision to tolerate a bounded number of such failures rather than aborting the entire step. Conflating the two - catching an exception inside the processor and returning null instead of using skip - hides real failures as if they were routine filtering, losing the skip count and error visibility that operators need to notice something is actually going wrong upstream.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Concretely, why can't idempotency alone (without restart support) make a long-running reconciliation job safe to just "re-run from scratch" after a crash?</summary>
+<div class="qa-body">Idempotency guarantees that re-processing the same logical unit of work twice doesn't corrupt state or duplicate a side effect - but it says nothing about cost. If a nightly reconciliation job processes 2 million orders and crashes at order 1.9 million, an idempotent writer means re-running the entire job from order 1 is safe (every already-written result gets a harmless ON CONFLICT DO NOTHING no-op), but it still means re-reading, re-processing, and re-calling payment-service's lookup API for 1.9 million orders that were already correctly reconciled, purely to re-confirm a result that doesn't change. At scale that's not a correctness problem, it's an operational one: the job might not even finish its second, redundant pass before the next night's job is due to start, and it multiplies load on every downstream system (payment-service, the database) it touches for no benefit. Restart support is what makes the recovery cheap rather than merely safe - resuming from item 1,900,001 instead of item 1 - and idempotency is what makes that resumption (specifically, re-processing the one in-flight chunk that didn't fully commit) safe rather than merely fast. The two properties solve different halves of the same failure.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/jpa-hibernate'"><div class="rc-title">JPA &amp; Hibernate</div><div class="rc-sub">Spring Batch's JdbcPagingItemReader and bulk writers are the batch-scale counterpart to the same JDBC/ORM mechanics covered there</div></div>
+<div class="related-card" onclick="window.location.hash='/async-messaging'"><div class="rc-title">Async Messaging</div><div class="rc-sub">OrderPlaced/PaymentCaptured events often trigger or feed the same batch reconciliation jobs, and share the same idempotent-consumer design pressure</div></div>
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience &amp; Fault Tolerance</div><div class="rc-sub">Skip/retry policies inside a chunk-oriented step are the same fault-tolerance patterns (retry, circuit breaking) applied to batch item processing</div></div>
+<div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'"><div class="rc-title">Payment Systems &amp; Idempotent Transactions</div><div class="rc-sub">The idempotency-key pattern that makes reconciliation and payout writers safe to re-run is the same mechanism used to make payment capture safe to retry</div></div>
+<div class="related-card" onclick="window.location.hash='/jvm-profiling-troubleshooting'"><div class="rc-title">JVM Performance Profiling &amp; Production Troubleshooting</div><div class="rc-sub">Diagnosing why a batch job runs slow or OOMs comes down to chunk size, reader paging, and GC pressure from the exact loop this page diagrams</div></div>
+</div>

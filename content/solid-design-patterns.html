@@ -7,7 +7,8 @@
 <span class="tag">Interface Segregation</span>
 <span class="tag">Dependency Inversion</span>
 <span class="tag">Creational Patterns</span>
-<span class="tag">Structural & Behavioral Patterns</span>
+<span class="tag">Structural Patterns</span>
+<span class="tag">Behavioral Patterns (Strategy/State/Observer)</span>
 </div>
 
 <div class="callout tip">
@@ -19,7 +20,7 @@
 <p>The formal statement — "a class should have only one reason to change" — is easy to misread as "a class should do one thing," which is too vague to apply. The precise, mechanical test is: <strong>enumerate the distinct actors or business concerns that could each independently demand a change to this class</strong>. If that list has more than one entry, the class has more than one responsibility, and those responsibilities will eventually be pulled in different directions by different callers.</p>
 
 <pre><code>// VIOLATION: three unrelated reasons to change live in one class
-class InvoiceService {
+class OrderInvoiceService {
     Invoice createInvoice(Order order) { /* pricing + tax logic */ }
 
     void saveInvoice(Invoice invoice) {
@@ -34,20 +35,20 @@ class InvoiceService {
     }
 }</code></pre>
 
-<p>Ask "what would force <code>InvoiceService</code> to change?" and you get three unrelated answers: the finance team changes tax rules, the DBA changes the schema or switches from JDBC to a JPA repository, and a designer changes the invoice's HTML layout. None of these three people should need to touch, recompile, or re-review the other two concerns' code — but because they're in one class, a schema migration and a pricing bug fix now show up in the same diff, and a unit test for pricing logic has to spin up a database connection just to instantiate the class.</p>
+<p>Ask "what would force <code>OrderInvoiceService</code> to change?" and you get three unrelated answers: the finance team changes how tax is calculated on an <code>Order</code>'s <code>totalAmount</code>, the DBA changes the schema or switches from JDBC to a JPA repository, and a designer changes the invoice's HTML layout for the confirmation email. None of these three people should need to touch, recompile, or re-review the other two concerns' code — but because they're in one class, a schema migration and a tax-calculation bug fix now show up in the same diff, and a unit test for pricing logic has to spin up a database connection just to instantiate the class.</p>
 
 <pre><code>// FIX: one reason to change per class
 class InvoicePricingService {
-    Invoice createInvoice(Order order) { /* pricing + tax only */ }
+    Invoice createInvoice(Order order) { /* pricing + tax only, off order.getItems() */ }
 }
 class InvoiceRepository {
     void save(Invoice invoice) { /* persistence only */ }
 }
 class InvoiceRenderer {
-    String toHtml(Invoice invoice) { /* presentation only */ }
+    String toHtml(Invoice invoice) { /* presentation only, for the order-confirmation email */ }
 }</code></pre>
 
-<p>Concretely, what breaks when SRP is violated is <strong>testability</strong> (you can't unit test pricing without a live database), <strong>maintainability</strong> (a merge conflict between the DBA's schema change and the finance team's tax fix, in a file neither fully understands), and <strong>reusability</strong> (you can't reuse the pricing logic in a batch job without dragging along HTML rendering code and its templating dependency).</p>
+<p>Concretely, what breaks when SRP is violated is <strong>testability</strong> (you can't unit test tax logic without a live database), <strong>maintainability</strong> (a merge conflict between the DBA's schema change and the finance team's tax fix, in a file neither fully understands), and <strong>reusability</strong> (you can't reuse the pricing logic in a nightly settlement batch job without dragging along HTML rendering code and its templating dependency).</p>
 
 <div class="callout">
 <div class="callout-title">SRP is about actors, not line count</div>
@@ -57,37 +58,37 @@ class InvoiceRenderer {
 <h2>2. Open/Closed Principle (OCP)</h2>
 <p>A module should be <strong>open for extension but closed for modification</strong>: you should be able to add new behavior by adding new code, not by editing code that already works and is already covered by regression tests. The mechanism that makes this possible is polymorphism — you replace a conditional that branches on type with a common interface, and each new case becomes a new implementation rather than a new branch.</p>
 
-<pre><code>// VIOLATION: adding a payment method means editing this method again
-class PaymentProcessor {
-    void process(String type, double amount) {
-        if (type.equals("CREDIT_CARD")) {
-            // charge via card network
-        } else if (type.equals("PAYPAL")) {
-            // call PayPal API
+<pre><code>// VIOLATION: adding a payment gateway means editing this method again
+class ShopSpherePaymentProcessor {
+    void process(String provider, Payment payment) {
+        if (provider.equals("STRIPE")) {
+            // charge via Stripe's API
+        } else if (provider.equals("LEGACY_BANK_GATEWAY")) {
+            // call the legacy bank gateway's SOAP endpoint
         }
-        // every new payment method edits this same method
+        // every new payment provider edits this same method
     }
 }</code></pre>
 
-<p>Every time a new payment method is added, you re-open a method that was already tested and working for credit cards and PayPal, risking a regression in code unrelated to the new feature. The fix inverts the direction of the dependency: define an abstraction, and let each case supply its own implementation.</p>
+<p>Every time ShopSphere onboards a new payment provider, you re-open a method that was already tested and working for Stripe and the bank gateway, risking a regression in code unrelated to the new feature. The fix inverts the direction of the dependency: define an abstraction, and let each case supply its own implementation.</p>
 
-<pre><code>interface PaymentMethod {
-    void process(double amount);
+<pre><code>interface PaymentGateway {
+    Payment charge(Payment payment);   // returns Payment with status CAPTURED or FAILED
 }
-class CreditCardPayment implements PaymentMethod {
-    public void process(double amount) { /* card network call */ }
+class StripeGateway implements PaymentGateway {
+    public Payment charge(Payment payment) { /* Stripe API call */ }
 }
-class PayPalPayment implements PaymentMethod {
-    public void process(double amount) { /* PayPal API call */ }
+class LegacyBankGateway implements PaymentGateway {
+    public Payment charge(Payment payment) { /* adapted legacy SOAP call — see Adapter, section 7 */ }
 }
-// Adding UpiPayment later requires zero edits to existing classes.
-class PaymentProcessor {
-    void process(PaymentMethod method, double amount) {
-        method.process(amount);
+// Adding RazorpayGateway later requires zero edits to existing classes.
+class ShopSpherePaymentProcessor {
+    Payment process(PaymentGateway gateway, Payment payment) {
+        return gateway.charge(payment);
     }
 }</code></pre>
 
-<p>Note that OCP is never absolute — somewhere, something has to map a request to a concrete <code>PaymentMethod</code> (a factory, a Spring bean lookup by qualifier, a registry populated at startup). OCP doesn't eliminate that decision point; it isolates it to one small, well-understood piece of wiring code instead of spreading the branching logic through business methods. This is also precisely the principle that the <a href="#/spring-core-mechanics">Strategy pattern</a> (covered below) exists to implement mechanically.</p>
+<p>Note that OCP is never absolute — somewhere, something has to map an order's chosen provider to a concrete <code>PaymentGateway</code> (a factory, a Spring bean lookup by qualifier, a registry populated at startup). OCP doesn't eliminate that decision point; it isolates it to one small, well-understood piece of wiring code instead of spreading the branching logic through business methods. This is also precisely the principle that the <a href="#/spring-core-mechanics">Strategy pattern</a> (covered below) exists to implement mechanically. Making that <code>charge()</code> call safe to retry when payment-service's response is lost mid-network-call is a separate, equally important concern — see <a href="#/payment-systems-idempotency">Payment Systems &amp; Idempotent Transactions</a>.</p>
 
 <h2>3. Liskov Substitution Principle (LSP)</h2>
 <p>LSP says a subtype must be usable through its supertype's reference without the caller noticing anything is different — the subtype must honor the supertype's <em>contract</em>, not merely its method signatures. This is a stronger requirement than "compiles without errors," because Java's type checker verifies signatures but has no way to verify behavioral promises like "this method never mutates the object's width independently of its height."</p>
@@ -117,35 +118,35 @@ void resize(Rectangle r) {
 }
 resize(new Square(...));      // ...but fails for Square: area() == 100</code></pre>
 
-<p>The caller made a "reasonable assumption about the supertype's contract" — that width and height are independent — and that assumption is exactly what <code>Square</code> had to violate to satisfy its own invariant (equal sides). This is not a bug in the caller; it's a bug in the inheritance modeling. The fix is to stop expressing "is described by the same shape hierarchy" as "is a subtype of." Either make both immutable value types with no setters (so there's no mutation contract to violate), or don't use inheritance between them at all — model both as implementations of a `Shape` interface exposing only `area()`, with no shared mutable state or setters whose independence is assumed.</p>
+<p>The caller made a "reasonable assumption about the supertype's contract" — that width and height are independent — and that assumption is exactly what <code>Square</code> had to violate to satisfy its own invariant (equal sides). This is not a bug in the caller; it's a bug in the inheritance modeling. The fix is to stop expressing "is described by the same shape hierarchy" as "is a subtype of." Either make both immutable value types with no setters (so there's no mutation contract to violate), or don't use inheritance between them at all — model both as implementations of a <code>Shape</code> interface exposing only <code>area()</code>, with no shared mutable state or setters whose independence is assumed.</p>
 
 <p>The mechanical test for LSP, generalized beyond this example: for every method a subclass overrides, ask whether it (a) throws exceptions the superclass method didn't promise to throw, (b) returns a narrower or incompatible range of values, (c) weakens a precondition callers rely on, or (d) strengthens a postcondition in a way that surprises code written only against the supertype. Any "yes" is an LSP violation, regardless of whether the code compiles.</p>
 
 <h2>4. Interface Segregation Principle (ISP)</h2>
 <p>ISP says many small, client-specific interfaces beat one large interface that forces every implementer to provide (or stub out) methods it has no use for. The cost of violating ISP is concrete: implementers throw <code>UnsupportedOperationException</code> from methods they can't meaningfully support, and every caller of the fat interface is coupled to methods it doesn't call — meaning a change to an unrelated method's signature forces a recompile of code that never used it.</p>
 
-<pre><code>// VIOLATION: one fat interface for every kind of worker
-interface Worker {
-    void work();
-    void eat();
-    void attendStandup();
+<pre><code>// VIOLATION: one fat interface for every kind of notifiable order event handler
+interface OrderEventHandler {
+    void sendEmail(Order order);
+    void sendSms(Order order);
+    void updateAnalyticsDashboard(Order order);
 }
 
-class RobotWorker implements Worker {
-    public void work() { /* fine */ }
-    public void eat() { throw new UnsupportedOperationException(); }         // robots don't eat
-    public void attendStandup() { throw new UnsupportedOperationException(); } // or stand up
+class SmsOnlyNotifier implements OrderEventHandler {
+    public void sendSms(Order order) { /* fine */ }
+    public void sendEmail(Order order) { throw new UnsupportedOperationException(); }         // this provider only does SMS
+    public void updateAnalyticsDashboard(Order order) { throw new UnsupportedOperationException(); } // not its job either
 }</code></pre>
 
 <pre><code>// FIX: segregate by capability
-interface Workable  { void work(); }
-interface Eatable    { void eat(); }
-interface Attendable { void attendStandup(); }
+interface EmailNotifiable     { void sendEmail(Order order); }
+interface SmsNotifiable       { void sendSms(Order order); }
+interface AnalyticsUpdatable  { void updateAnalyticsDashboard(Order order); }
 
-class HumanWorker implements Workable, Eatable, Attendable { ... }
-class RobotWorker  implements Workable { public void work() { ... } } // no stubs needed</code></pre>
+class FullOrderEventHandler implements EmailNotifiable, SmsNotifiable, AnalyticsUpdatable { ... }
+class SmsOnlyNotifier implements SmsNotifiable { public void sendSms(Order order) { ... } } // no stubs needed</code></pre>
 
-<p>A caller that only needs to trigger work should depend on <code>Workable</code>, not <code>Worker</code> — that way, adding a new method to <code>Attendable</code> (e.g., <code>void submitStandupNotes()</code>) never forces a recompile of code that only ever called <code>work()</code>. This composes directly with dependency inversion (next section): the whole point of depending on an abstraction is undermined if that abstraction is bloated enough to require irrelevant methods.
+<p>Code in <code>notification-service</code> that only needs to trigger an SMS on <code>OrderShipped</code> should depend on <code>SmsNotifiable</code>, not <code>OrderEventHandler</code> — that way, adding a new method to <code>AnalyticsUpdatable</code> (e.g., <code>void recordConversionFunnelStep(Order order)</code>) never forces a recompile of code that only ever called <code>sendSms()</code>. This composes directly with dependency inversion (next section): the whole point of depending on an abstraction is undermined if that abstraction is bloated enough to require irrelevant methods.</p>
 
 <h2>5. Dependency Inversion Principle (DIP)</h2>
 <p>DIP is the principle most people conflate with dependency injection, but they are not the same thing — DIP is the design rule, DI is one mechanical technique for satisfying it. DIP states: <strong>high-level modules (business policy) should not depend on low-level modules (implementation detail); both should depend on an abstraction</strong>. The abstraction is owned by the high-level module, not the low-level one — this reversal of ownership is why it's called "inversion."</p>
@@ -171,7 +172,7 @@ class OrderService {
 }
 class MySqlOrderRepository implements OrderRepository { ... }  // low-level detail, depends on the abstraction too</code></pre>
 
-<p>Now both <code>OrderService</code> (high-level) and <code>MySqlOrderRepository</code> (low-level) depend on <code>OrderRepository</code> — neither depends on the other directly. Swapping persistence technology means writing a new class that implements the interface; <code>OrderService</code> never changes. Testing means passing an in-memory fake or a Mockito mock that implements <code>OrderRepository</code>. This is precisely why Spring's dependency injection container is meaningful rather than a convenience: it doesn't cause you to follow DIP, it just automates the wiring once your code already follows DIP. Injecting a concrete class directly (`new MySqlOrderRepository()` via `@Autowired` on the concrete type) gives you Spring's object graph management but none of DIP's actual decoupling — see <a href="#/spring-core-mechanics">Spring Core Mechanics</a> for how the container resolves interface-typed dependencies to concrete beans at runtime.</p>
+<p>Now both <code>OrderService</code> (high-level) and <code>MySqlOrderRepository</code> (low-level) depend on <code>OrderRepository</code> — neither depends on the other directly. Swapping persistence technology means writing a new class that implements the interface; <code>OrderService</code> never changes. Testing means passing an in-memory fake or a Mockito mock that implements <code>OrderRepository</code>. This is precisely why Spring's dependency injection container is meaningful rather than a convenience: it doesn't cause you to follow DIP, it just automates the wiring once your code already follows DIP. Injecting a concrete class directly (<code>new MySqlOrderRepository()</code> via <code>@Autowired</code> on the concrete type) gives you Spring's object graph management but none of DIP's actual decoupling — see <a href="#/spring-core-mechanics">Spring Core Mechanics</a> for how the container resolves interface-typed dependencies to concrete beans at runtime.</p>
 
 <table>
 <tr><th>Principle</th><th>One-line test</th><th>What breaks if violated</th></tr>
@@ -182,42 +183,85 @@ class MySqlOrderRepository implements OrderRepository { ... }  // low-level deta
 <tr><td>DIP</td><td>Does the high-level class name a concrete low-level class?</td><td>Can't test without real infra; can't swap implementations</td></tr>
 </table>
 
-<h2>6. Creational Patterns: Deferring Object Construction</h2>
+<h2>6. The Gang-of-Four Taxonomy</h2>
+<p>The 23 patterns in the original "Gang of Four" (Erich Gamma, Richard Helm, Ralph Johnson, John Vlissides) catalog are grouped by <strong>what question they answer</strong>, not by how they look in UML. Creational patterns answer "how do I get an object without hard-wiring which concrete class or how many objects get built?" Structural patterns answer "how do I compose existing classes/objects into a larger shape without changing them?" Behavioral patterns answer "how do objects that already exist coordinate and communicate at runtime?" Sections 6–8 below cover the ones most likely to show up in a Java/Spring codebase — this tree places them against the full catalog so you can see what's deliberately out of scope.</p>
+<pre><code>Gang-of-Four Design Patterns
+│
+├── Creational  — controls HOW and WHEN objects get constructed
+│     ├── Factory Method     — one method decides which subclass to instantiate   [section 6]
+│     ├── Abstract Factory   — produces a whole family of related objects         [section 6]
+│     ├── Builder            — assembles a complex object step by step            [section 6]
+│     ├── Singleton          — exactly one instance, globally reachable           [section 6]
+│     └── Prototype          — creates new objects by cloning an existing one     (rare in Java; see note below)
+│
+├── Structural  — controls HOW existing classes/objects are composed
+│     ├── Adapter            — translates one interface into another             [section 7]
+│     ├── Decorator          — layers behavior onto an object, same interface     [section 7]
+│     ├── Facade             — one simplified entry point over a complex subsystem
+│     ├── Composite          — treats a tree of objects and single objects uniformly
+│     ├── Proxy              — stands in for another object (lazy load, access control, remote call)
+│     ├── Bridge             — separates an abstraction from its implementation so both vary independently
+│     └── Flyweight           — shares immutable state across many logically-distinct objects to save memory
+│
+└── Behavioral  — controls HOW objects interact and share responsibility at runtime
+      ├── Strategy           — swappable algorithm/behavior behind one interface  [section 8]
+      ├── Observer           — subject notifies decoupled listeners of a change   [section 8]
+      ├── State              — behavior changes as an object's internal state changes [section 8]
+      ├── Template Method    — superclass fixes an algorithm's skeleton, subclasses fill in steps
+      ├── Chain of Responsibility — a request passes along a chain until something handles it
+      ├── Command            — encapsulates a request as an object (undo/redo, queuing)
+      ├── Iterator           — sequential access to a collection without exposing its structure
+      ├── Mediator           — centralizes how a set of objects communicate, so they don't reference each other directly
+      ├── Visitor            — adds a new operation over a class hierarchy without editing the hierarchy
+      └── Memento            — captures/restores an object's internal state without violating encapsulation</code></pre>
+<div class="callout">
+<div class="callout-title">Why Prototype is rare in idiomatic Java</div>
+<p>Prototype solves "creating a new instance is more expensive than copying an existing one" by cloning a pre-configured prototype object instead of running its constructor from scratch. Java exposes a built-in hook for this (<code>Object.clone()</code> plus the <code>Cloneable</code> marker interface), but that mechanism is widely considered a design mistake in the language itself — <code>clone()</code> performs a shallow copy by default, <code>Cloneable</code> declares no actual clone method, and getting deep-copy semantics right requires overriding <code>clone()</code> carefully in every subclass. Most modern Java code gets the same effect more safely via a copy constructor or a static factory method (e.g. <code>Product.copyOf(existing)</code>), which is why Prototype rarely appears by name in Java codebases even though the underlying need — cheap duplication of a pre-built object, such as cloning a seller's "template" <code>Product</code> listing into a new one with a different SKU — still comes up.</p>
+</div>
+<p>The rest of this page covers Creational, Structural, and Behavioral patterns in that order, focusing on the subset that recurs constantly in Spring/Java backend code: Factory Method, Abstract Factory, Singleton, and Builder (Creational); Adapter and Decorator (Structural); Strategy, Observer, and State (Behavioral).</p>
+
 <h3>Factory Method &amp; Abstract Factory</h3>
 <p>Reach for a factory when <strong>the exact concrete type needed isn't known until runtime</strong> — it depends on configuration, user input, or a request parameter — and you want callers to depend only on an interface, never on a constructor of a specific implementation (which would itself be a DIP violation).</p>
-<pre><code>interface NotificationSender { void send(String msg); }
+<pre><code>interface ShippingProvider {
+    ShippingLabel createLabel(Order order, Address destination);
+    Duration estimatedTransitTime(Address destination);
+}
 
-class NotificationFactory {
-    static NotificationSender create(String channel) {
-        return switch (channel) {
-            case "EMAIL" -> new EmailSender();
-            case "SMS"   -> new SmsSender();
-            case "PUSH"  -> new PushSender();
-            default -> throw new IllegalArgumentException(channel);
+class ShippingProviderFactory {
+    static ShippingProvider create(String carrierCode) {
+        return switch (carrierCode) {
+            case "FEDEX"  -> new FedExProvider();
+            case "UPS"    -> new UpsProvider();
+            case "USPS"   -> new UspsProvider();
+            default -> throw new IllegalArgumentException("Unknown carrier: " + carrierCode);
         };
     }
-}</code></pre>
-<p>Factory Method defers creation to a single method (often overridden per-subclass); <strong>Abstract Factory</strong> goes one level further and produces an entire family of related objects that must stay consistent with each other — e.g., a <code>UIFactory</code> interface with <code>DarkThemeFactory</code> and <code>LightThemeFactory</code> implementations, each producing a matching <code>Button</code>, <code>Checkbox</code>, and <code>ScrollBar</code> so you never accidentally mix a dark-theme button with a light-theme scrollbar. Use Abstract Factory specifically when creation decisions need to be made as a coordinated group, not independently per object.</p>
+}
+
+// order-service picks a provider per shipment without ever naming a concrete class:
+ShippingProvider provider = ShippingProviderFactory.create(order.getSelectedCarrier());
+ShippingLabel label = provider.createLabel(order, order.getShippingAddress());</code></pre>
+<p>Factory Method defers creation to a single method (often overridden per-subclass); <strong>Abstract Factory</strong> goes one level further and produces an entire family of related objects that must stay consistent with each other. In ShopSphere terms: a <code>RegionalCheckoutFactory</code> interface with <code>UsCheckoutFactory</code> and <code>EuCheckoutFactory</code> implementations, each producing a matching <code>TaxCalculator</code>, <code>PaymentGateway</code>, and <code>InvoiceFormatter</code> for that region — so checkout never accidentally combines EU VAT rules with a US-only payment gateway. Use Abstract Factory specifically when creation decisions need to be made as a coordinated group, not independently per object.</p>
 
 <h3>Singleton — and why it's dangerous</h3>
-<p>Singleton restricts a class to exactly one instance, reachable globally. It's tempting for things like configuration readers or connection pools, but it comes with real costs: it introduces <strong>global mutable state</strong> (any code, anywhere, can read or mutate the single instance, making reasoning about state changes non-local), it makes <strong>testing harder</strong> (tests can't easily substitute a fake instance, and state leaks between tests unless explicitly reset), and naive lazy-initialization implementations have subtle <strong>thread-safety bugs</strong>.</p>
+<p>Singleton restricts a class to exactly one instance, reachable globally. It's tempting for things like configuration readers or connection pools — e.g. a single <code>ShopSphereFeatureFlags</code> object read by every service instance to decide whether a new checkout flow is enabled — but it comes with real costs: it introduces <strong>global mutable state</strong> (any code, anywhere, can read or mutate the single instance, making reasoning about state changes non-local), it makes <strong>testing harder</strong> (tests can't easily substitute a fake instance, and state leaks between tests unless explicitly reset), and naive lazy-initialization implementations have subtle <strong>thread-safety bugs</strong>.</p>
 <pre><code>// BROKEN under concurrency: two threads can both see instance == null
-class Config {
-    private static Config instance;
-    static Config getInstance() {
+class FeatureFlags {
+    private static FeatureFlags instance;
+    static FeatureFlags getInstance() {
         if (instance == null) {           // race window here
-            instance = new Config();
+            instance = new FeatureFlags();
         }
         return instance;
     }
 }</code></pre>
 <p>Synchronizing the whole method works but serializes every call forever, even after the instance exists. The standard fix in Java is the <strong>initialization-on-demand holder idiom</strong>, which leans on the JVM's own classloading guarantees instead of explicit locking:</p>
-<pre><code>class Config {
-    private Config() {}
+<pre><code>class FeatureFlags {
+    private FeatureFlags() {}
     private static class Holder {
-        static final Config INSTANCE = new Config();  // built lazily, thread-safely
+        static final FeatureFlags INSTANCE = new FeatureFlags();  // built lazily, thread-safely
     }
-    static Config getInstance() {
+    static FeatureFlags getInstance() {
         return Holder.INSTANCE;
     }
 }</code></pre>
@@ -230,77 +274,98 @@ class Config {
 <h3>Builder</h3>
 <p>Builder solves telescoping constructors — the pattern where a class with many optional fields grows an ever-longer chain of overloaded constructors to cover every combination of "which optional fields are set."</p>
 <pre><code>// VIOLATION: telescoping constructors
-new HttpRequest("GET", url, null, null, 30, false);   // what do these positions mean?
+new ShippingLabel(order.getId(), carrier, null, null, true, false);   // what do these positions mean?
 
 // FIX: builder makes each optional field self-documenting and omittable
-HttpRequest req = HttpRequest.builder()
-    .method("GET")
-    .url(url)
-    .timeoutSeconds(30)
-    .build();  // headers and retry default sensibly, no positional guessing</code></pre>
+ShippingLabel label = ShippingLabel.builder()
+    .orderId(order.getId())
+    .carrier("FEDEX")
+    .insured(true)
+    .build();  // trackingNumber and signatureRequired default sensibly, no positional guessing</code></pre>
 <p>Builder is most valuable exactly when a class has several optional constructor parameters with sensible defaults — it turns an error-prone positional call into a readable, self-validating sequence, and lets the class remain immutable (all fields set once, at <code>build()</code>, rather than via mutable setters scattered through calling code).</p>
 
 <h2>7. Structural Patterns: Composing Existing Interfaces</h2>
 <h3>Adapter</h3>
-<p>Adapter solves a narrow, specific problem: you have a class whose interface doesn't match what your code expects, and you cannot (or should not) modify that class — it's a third-party library, a legacy class with other callers, or a class you don't own the source of.</p>
-<pre><code>// Third-party class you can't change:
-class LegacyXmlParser {
-    String parseToXmlString(byte[] data) { ... }
+<p>Adapter solves a narrow, specific problem: you have a class whose interface doesn't match what your code expects, and you cannot (or should not) modify that class — it's a third-party library, a legacy class with other callers, or a class you don't own the source of. ShopSphere's <code>payment-service</code> hits this constantly: onboarding a new acquiring bank almost never means that bank's SDK happens to expose the exact <code>PaymentGateway</code> shape defined in section 2's OCP fix.</p>
+<pre><code>// Legacy bank gateway SDK you can't change — synchronous, SOAP-style, its own status enum:
+class LegacyBankGatewaySdk {
+    BankGatewayResponse submitPayment(String merchantAccount, long amountInCents, String currencyCode) { ... }
+    // BankGatewayResponse.getStatusCode() returns "00" (success), "05" (declined), "96" (system error) - not our Payment.Status
 }
-// Your code expects this interface:
-interface JsonParser { String parseToJson(byte[] data); }
 
-// Adapter bridges the mismatch without touching LegacyXmlParser:
-class XmlToJsonAdapter implements JsonParser {
-    private final LegacyXmlParser legacy = new LegacyXmlParser();
-    public String parseToJson(byte[] data) {
-        String xml = legacy.parseToXmlString(data);
-        return convertXmlToJson(xml);
+// Your code expects this interface (defined in section 2's OCP fix):
+interface PaymentGateway {
+    Payment charge(Payment payment);
+}
+
+// Adapter bridges the mismatch without touching LegacyBankGatewaySdk:
+class LegacyBankGatewayAdapter implements PaymentGateway {
+    private final LegacyBankGatewaySdk legacySdk = new LegacyBankGatewaySdk();
+
+    public Payment charge(Payment payment) {
+        BankGatewayResponse resp = legacySdk.submitPayment(
+            MERCHANT_ACCOUNT, payment.getAmountInCents(), payment.getCurrencyCode());
+        return payment.withStatus(translateStatus(resp.getStatusCode())); // "00" -> CAPTURED, "05"/"96" -> FAILED
     }
 }</code></pre>
-<p>The signal that you need Adapter, specifically, is "the shapes are incompatible but the underlying capability is the same" — contrast this with Decorator below, where the interface already matches and you're adding behavior, not translating it.</p>
+<p>The signal that you need Adapter, specifically, is "the shapes are incompatible but the underlying capability is the same" — the legacy SDK genuinely can charge a card, it just speaks in merchant accounts, cents-as-<code>long</code>, and two-digit status codes instead of ShopSphere's <code>Payment</code> domain object and <code>Payment.Status</code> enum. Contrast this with Decorator below, where the interface already matches and you're adding behavior, not translating it. Making sure the same <code>Payment</code> is never double-charged if <code>submitPayment</code>'s response is lost after the call actually succeeded is a distinct concern the adapter itself doesn't solve — see <a href="#/payment-systems-idempotency">Payment Systems &amp; Idempotent Transactions</a> for how an <code>idempotencyKey</code> on <code>Payment</code> makes retries safe.</p>
 
 <h3>Decorator</h3>
-<p>Decorator attaches new behavior to an individual object at runtime, wrapping it behind the same interface, as an alternative to a combinatorial explosion of subclasses. If you had `Stream`, `BufferedStream`, `EncryptedStream`, `BufferedEncryptedStream`, `CompressedBufferedEncryptedStream`... you'd need a new subclass for every combination of behaviors. Decorator instead lets you compose independent wrappers at construction time.</p>
-<pre><code>interface DataSource { void write(String data); String read(); }
-
-class FileDataSource implements DataSource { ... }
-
-class EncryptionDecorator implements DataSource {
-    private final DataSource wrapped;
-    EncryptionDecorator(DataSource wrapped) { this.wrapped = wrapped; }
-    public void write(String data) { wrapped.write(encrypt(data)); }
-    public String read() { return decrypt(wrapped.read()); }
+<p>Decorator attaches new behavior to an individual object at runtime, wrapping it behind the same interface, as an alternative to a combinatorial explosion of subclasses. If ShopSphere needed a <code>StripeGateway</code>, a <code>RetryingStripeGateway</code>, a <code>LoggingStripeGateway</code>, and a <code>RetryingLoggingStripeGateway</code> — one subclass per combination of cross-cutting concerns — every new concern (metrics, circuit-breaking) would double the number of subclasses again. Decorator instead lets you compose independent wrappers at construction time, each implementing the same <code>PaymentGateway</code> interface from section 2 as the gateway it wraps:</p>
+<pre><code>class RetryingPaymentGateway implements PaymentGateway {
+    private final PaymentGateway wrapped;
+    RetryingPaymentGateway(PaymentGateway wrapped) { this.wrapped = wrapped; }
+    public Payment charge(Payment payment) {
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                return wrapped.charge(payment); // same idempotencyKey every attempt — safe to retry
+            } catch (TransientGatewayException e) {
+                if (attempt == 3) throw e;
+            }
+        }
+        throw new IllegalStateException("unreachable");
+    }
 }
 
-class CompressionDecorator implements DataSource {
-    private final DataSource wrapped;
-    CompressionDecorator(DataSource wrapped) { this.wrapped = wrapped; }
-    public void write(String data) { wrapped.write(compress(data)); }
-    public String read() { return decompress(wrapped.read()); }
+class LoggingPaymentGateway implements PaymentGateway {
+    private final PaymentGateway wrapped;
+    LoggingPaymentGateway(PaymentGateway wrapped) { this.wrapped = wrapped; }
+    public Payment charge(Payment payment) {
+        log.info("charging payment {}", payment.getIdempotencyKey());
+        Payment result = wrapped.charge(payment);
+        log.info("payment {} resulted in status {}", payment.getIdempotencyKey(), result.getStatus());
+        return result;
+    }
 }
 
 // Compose freely at the call site — no new class needed for this combination:
-DataSource source = new EncryptionDecorator(new CompressionDecorator(new FileDataSource()));</code></pre>
-<p>Java's own I/O library is the canonical real-world instance of this pattern: <code>new BufferedReader(new InputStreamReader(new FileInputStream(file)))</code> wraps a raw byte stream first with character-decoding behavior, then with buffering behavior, each layer implementing the same <code>Reader</code>/<code>InputStream</code> surface as the layer it wraps. This is precisely why the constructor chaining looks nested rather than flat — you're stacking decorators, not calling a single constructor with many arguments.</p>
+PaymentGateway gateway = new RetryingPaymentGateway(new LoggingPaymentGateway(new StripeGateway()));</code></pre>
+<p>Each decorator implements the exact same <code>PaymentGateway</code> interface as the object it wraps, so <code>ShopSpherePaymentProcessor.process</code> from section 2 can't tell — and doesn't need to know — whether it was handed a bare <code>StripeGateway</code> or three layers of decorators around one; it just calls <code>gateway.charge(payment)</code>. This is precisely why the constructor chaining above looks nested rather than flat — you're stacking decorators, not calling a single constructor with many arguments. Java's own I/O library is the canonical real-world instance of this same pattern: <code>new BufferedReader(new InputStreamReader(new FileInputStream(file)))</code> wraps a raw byte stream first with character-decoding behavior, then with buffering behavior, each layer implementing the same <code>Reader</code>/<code>InputStream</code> surface as the layer it wraps — structurally identical to stacking <code>RetryingPaymentGateway</code> and <code>LoggingPaymentGateway</code> around <code>StripeGateway</code> above.</p>
 
 <h2>8. Behavioral Patterns: Coordinating Runtime Interactions</h2>
 <h3>Strategy</h3>
-<p>Strategy encapsulates a family of interchangeable algorithms behind one interface and lets the caller select (or be configured with) whichever implementation applies, without the caller's code branching on type. This is the direct mechanical implementation of the <a href="#/spring-core-mechanics">Open/Closed Principle</a> described in section 2 — the <code>PaymentMethod</code> refactor earlier in this page <em>is</em> the Strategy pattern; OCP is the principle, Strategy is the reusable shape that satisfies it.</p>
-<pre><code>interface DiscountStrategy { double apply(double price); }
-class NoDiscount implements DiscountStrategy { public double apply(double p) { return p; } }
+<p>Strategy encapsulates a family of interchangeable algorithms behind one interface and lets the caller select (or be configured with) whichever implementation applies, without the caller's code branching on type. This is the direct mechanical implementation of the <a href="#/spring-core-mechanics">Open/Closed Principle</a> described in section 2 — the <code>PaymentGateway</code> refactor earlier in this page <em>is</em> the Strategy pattern; OCP is the principle, Strategy is the reusable shape that satisfies it.</p>
+<pre><code>interface DiscountStrategy { double apply(double subtotal); }
+class NoDiscount implements DiscountStrategy { public double apply(double subtotal) { return subtotal; } }
 class PercentageDiscount implements DiscountStrategy {
     private final double pct;
     PercentageDiscount(double pct) { this.pct = pct; }
-    public double apply(double p) { return p * (1 - pct); }
+    public double apply(double subtotal) { return subtotal * (1 - pct); }
+}
+class CouponDiscount implements DiscountStrategy {
+    private final Coupon coupon;   // e.g. code "FLASH25", percentOff=0.25, validUntil=...
+    CouponDiscount(Coupon coupon) { this.coupon = coupon; }
+    public double apply(double subtotal) {
+        return coupon.isExpired() ? subtotal : subtotal * (1 - coupon.getPercentOff());
+    }
 }
 
 class Cart {
-    private DiscountStrategy strategy;   // swappable at runtime
-    void setStrategy(DiscountStrategy s) { this.strategy = s; }
+    private DiscountStrategy strategy = new NoDiscount();   // swappable at runtime
+    void applyCoupon(Coupon coupon) { this.strategy = new CouponDiscount(coupon); }
     double checkoutTotal(double subtotal) { return strategy.apply(subtotal); }
 }</code></pre>
-<p>The signal for Strategy specifically (versus Factory) is that you're choosing <em>behavior</em>, potentially swapping it more than once during an object's lifetime, rather than choosing which concrete object to construct once. In Spring, this shows up constantly as multiple beans implementing one interface, injected as a <code>List&lt;DiscountStrategy&gt;</code> or selected via a <code>@Qualifier</code>.</p>
+<p>The signal for Strategy specifically (versus Factory) is that you're choosing <em>behavior</em>, potentially swapping it more than once during an object's lifetime (a customer can apply, then remove, then apply a different coupon before checking out), rather than choosing which concrete object to construct once. In Spring, this shows up constantly as multiple beans implementing one interface, injected as a <code>List&lt;DiscountStrategy&gt;</code> or selected via a <code>@Qualifier</code>.</p>
 
 <h3>Observer</h3>
 <p>Observer decouples a subject (the thing whose state changes) from the objects that need to react to those changes, so the subject never needs to know the concrete types — or even the number — of things watching it.</p>
@@ -310,22 +375,87 @@ class OrderSubject {
     private final List&lt;OrderListener&gt; listeners = new ArrayList&lt;&gt;();
     void subscribe(OrderListener l) { listeners.add(l); }
     void placeOrder(Order order) {
-        // ... persist order ...
+        // ... persist order, set status CREATED ...
         for (OrderListener l : listeners) l.onOrderPlaced(order);  // subject doesn't know or care who's listening
     }
 }
 
 class EmailNotifier implements OrderListener {
-    public void onOrderPlaced(Order order) { /* send confirmation email */ }
+    public void onOrderPlaced(Order order) { /* send order-confirmation email via notification-service */ }
 }
-class InventoryUpdater implements OrderListener {
-    public void onOrderPlaced(Order order) { /* decrement stock */ }
+class InventoryReserver implements OrderListener {
+    public void onOrderPlaced(Order order) { /* reserve stock in inventory-service for each OrderItem */ }
 }</code></pre>
-<p>Adding a new reaction to "order placed" (say, triggering a fraud check) means writing a new <code>OrderListener</code> and subscribing it — <code>OrderSubject</code> itself never changes, which is Observer and OCP reinforcing each other. This is the same shape underlying Java's own event listener interfaces (<code>ActionListener</code>, <code>PropertyChangeListener</code>), Spring's <code>ApplicationEventPublisher</code>/<code>@EventListener</code> mechanism, and — at a larger scale — the publish/subscribe model behind message brokers, where the "subject" is a topic and "listeners" are consumer groups that can be added or removed without the producer's code changing at all.</p>
+<p>Adding a new reaction to "order placed" (say, triggering a fraud check) means writing a new <code>OrderListener</code> and subscribing it — <code>OrderSubject</code> itself never changes, which is Observer and OCP reinforcing each other. This is the same shape underlying Java's own event listener interfaces (<code>ActionListener</code>, <code>PropertyChangeListener</code>), Spring's <code>ApplicationEventPublisher</code>/<code>@EventListener</code> mechanism, and — at a larger scale — the publish/subscribe model behind message brokers: in a microservices framing of ShopSphere, <code>order-service</code> doesn't call <code>InventoryReserver</code> or <code>EmailNotifier</code> directly at all — it publishes an <code>OrderPlaced</code> event onto a Kafka topic, and <code>inventory-service</code> and <code>notification-service</code> each consume it independently as their own consumer group. The "subject" is the topic, "listeners" are consumer groups that can be added or removed without <code>order-service</code>'s code changing at all — the exact same decoupling Observer gives you in-process, just crossing a process boundary.</p>
+
+<h3>State</h3>
+<p>State lets an object change its behavior as its internal state changes, by giving each state its own class that implements a shared interface, rather than scattering <code>if (status == X)</code> checks across every method that needs to behave differently per state. The signal for State, specifically, is that you have an object whose set of <em>legal operations and legal transitions</em> genuinely differs by state — not just a value that happens to vary.</p>
+<p>An <code>Order</code>'s lifecycle is the canonical example: <code>CREATED → PAID → SHIPPED → DELIVERED</code>, with <code>CANCELLED</code> reachable from some but not all of those states.</p>
+<pre><code>          pay()          ship()          deliver()
+CREATED --------> PAID --------> SHIPPED ----------> DELIVERED   (terminal)
+   |                |
+   | cancel()        | cancel()
+   v                v
+        CANCELLED   (terminal — unreachable once SHIPPED)</code></pre>
+<p>Modeling this with a raw enum field and conditionals scattered across <code>OrderService</code> means every new status or every new rule about which transitions are legal touches many unrelated methods:</p>
+<pre><code>// VIOLATION: transition legality logic scattered across the service, easy to get wrong per-method
+class OrderService {
+    void cancel(Order order) {
+        if (order.getStatus() == OrderStatus.SHIPPED || order.getStatus() == OrderStatus.DELIVERED) {
+            throw new IllegalStateException("Cannot cancel a shipped order");
+        }
+        order.setStatus(OrderStatus.CANCELLED);
+    }
+    void markPaid(Order order) {
+        if (order.getStatus() != OrderStatus.CREATED) {
+            throw new IllegalStateException("Only a CREATED order can be paid");
+        }
+        order.setStatus(OrderStatus.PAID);
+    }
+    // ... markShipped(), markDelivered() each re-implement their own ad hoc legality check
+}</code></pre>
+<pre><code>// FIX: each state is a class that knows its own legal transitions
+interface OrderState {
+    OrderState pay(Order order);
+    OrderState ship(Order order);
+    OrderState cancel(Order order);
+    default OrderState deliver(Order order) { throw new IllegalStateException("Cannot deliver from " + this); }
+}
+
+class CreatedState implements OrderState {
+    public OrderState pay(Order order) { order.setStatus(OrderStatus.PAID); return new PaidState(); }
+    public OrderState ship(Order order) { throw new IllegalStateException("Cannot ship before payment"); }
+    public OrderState cancel(Order order) { order.setStatus(OrderStatus.CANCELLED); return new CancelledState(); }
+}
+class PaidState implements OrderState {
+    public OrderState pay(Order order) { throw new IllegalStateException("Already paid"); }
+    public OrderState ship(Order order) { order.setStatus(OrderStatus.SHIPPED); return new ShippedState(); }
+    public OrderState cancel(Order order) { order.setStatus(OrderStatus.CANCELLED); return new CancelledState(); }
+}
+class ShippedState implements OrderState {
+    public OrderState pay(Order order) { throw new IllegalStateException("Already paid"); }
+    public OrderState ship(Order order) { throw new IllegalStateException("Already shipped"); }
+    public OrderState cancel(Order order) { throw new IllegalStateException("Cannot cancel after shipping"); }
+    public OrderState deliver(Order order) { order.setStatus(OrderStatus.DELIVERED); return new DeliveredState(); }
+}
+// DeliveredState and CancelledState are terminal: every method throws, by inheriting the default or overriding similarly.
+
+// Order delegates instead of branching:
+class Order {
+    private OrderState state = new CreatedState();
+    void pay()    { this.state = state.pay(this); }
+    void ship()   { this.state = state.ship(this); }
+    void cancel() { this.state = state.cancel(this); }
+}</code></pre>
+<p>Adding a new status (say, <code>RETURN_REQUESTED</code>) means writing one new <code>OrderState</code> implementation and deciding which existing states' transition methods should return it — no existing state class needs to change unless it should now also allow transitioning into the new state, which is Open/Closed reinforcing State exactly the way it reinforces Strategy. The legality of every transition also now lives in exactly one place per state, instead of being re-derived (and potentially re-derived <em>inconsistently</em>) in every service method that happens to touch <code>Order</code>.</p>
+<div class="callout">
+<div class="callout-title">State versus Strategy: same shape, different intent</div>
+<p>Structurally, State and Strategy look identical — both are "an interface with a family of implementations, held as a field and delegated to." The difference is entirely about <em>who changes the field and why</em>. With Strategy, the caller explicitly picks a strategy from the outside based on its own criteria (a customer applies a specific coupon), and the strategy object itself never causes a change to some other strategy. With State, the current state object itself decides and returns the next state as a direct consequence of the operation performed on it (calling <code>pay()</code> is what causes the transition from <code>CreatedState</code> to <code>PaidState</code>) — the object's behavior is intrinsically tied to a lifecycle, and transitions are usually constrained (not every state can reach every other state), whereas Strategy implementations are typically freely interchangeable with no such constraint.</p>
+</div>
 
 <div class="callout tip">
 <div class="callout-title">Patterns are named shapes, not goals</div>
-<p>None of these patterns are things to apply for their own sake — each one is a named answer to a specific recurring problem shape (unknown-type-until-runtime, one-instance-needed, many-optional-fields, incompatible-interfaces, behavior-composition, algorithm-swapping, decoupled-reaction). The skill worth building is recognizing the problem shape in an unfamiliar codebase and reaching for the matching pattern — not memorizing UML diagrams.</p>
+<p>None of these patterns are things to apply for their own sake — each one is a named answer to a specific recurring problem shape (unknown-type-until-runtime, one-instance-needed, many-optional-fields, incompatible-interfaces, behavior-composition, algorithm-swapping, decoupled-reaction, lifecycle-constrained-behavior). The skill worth building is recognizing the problem shape in an unfamiliar codebase and reaching for the matching pattern — not memorizing UML diagrams.</p>
 </div>
 
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
@@ -365,10 +495,21 @@ class InventoryUpdater implements OrderListener {
 <div class="qa-body">Two compounding problems appear as more implementers and callers accumulate. First, implementers that can't meaningfully support every method end up throwing <code>UnsupportedOperationException</code> or returning silent no-ops, which turns compile-time type safety into a runtime landmine — code compiles cleanly against the interface but fails only when a specific method is actually invoked on a specific implementer. Second, every caller of the fat interface becomes coupled to methods it never calls: adding or changing a method signature anywhere on the interface forces recompilation and re-review of callers that only ever used a different, unrelated method, which slows down otherwise-unrelated changes and increases the blast radius of code review. Splitting into focused interfaces bounds both problems to only the callers and implementers that actually care about each capability.</div>
 </details>
 
+<details class="concept-qa">
+<summary>State and Strategy have nearly identical class diagrams. What actually distinguishes when to reach for one versus the other?</summary>
+<div class="qa-body">Both are "an interface, a family of implementations, one held as a field and delegated to" — the UML diagrams genuinely look the same. The distinguishing question is who changes the field, and why. With Strategy, the object holding the field never changes it itself as a side effect of doing its work — some external caller picks a strategy based on its own criteria (a customer chooses to apply a specific coupon), and the strategies are normally freely interchangeable with no ordering constraint between them. With State, the current state object itself returns the next state as a direct, intrinsic consequence of the operation being performed — calling <code>pay()</code> on an Order in <code>CreatedState</code> is precisely what causes the transition to <code>PaidState</code>, and the transitions are constrained: you cannot jump from <code>CreatedState</code> to <code>ShippedState</code> directly. If the "different cases" you're modeling are freely swappable and chosen from outside, it's Strategy. If they represent stages of a lifecycle where the current stage dictates both behavior and which stages can come next, it's State.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does modeling Order status as a State-pattern class hierarchy scale better than a single enum field with scattered if-checks, once an Order gains more than two or three statuses?</summary>
+<div class="qa-body">With a raw enum plus conditionals, the rule "which transitions are legal from this status" is not stored anywhere as a single fact — it's implicitly re-derived, separately, inside every method that happens to touch the Order (cancel(), pay(), ship(), refund(), and any future method). Each of those re-derivations can drift out of sync with the others as the system evolves, which is exactly how a bug like "a DELIVERED order can still be cancelled because someone forgot to add that check to the newest method" gets introduced. Modeling each status as its own class implementing a shared OrderState interface consolidates that fact into exactly one place per state — CreatedState's methods are the single source of truth for everything that's legal from CREATED — so adding a new status or a new legal transition means writing or editing one class, not auditing every method that touches Order for a missed case. It's the same benefit Open/Closed and Strategy provide, applied specifically to lifecycle-shaped state rather than to swappable algorithms.</div>
+</details>
+
 <h2>Related Topics</h2>
 <div class="related-grid">
 <div class="related-card" onclick="window.location.hash='/spring-core-mechanics'"><div class="rc-title">Spring Core Mechanics</div><div class="rc-sub">Days 26–30 · How the IoC container automates dependency injection once your classes already follow DIP</div></div>
 <div class="related-card" onclick="window.location.hash='/lld-parking-lot'"><div class="rc-title">LLD: Parking Lot</div><div class="rc-sub">Days 36–40 · Applies SRP, Strategy, and Factory together in a full class-design exercise</div></div>
 <div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience & Fault Tolerance</div><div class="rc-sub">Days 46–50 · Circuit breakers and retry policies are commonly implemented as Strategy/Decorator wrappers</div></div>
 <div class="related-card" onclick="window.location.hash='/modern-java-features'"><div class="rc-title">Modern Java Features</div><div class="rc-sub">Days 21–25 · Records and sealed interfaces change how cleanly you can express Strategy and Factory outputs</div></div>
+<div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'"><div class="rc-title">Payment Systems & Idempotent Transactions</div><div class="rc-sub">The Adapter-wrapped PaymentGateway in section 7 still needs an idempotencyKey to make retried charge() calls safe</div></div>
 </div>

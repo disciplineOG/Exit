@@ -16,8 +16,34 @@
 </div>
 
 <h2>1. The Persistence Context: Identity Map and First-Level Cache</h2>
-<p>A <code>Session</code> (Hibernate) or <code>EntityManager</code> (JPA) is backed by a <strong>persistence context</strong> — a per-transaction (by default) in-memory map from entity identity (entity type + primary key) to a managed Java object. This is not a general-purpose cache in the sense of "reduce database load across requests"; it exists to guarantee a much stricter property: <strong>within one persistence context, there is exactly one Java object representing a given row.</strong></p>
+<p>A <code>Session</code> (Hibernate) or <code>EntityManager</code> (JPA — <code>EntityManager</code> is the JPA-standard interface; Hibernate's native <code>Session</code> extends it, so almost everything below applies to both names for the same object) is backed by a <strong>persistence context</strong> — a per-transaction (by default) in-memory map from entity identity (entity type + primary key) to a managed Java object. This is not a general-purpose cache in the sense of "reduce database load across requests"; it exists to guarantee a much stricter property: <strong>within one persistence context, there is exactly one Java object representing a given row.</strong></p>
 <p>Concretely: if you call <code>entityManager.find(Order.class, 5L)</code> twice inside the same transaction, the second call does not hit the database at all — it returns the exact same object reference as the first call, verifiable with <code>==</code>. This is called the <strong>identity map</strong> pattern, and it exists to solve a real problem: without it, loading the same row twice would give you two different Java objects, and if you mutated both, whichever got flushed last would silently win, with no way to detect the conflict at the object-graph level. The identity map guarantees that "the same row" and "the same object" are the same statement anywhere within a transaction, which is what lets Hibernate track changes coherently.</p>
+<h3>Where Session/EntityManager sits: the object hierarchy</h3>
+<p>These names — <code>SessionFactory</code>, <code>Session</code>, <code>EntityManagerFactory</code>, <code>EntityManager</code>, persistence context — are frequently used loosely. They map onto a small, fixed hierarchy with very different lifetimes and cardinalities:</p>
+<pre><code>SessionFactory  (Hibernate native)  ==  EntityManagerFactory  (JPA standard)
+  - built ONCE per application (per database, per Hibernate/JPA config) at startup
+  - expensive to create: parses all @Entity mappings, builds the metamodel, primes caches
+  - thread-safe, shared across the entire application
+  - owns the (optional) second-level cache, which DOES span transactions/requests
+  - in Spring Boot, this is created for you once from your DataSource + entity scan config
+       |
+       | .openSession() / .createEntityManager()  -- cheap, called per unit of work
+       v
+Session  (Hibernate native)  ==  EntityManager  (JPA standard interface Session extends)
+  - created PER TRANSACTION (typical Spring Data default) or per HTTP request (if OSIV is on)
+  - NOT thread-safe -- never share one across threads
+  - wraps exactly one persistence context (the identity map + dirty-check snapshots + action queue)
+  - in Spring Data JPA, you rarely call this API directly -- @Transactional + repository
+    methods obtain and close one for you around the method boundary
+       |
+       | .find() / .persist() / .createQuery() / .getReference() ...
+       v
+Persistence Context
+  - the identity map: (EntityType, id) -> managed Java object
+  - snapshots of loaded/flushed state, used for dirty checking (section 2)
+  - the pending-action queue: queued inserts/updates/deletes (section 7, write-behind)
+  - scoped 1:1 to its owning Session/EntityManager -- destroyed when it closes</code></pre>
+<p>The practical consequence of this shape: a <code>SessionFactory</code>/<code>EntityManagerFactory</code> is safe to hold as a long-lived singleton bean and share across every thread in your application, but a <code>Session</code>/<code>EntityManager</code> it hands out is a short-lived, single-threaded, single-unit-of-work object — which is exactly why Spring wires one <code>EntityManager</code> per transaction behind the scenes rather than reusing one across requests. Trying to reuse a <code>Session</code> across threads (e.g. caching it as a field on a singleton <code>@Service</code>) is a correctness bug waiting to happen, since two threads would be silently sharing one identity map, one dirty-check snapshot set, and one pending-action queue.</p>
 <h3>What actually lives in the persistence context</h3>
 <ul>
 <li>The identity map itself (id → managed entity).</li>
@@ -37,6 +63,14 @@ public void renameCustomer(Long id, String newName) {
     Customer c = customerRepository.findById(id).orElseThrow();
     c.setName(newName); // no save() call
 } // flush happens here, at commit</code></pre>
+<p>The same mechanism is what makes order-status transitions work without an explicit save:</p>
+<pre><code>@Transactional
+public void markShipped(Long orderId) {
+    Order order = orderRepository.findById(orderId).orElseThrow();
+    order.setStatus(OrderStatus.SHIPPED); // managed entity, mutated via setter
+    // no repository.save(order) anywhere -- Hibernate detects the changed
+    // 'status' field at flush time and issues UPDATE orders SET status = ? WHERE id = ?
+}</code></pre>
 <p><code>findById</code> returns a <em>managed</em> entity — one attached to the persistence context. Mutating it marks the context dirty for that entity. At transaction commit, Hibernate flushes: it walks every managed entity, diffs against its stored snapshot, and generates the necessary <code>UPDATE</code> for any entity whose fields changed. If you had instead called a query method that returns a DTO or a detached entity, this would not work — there'd be nothing to dirty-check.</p>
 <div class="callout warn">
 <div class="callout-title">Dirty checking cost scales with entity size and field count</div>
@@ -67,45 +101,126 @@ public void renameCustomer(Long id, String newName) {
 <h2>4. The N+1 Query Problem</h2>
 <p>This is the most common Hibernate performance defect in production code, and it is a direct consequence of lazy loading combined with iteration.</p>
 <pre><code>@Entity
-class Department {
+class Seller {
     @Id Long id;
-    @OneToMany(mappedBy = "department", fetch = FetchType.LAZY)
-    List&lt;Employee&gt; employees;
+    String businessName;
+
+    @OneToMany(mappedBy = "seller", fetch = FetchType.LAZY)
+    List&lt;Product&gt; products;
 }
 
-List&lt;Department&gt; depts = departmentRepository.findAll(); // 1 query
-for (Department d : depts) {
-    System.out.println(d.getEmployees().size()); // 1 query PER department
+@Entity
+class Product {
+    @Id Long id;
+    String name;
+    BigDecimal price;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "seller_id")
+    Seller seller;
+}
+
+List&lt;Seller&gt; sellers = sellerRepository.findAll(); // 1 query
+for (Seller s : sellers) {
+    System.out.println(s.getProducts().size()); // 1 query PER seller
 }</code></pre>
-<p><code>findAll()</code> issues one <code>SELECT * FROM department</code>. Because <code>employees</code> is <code>LAZY</code>, Hibernate populates each <code>Department</code> with a proxy collection that has not been initialized. The moment you call <code>.size()</code> (or iterate it, or call any method that forces initialization), Hibernate issues a fresh <code>SELECT * FROM employee WHERE department_id = ?</code> for <em>that one</em> department. With 50 departments, that's 1 + 50 = 51 queries — the "N+1." The failure mode is insidious precisely because it's invisible in unit tests with small datasets and only becomes a visible latency problem at production scale, where N is in the hundreds or thousands.</p>
+<p><code>findAll()</code> issues one <code>SELECT * FROM seller</code>. Because <code>products</code> is <code>LAZY</code>, Hibernate populates each <code>Seller</code> with a proxy collection that has not been initialized. The moment you call <code>.size()</code> (or iterate it, or call any method that forces initialization), Hibernate issues a fresh <code>SELECT * FROM product WHERE seller_id = ?</code> for <em>that one</em> seller. With 50 sellers on an admin "sellers overview" dashboard, that's 1 + 50 = 51 queries — the "N+1." The failure mode is insidious precisely because it's invisible in unit tests with a handful of test sellers and only becomes a visible latency problem at production scale, where N is in the hundreds or thousands — e.g. an admin screen listing every seller alongside their live product count during a catalog audit.</p>
 <h3>The fixes, and their trade-offs</h3>
 <table>
 <tr><th>Fix</th><th>Mechanism</th><th>Trade-off</th></tr>
-<tr><td><code>JOIN FETCH</code></td><td>Explicit JPQL that eagerly loads the association in the same query, via a SQL join</td><td>Fast, one round trip; but combining <code>JOIN FETCH</code> with pagination on the "many" side produces incorrect or memory-exploding results (Hibernate warns and, in some cases, paginates in memory) — don't paginate a query that fetch-joins a collection</td></tr>
+<tr><td><code>JOIN FETCH</code></td><td>Explicit JPQL that eagerly loads the association in the same query, via a SQL join — e.g. <code>SELECT s FROM Seller s JOIN FETCH s.products</code></td><td>Fast, one round trip; but combining <code>JOIN FETCH</code> with pagination on the "many" side produces incorrect or memory-exploding results (Hibernate warns and, in some cases, paginates in memory) — don't paginate a query that fetch-joins a collection</td></tr>
 <tr><td><code>@EntityGraph</code></td><td>Declarative annotation telling Spring Data which associations to eagerly fetch for a specific repository method, without hand-writing JPQL joins</td><td>Cleaner and composable per-query, but under the hood still generates a join (or a secondary <code>SELECT</code> depending on the graph type), so the same pagination caveat can apply</td></tr>
-<tr><td>Batch fetching (<code>@BatchSize</code> or <code>hibernate.default_batch_fetch_size</code>)</td><td>Instead of one query per parent, Hibernate groups pending lazy initializations and issues one query per batch using <code>WHERE department_id IN (?, ?, ..., ?)</code></td><td>Turns N+1 into roughly N/batchSize+1 queries; doesn't eliminate extra round trips entirely but drastically reduces them, and works fine with pagination since it doesn't change the shape of the original query</td></tr>
+<tr><td>Batch fetching (<code>@BatchSize</code> or <code>hibernate.default_batch_fetch_size</code>)</td><td>Instead of one query per parent, Hibernate groups pending lazy initializations and issues one query per batch using <code>WHERE seller_id IN (?, ?, ..., ?)</code></td><td>Turns N+1 into roughly N/batchSize+1 queries; doesn't eliminate extra round trips entirely but drastically reduces them, and works fine with pagination since it doesn't change the shape of the original query</td></tr>
 </table>
 <div class="callout tip">
 <div class="callout-title">Picking between them</div>
-<p><code>JOIN FETCH</code> / <code>@EntityGraph</code> are best when you know, for a specific use case, that you always need the association and there's no pagination involved. Batch fetching is the pragmatic default for list-then-paginate screens where you sometimes need the association and can't safely fetch-join. A DTO projection (see below) sidesteps the whole question by never loading the entity graph at all.</p>
+<p><code>JOIN FETCH</code> / <code>@EntityGraph</code> are best when you know, for a specific use case, that you always need the association and there's no pagination involved — e.g. rendering a single seller's full storefront with all products in one screen. Batch fetching is the pragmatic default for list-then-paginate screens where you sometimes need the association and can't safely fetch-join — e.g. a paginated admin sellers list where an expand-to-view-products interaction is optional. A DTO projection (see below) sidesteps the whole question by never loading the entity graph at all.</p>
 </div>
+<h3>The same problem, one level deeper: Order → OrderItem → Product</h3>
+<p>N+1 compounds across chained associations. Loading a customer's order history and then, for each order, iterating its line items and then, for each line item, touching the referenced product is a textbook two-level N+1:</p>
+<pre><code>@Entity
+class Order {
+    @Id Long id;
+    Long customerId;
+    OrderStatus status;
+    BigDecimal totalAmount;
+
+    @OneToMany(mappedBy = "order", fetch = FetchType.LAZY, cascade = CascadeType.ALL)
+    List&lt;OrderItem&gt; items;
+}
+
+@Entity
+class OrderItem {
+    @Id Long id;
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "order_id")
+    Order order;
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "product_id")
+    Product product;
+    int quantity;
+    BigDecimal unitPriceAtPurchase;
+}
+
+// order history screen: 1 (orders) + N (items per order) + M (product per item) queries
+for (Order o : orderRepository.findByCustomerId(customerId)) {
+    for (OrderItem item : o.getItems()) {        // N+1 #1: items per order
+        System.out.println(item.getProduct().getName()); // N+1 #2: product per item
+    }
+}</code></pre>
+<p>The fix composes the same way the problem does — a single JPQL query can fetch-join both levels at once: <code>SELECT DISTINCT o FROM Order o JOIN FETCH o.items i JOIN FETCH i.product WHERE o.customerId = :customerId</code> (the <code>DISTINCT</code> matters here because a fetch join across a one-to-many produces one result row per <code>OrderItem</code>, which would otherwise duplicate the parent <code>Order</code> in the returned list once per item).</p>
 
 <h2>5. Lazy vs Eager Loading and LazyInitializationException</h2>
-<p><code>FetchType.LAZY</code> defers loading an association until it's actually accessed; <code>FetchType.EAGER</code> loads it immediately as part of the owning entity's query (via a join or a secondary select). JPA's defaults are easy to get backwards from memory: <code>@ManyToOne</code> and <code>@OneToOne</code> default to <code>EAGER</code>; <code>@OneToMany</code> and <code>@ManyToMany</code> default to <code>LAZY</code>. In practice, almost everyone overrides the defaults to make every association <code>LAZY</code> explicitly, because eager loading composes badly: if entity A eagerly loads B, and B eagerly loads C, fetching a single A can silently pull in a much larger object graph than intended, and that cost is invisible at the call site — nothing in <code>repository.findById(id)</code> tells you how much data is about to come back.</p>
+<p><code>FetchType.LAZY</code> defers loading an association until it's actually accessed; <code>FetchType.EAGER</code> loads it immediately as part of the owning entity's query (via a join or a secondary select). JPA's defaults are easy to get backwards from memory: <code>@ManyToOne</code> and <code>@OneToOne</code> default to <code>EAGER</code>; <code>@OneToMany</code> and <code>@ManyToMany</code> default to <code>LAZY</code>. In practice, almost everyone overrides the defaults to make every association <code>LAZY</code> explicitly, because eager loading composes badly: if <code>Product</code> eagerly loads its <code>Seller</code>, and <code>Seller</code> eagerly loads its full <code>products</code> list, fetching a single <code>Product</code> can silently pull in that seller's entire catalog, and that cost is invisible at the call site — nothing in <code>productRepository.findById(id)</code> tells you how much data is about to come back.</p>
 <p>The cost of choosing <code>LAZY</code> everywhere is the risk of <code>LazyInitializationException</code>: Hibernate represents a lazy association with a proxy object (for <code>@ManyToOne</code>/<code>@OneToOne</code>) or a lazy-loading collection wrapper (for <code>@OneToMany</code>/<code>@ManyToMany</code>). That proxy holds a reference back to the <code>Session</code> that created it. If you try to access the association <em>after</em> that session has closed — which, in a typical Spring Data setup, happens right after your <code>@Transactional</code> method returns — there is no active session left to run the initialization query, and Hibernate throws rather than silently returning null or stale data.</p>
 <pre><code>@Transactional(readOnly = true)
-public Department getDepartment(Long id) {
-    return departmentRepository.findById(id).orElseThrow();
+public Seller getSeller(Long id) {
+    return sellerRepository.findById(id).orElseThrow();
 } // session closes here
 
 // later, in a controller or view:
-department.getEmployees().size(); // LazyInitializationException — no session</code></pre>
+seller.getProducts().size(); // LazyInitializationException — no session</code></pre>
 <h3>The standard fixes</h3>
 <ul>
-<li><strong>Fetch joins:</strong> write the query to eagerly bring in exactly the associations the caller needs, scoped to that one use case, rather than changing the mapping's global fetch type.</li>
+<li><strong>Fetch joins:</strong> write the query to eagerly bring in exactly the associations the caller needs, scoped to that one use case (e.g. a "seller storefront" query that fetch-joins <code>products</code>), rather than changing the mapping's global fetch type.</li>
 <li><strong>DTO projections:</strong> query directly into a flat DTO (via JPQL constructor expressions, Spring Data projections, or a mapping library) so the controller/view never touches a managed entity or its proxies at all. This is generally the most robust fix because it also avoids over-fetching and decouples your API shape from your entity graph.</li>
 <li><strong>Open Session in View (OSIV):</strong> a servlet filter (enabled by default in Spring Boot via <code>spring.jpa.open-in-view=true</code>) that keeps the Hibernate session open for the entire HTTP request, not just the <code>@Transactional</code> method, so lazy associations can still be initialized while rendering a view.</li>
 </ul>
+<h3>Worked example: a product page's reviews</h3>
+<p>A product detail page needs <code>Product</code> plus its <code>Review</code>s plus, for each review, the reviewing customer's display name — a case where a naive lazy-loaded entity graph and a DTO projection produce visibly different query counts for the exact same page:</p>
+<pre><code>@Entity
+class Review {
+    @Id Long id;
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "product_id")
+    Product product;
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "customer_id")
+    Customer customer;
+    int rating;
+    String comment;
+}
+
+// naive: 1 (product) + 1 (reviews) + N (customer per review) if customer.getName() is touched
+Product product = productRepository.findById(productId).orElseThrow();
+for (Review r : product.getReviews()) {
+    render(r.getRating(), r.getComment(), r.getCustomer().getName()); // N+1 on customer
+}
+
+// DTO projection: exactly one query, no proxies, no risk of LazyInitializationException later
+interface ReviewSummary {
+    int getRating();
+    String getComment();
+    String getCustomerName();
+}
+
+@Query("""
+    select r.rating as rating, r.comment as comment, c.name as customerName
+    from Review r join r.customer c
+    where r.product.id = :productId
+    """)
+List&lt;ReviewSummary&gt; findSummariesByProductId(@Param("productId") Long productId);</code></pre>
+<p>The projection interface's getter names (<code>getRating</code>, <code>getComment</code>, <code>getCustomerName</code>) are matched by Spring Data against the query's column aliases — this is a <em>closed projection</em>: Spring Data generates a proxy implementing the interface backed directly by the query's result row, with no <code>Product</code>, <code>Review</code>, or <code>Customer</code> entity ever loaded into the persistence context at all. This is why DTO projections sidestep both N+1 and <code>LazyInitializationException</code> simultaneously — there's no lazy proxy to forget about, because there's no managed entity in the first place.</p>
 <div class="callout warn">
 <div class="callout-title">Why Open Session in View is controversial</div>
 <p>OSIV makes the symptom disappear without fixing the cause: it hides N+1 problems by moving lazy-initialization queries out of your service layer and into whatever happens to touch the entity later (a JSON serializer, a template engine), where they're harder to see, profile, and reason about. It also holds a database connection checked out from the pool for the full duration of request processing — including view rendering and any slow downstream calls — which under load can exhaust the connection pool much faster than a design where connections are held only for the duration of the actual transaction. Spring Boot ships it enabled by default specifically for developer convenience, and logs a warning about it on startup; most production-hardened setups explicitly disable it and use fetch joins or DTOs instead.</p>
@@ -159,50 +274,57 @@ public class OrderService {
 </div>
 
 <h2>8. Concurrency Control: Optimistic Locking and Pessimistic Locking</h2>
-<p>Both mechanisms solve the same underlying problem — two transactions reading and then writing the same row without either being aware of the other, resulting in a lost update — but they solve it with opposite philosophies about whether conflicts are rare or expected.</p>
+<p>Both mechanisms solve the same underlying problem — two transactions reading and then writing the same row without either being aware of the other, resulting in a lost update — but they solve it with opposite philosophies about whether conflicts are rare or expected. The canonical ShopSphere example is a flash sale: many concurrent checkout requests all trying to decrement the same product's <code>Inventory.availableQty</code> at once.</p>
 <h3>Optimistic locking via @Version</h3>
 <pre><code>@Entity
-class Account {
+class Inventory {
     @Id Long id;
-    BigDecimal balance;
+    Long productId;
+    Long warehouseId;
+    int availableQty;
+    int reservedQty;
     @Version
     Long version;
 }</code></pre>
 <p>Hibernate adds a version column and rewrites every <code>UPDATE</code> for that entity to check-and-increment it atomically:</p>
-<pre><code>UPDATE account SET balance = ?, version = version + 1
+<pre><code>UPDATE inventory SET available_qty = ?, reserved_qty = ?, version = version + 1
 WHERE id = ? AND version = ?  -- the version value read at load time</code></pre>
 <p>If another transaction updated the row (and thus incremented <code>version</code>) between when this transaction read the row and when it tries to write, the <code>WHERE version = ?</code> clause matches zero rows. Hibernate checks the JDBC update count; when it's 0 where 1 was expected, it throws <code>OptimisticLockException</code> (wrapped as <code>ObjectOptimisticLockingFailureException</code> in Spring Data). No row-level database lock is held while the transaction is thinking — the check happens entirely at write time, which is why it's called optimistic: it assumes conflicts are uncommon and pays the cost of detecting them only when they actually occur, rather than paying a locking cost on every read.</p>
 <h3>Pessimistic locking via @Lock(PESSIMISTIC_WRITE)</h3>
 <p>Pessimistic locking instead prevents the conflict from being possible at all, by taking a database row lock at read time:</p>
 <pre><code>@Lock(LockModeType.PESSIMISTIC_WRITE)
-@Query("select a from Account a where a.id = :id")
-Account findByIdForUpdate(@Param("id") Long id);</code></pre>
-<p>This compiles down to <code>SELECT ... FROM account WHERE id = ? FOR UPDATE</code>. The database itself blocks any other transaction that tries to acquire a conflicting lock on that row (another <code>FOR UPDATE</code>, or in some databases even a plain write) until this transaction commits or rolls back. This trades throughput for certainty: it eliminates the race but means every reader-then-writer serializes on that row for the duration of the transaction, which is exactly the kind of contention that causes connection pool exhaustion and timeouts under load if the transaction holding the lock is slow or long-running.</p>
+@Query("select i from Inventory i where i.productId = :productId and i.warehouseId = :warehouseId")
+Inventory findForReservation(@Param("productId") Long productId, @Param("warehouseId") Long warehouseId);</code></pre>
+<p>This compiles down to <code>SELECT ... FROM inventory WHERE product_id = ? AND warehouse_id = ? FOR UPDATE</code>. The database itself blocks any other transaction that tries to acquire a conflicting lock on that row (another <code>FOR UPDATE</code>, or in some databases even a plain write) until this transaction commits or rolls back. This trades throughput for certainty: it eliminates the race but means every reader-then-writer serializes on that row for the duration of the transaction, which is exactly the kind of contention that causes connection pool exhaustion and timeouts under load if the transaction holding the lock is slow or long-running — precisely the risk during a flash sale, where thousands of checkout requests might all want a <code>FOR UPDATE</code> lock on the same hot product's inventory row within the same second.</p>
 <table>
 <tr><th></th><th>Optimistic (@Version)</th><th>Pessimistic (SELECT ... FOR UPDATE)</th></tr>
 <tr><td>Where the conflict is caught</td><td>At write time, via a failed <code>WHERE version = ?</code> match</td><td>Never happens — contenders block until the lock is released</td></tr>
 <tr><td>Cost when conflicts are rare</td><td>Very low — no locks held during read</td><td>Unnecessary serialization even when nobody actually collides</td></tr>
 <tr><td>Cost when conflicts are frequent</td><td>High — retries pile up, users see failures</td><td>Predictable, but throughput drops as lock hold time grows</td></tr>
 <tr><td>Failure mode under contention</td><td>Client-visible exception, requires an explicit retry strategy</td><td>Increased latency / potential lock timeouts and deadlocks</td></tr>
-<tr><td>Typical fit</td><td>Web request flows where conflicts are occasional (e.g. two admins editing the same record)</td><td>Short, critical sections where correctness must not depend on a retry (e.g. decrementing finite inventory)</td></tr>
+<tr><td>Typical fit</td><td>Web request flows where conflicts are occasional (e.g. two admins editing the same seller's catalog entry)</td><td>Short, critical sections where correctness must not depend on a retry (e.g. decrementing finite <code>Inventory.availableQty</code> during a flash-sale checkout spike, where an overselling bug is worse than a slower checkout)</td></tr>
 </table>
 <div class="callout tip">
 <div class="callout-title">Optimistic locking composes with retry, not with silence</div>
-<p><code>@Version</code> only helps if something actually catches <code>OptimisticLockException</code> and retries the read-modify-write cycle (typically with a bounded number of attempts and possibly a backoff, echoing the retry patterns in <a href="#/resilience-fault-tolerance">Resilience & Fault Tolerance</a>). If nothing catches it, the exception just propagates up as a failed request — which is correct behavior (you did prevent a lost update) but is often mistaken for a bug rather than the locking mechanism doing exactly its job.</p>
+<p><code>@Version</code> only helps if something actually catches <code>OptimisticLockException</code> and retries the read-modify-write cycle (typically with a bounded number of attempts and possibly a backoff, echoing the retry patterns in <a href="#/resilience-fault-tolerance">Resilience &amp; Fault Tolerance</a>). If nothing catches it, the exception just propagates up as a failed request — which is correct behavior (you did prevent two concurrent checkouts from both decrementing the same stale <code>availableQty</code> and overselling the product) but is often mistaken for a bug rather than the locking mechanism doing exactly its job.</p>
 </div>
 
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
+<details class="concept-qa">
+<summary>Why is SessionFactory/EntityManagerFactory safe to share across threads while Session/EntityManager is not?</summary>
+<div class="qa-body">SessionFactory (and its JPA-standard counterpart EntityManagerFactory) holds application-wide, read-mostly state: the parsed entity mappings, the metamodel, and the optional second-level cache — none of which changes per request, so many threads reading it concurrently is safe by construction, which is exactly why it's built once at startup and held as a singleton. A Session/EntityManager is the opposite: it wraps exactly one persistence context, which is a mutable identity map plus a set of dirty-check snapshots plus a queue of pending writes, all specific to one unit of work. If two threads shared one Session, their writes and reads would interleave into the same identity map and action queue with no coordination at all, silently corrupting which entity's changes get flushed and when. This is why the factory is a long-lived singleton and the Session/EntityManager it opens is a short-lived, single-threaded object scoped to one transaction (or one request, under Open Session in View).</div>
+</details>
 <details class="concept-qa">
 <summary>Why does calling find() twice on the same id return the identical object reference, and why does that matter for correctness, not just performance?</summary>
 <div class="qa-body">The persistence context maintains an identity map keyed by (entity type, primary key). The first call loads the row and registers the resulting object in that map. The second call checks the map first, finds an entry, and returns that exact reference without touching the database. This matters beyond avoiding a redundant query: if two calls returned two different objects representing the same row, and code mutated both independently, Hibernate would have no way to know which set of changes should win at flush time, and you could silently lose one side's changes with no error at all. Guaranteeing one object per row within a unit of work makes "the object" and "the row" synonymous for the duration of the transaction, which is what dirty checking and the overall unit-of-work model depend on.</div>
 </details>
 <details class="concept-qa">
 <summary>Why is FetchType.LAZY considered the safer default even though it introduces the risk of LazyInitializationException?</summary>
-<div class="qa-body">EAGER loading's cost is invisible and unbounded at the call site: fetching one entity can transitively pull in an arbitrarily large graph through chained eager associations, and there's no way to tell from `repository.findById(id)` how much data is about to load. That cost shows up as a production slowdown that's hard to trace back to a single annotation. LAZY loading's cost, by contrast, is visible and immediate: accessing an uninitialized association outside a session throws a specific, unambiguous exception at a specific line, which is far easier to diagnose and fix (with a fetch join, an entity graph, or a DTO) than a graph that's simply larger than expected. Failing loudly and immediately is preferable to failing silently and slowly.</div>
+<div class="qa-body">EAGER loading's cost is invisible and unbounded at the call site: fetching one entity can transitively pull in an arbitrarily large graph through chained eager associations, and there's no way to tell from <code>repository.findById(id)</code> how much data is about to load. That cost shows up as a production slowdown that's hard to trace back to a single annotation. LAZY loading's cost, by contrast, is visible and immediate: accessing an uninitialized association outside a session throws a specific, unambiguous exception at a specific line, which is far easier to diagnose and fix (with a fetch join, an entity graph, or a DTO) than a graph that's simply larger than expected. Failing loudly and immediately is preferable to failing silently and slowly.</div>
 </details>
 <details class="concept-qa">
 <summary>Walk through exactly why calling an @Transactional method from another method in the same class does not start a transaction.</summary>
-<div class="qa-body">Spring implements @Transactional using an AOP proxy — either a JDK dynamic proxy (if the bean implements an interface) or a CGLIB subclass proxy (otherwise) — that wraps the target bean. The transactional interceptor logic lives on that proxy, not inside the target class's bytecode. When Spring wires the bean into other beans, it injects the proxy, so calls arriving from outside the class go through the proxy and trigger the interceptor. But a call made from one method to another *within the same class* is a plain Java method call on `this`, which refers to the raw target object, never the proxy that wraps it. The call bypasses the proxy entirely, so the transactional advice around it never executes, and the method runs with whatever transaction (if any) was already active in the caller — often none.</div>
+<div class="qa-body">Spring implements @Transactional using an AOP proxy — either a JDK dynamic proxy (if the bean implements an interface) or a CGLIB subclass proxy (otherwise) — that wraps the target bean. The transactional interceptor logic lives on that proxy, not inside the target class's bytecode. When Spring wires the bean into other beans, it injects the proxy, so calls arriving from outside the class go through the proxy and trigger the interceptor. But a call made from one method to another *within the same class* is a plain Java method call on <code>this</code>, which refers to the raw target object, never the proxy that wraps it. The call bypasses the proxy entirely, so the transactional advice around it never executes, and the method runs with whatever transaction (if any) was already active in the caller — often none.</div>
 </details>
 <details class="concept-qa">
 <summary>What's the mechanical difference between REQUIRES_NEW and NESTED, and why does that difference determine whether an outer rollback can undo the inner work?</summary>
@@ -227,4 +349,6 @@ Account findByIdForUpdate(@Param("id") Long id);</code></pre>
 <div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">Isolation levels, locking, and MVCC that @Transactional ultimately delegates to</div></div>
 <div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience & Fault Tolerance</div><div class="rc-sub">Retry strategies needed to make optimistic locking failures actually recoverable</div></div>
 <div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Consistency trade-offs that generalize the single-database locking choices here</div></div>
+<div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'"><div class="rc-title">Payment Systems & Idempotent Transactions</div><div class="rc-sub">@Version-based optimistic locking on Inventory during checkout is the same lost-update problem payment idempotency keys solve for charges</div></div>
+<div class="related-card" onclick="window.location.hash='/batch-processing-scheduled-jobs'"><div class="rc-title">Batch Processing & Scheduled Jobs</div><div class="rc-sub">The flush()/clear() pattern for bounding persistence-context growth is the standard technique for large Hibernate-backed batch jobs</div></div>
 </div>

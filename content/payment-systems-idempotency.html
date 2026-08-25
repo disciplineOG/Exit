@@ -1,0 +1,340 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Extended Bonus · HLD / Bonus</p>
+<h1>Payment Systems &amp; Idempotent Transactions</h1>
+<div class="topic-tags">
+<span class="tag">Idempotency-Key</span>
+<span class="tag">Webhook Signature Verification</span>
+<span class="tag">At-Least-Once Delivery</span>
+<span class="tag">Reconciliation</span>
+<span class="tag">Saga Pattern</span>
+<span class="tag">Compensating Transactions</span>
+<span class="tag">2PC vs Saga</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>A retried HTTP request is not a hypothetical edge case in payments — it's the default. Mobile networks drop connections mid-response, load balancers time out and retry, a customer double-taps "Pay Now" on a slow checkout page, and a client library retries any request that didn't get a clean 2xx within its timeout window. In almost every other domain a duplicate request is a minor annoyance (rendering the same product page twice costs nothing). In payments, a duplicate <code>POST /payments</code> that isn't handled correctly means ShopSphere charges a customer's card twice for one order — a real financial error that generates a chargeback, a support ticket, and a loss of trust, not just a logged warning. Everything on this page follows from one design principle: <strong>a payment API must be safe to call more than once with the same intent</strong>, and every layer of the system — the API itself, the webhook handler receiving the gateway's callback, and the cross-service workflow that ties order, payment, and inventory together — has to be built around that principle rather than assuming "the network is reliable and each request happens exactly once."</p>
+</div>
+
+<h2>1. Why Payment APIs Must Be Idempotent</h2>
+<p>An operation is <strong>idempotent</strong> if performing it more than once has the exact same effect as performing it once. <code>PUT /products/42 {price: 29.99}</code> is naturally idempotent — setting the price to 29.99 five times leaves the product at the same price as setting it once. <code>POST /payments {orderId: 501, amount: 49.99}</code> is <strong>not</strong> naturally idempotent, because a POST's whole semantic is "create a new resource" — the naive implementation creates a brand-new <code>Payment</code> row and initiates a brand-new charge against the customer's card on every call, identical parameters or not. If ShopSphere's checkout page issues that POST, the response is delayed past the client's timeout, and the client's retry logic fires a second, identical POST, the naive payment-service now captures the card twice for the same order.</p>
+<p>This isn't a rare failure. Consider the ordinary failure modes that produce a retry in ShopSphere's checkout flow:</p>
+<ul>
+<li>The customer's mobile connection drops between sending the request and receiving the response — the server may have already fully processed and captured the payment; the client has no way to know that from a dropped connection alone.</li>
+<li>An upstream load balancer or API gateway in front of payment-service enforces a request timeout shorter than payment-service's actual processing time (a slow call out to the card network), times out the client's connection, and the client-side retry policy resends the exact same request.</li>
+<li>A customer, seeing a checkout page that hasn't visibly responded yet, clicks "Pay Now" a second time out of impatience.</li>
+</ul>
+<p>In every case, the client cannot distinguish "my request never reached the server" from "my request reached the server, was processed, and the response was lost on the way back." The only safe assumption a retrying client can make is "the server may or may not have already done this" — which means the server-side API has to be built so that doesn't matter.</p>
+<div class="callout warn">
+<div class="callout-title">Retrying is not optional to disallow</div>
+<p>You cannot fix this by telling clients "just don't retry." Timeouts, TCP resets, and mobile network handoffs happen regardless of client discipline, and any well-behaved HTTP client library (and any reasonable checkout UI) is going to retry a request that didn't get a definitive response. The correct fix is architectural, not procedural: make the retried request provably safe on the server side.</p>
+</div>
+
+<h2>2. The Idempotency-Key Pattern</h2>
+<p>The standard solution — used by Stripe, PayPal, and every serious payment gateway — is for the <strong>client</strong> to generate a unique token (typically a UUID) once, at the moment the user initiates the payment attempt, and attach it to the request as an <code>Idempotency-Key</code> header. The server then treats "same idempotency key" as "same logical request," regardless of how many times it physically arrives.</p>
+<pre><code>POST /api/payments HTTP/1.1
+Host: payment-service.shopsphere.internal
+Idempotency-Key: 7f3e9a10-2b44-4c1a-9f0d-8e6b5a2c9d11
+Content-Type: application/json
+
+{
+  "orderId": 501,
+  "amount": 49.99,
+  "currency": "USD",
+  "provider": "stripe"
+}</code></pre>
+<p>Crucially, the key is generated <strong>client-side, once per user intent</strong> — not server-side, and not regenerated on each retry. If ShopSphere's checkout page generates a new key every time it re-sends the request, the whole mechanism is defeated, because the server would see each retry as a brand-new logical request with nothing to deduplicate against. The key must persist across retries of the same attempt (stored in the client's in-memory checkout state, not regenerated) and only change if the customer genuinely starts a new, separate payment attempt (e.g. they cancel and re-enter their card details).</p>
+<h3>2.1 The server-side dedupe table</h3>
+<p>payment-service backs this with a table keyed on the idempotency key, tracking the request and its outcome:</p>
+<pre><code>CREATE TABLE idempotency_keys (
+    idempotency_key   VARCHAR(64) PRIMARY KEY,
+    request_hash      VARCHAR(64) NOT NULL,   -- hash of the request body, to detect key reuse with different params
+    status             VARCHAR(16) NOT NULL,   -- IN_PROGRESS | COMPLETED
+    response_body      TEXT,                    -- the exact response to replay, once COMPLETED
+    response_status    INT,
+    created_at          TIMESTAMP NOT NULL,
+    payment_id          BIGINT                  -- the Payment row this request produced, once known
+);</code></pre>
+<p>The request-handling logic, expressed precisely, is:</p>
+<pre><code>@PostMapping("/api/payments")
+public ResponseEntity&lt;PaymentResponse&gt; charge(
+        @RequestHeader("Idempotency-Key") String idempotencyKey,
+        @RequestBody PaymentRequest request) {
+
+    // 1. Try to atomically claim this key. A unique constraint on idempotency_key
+    //    makes this INSERT the actual concurrency-safety mechanism - see 2.2.
+    Optional&lt;IdempotencyRecord&gt; existing = idempotencyStore.findByKey(idempotencyKey);
+
+    if (existing.isPresent()) {
+        IdempotencyRecord record = existing.get();
+        if (!record.getRequestHash().equals(hash(request))) {
+            // Same key, different payload - the client is misusing the key. Reject loudly
+            // rather than silently charging for a different amount than the key was created for.
+            return ResponseEntity.status(422).body(PaymentResponse.keyReused());
+        }
+        if (record.getStatus() == COMPLETED) {
+            // This exact request was already fully processed - replay the stored
+            // response verbatim. No new Payment row, no new charge attempt.
+            return ResponseEntity.status(record.getResponseStatus()).body(record.getResponseBody());
+        }
+        // status == IN_PROGRESS: another instance of this exact request is still being
+        // processed right now (see 2.2) - tell the client to retry shortly rather than
+        // racing a second charge attempt against the first.
+        return ResponseEntity.status(409).body(PaymentResponse.processing());
+    }
+
+    // 2. First time seeing this key - claim it, then actually do the work.
+    idempotencyStore.insertInProgress(idempotencyKey, hash(request));
+    Payment payment = paymentGateway.capture(request);         // the real charge, via Stripe/PayPal
+    idempotencyStore.markCompleted(idempotencyKey, payment);
+    return ResponseEntity.ok(PaymentResponse.from(payment));
+}</code></pre>
+<p>The response returned on a duplicate is not "processed again, here's a new result" — it is the exact, previously-computed response, replayed byte-for-byte. This matters because the payment result (a <code>Payment</code> id, a status, a receipt reference) must be stable across retries; a client that retried and got back a <em>different</em> payment id each time would have no reliable way to know which one actually represents the real transaction.</p>
+<h3>2.2 The race condition idempotency alone doesn't fix</h3>
+<p>A naive implementation checks "does this key exist?" and, if not, proceeds to charge — but two retries can arrive concurrently (e.g. the original request and a client-side retry fired a few hundred milliseconds later, both in flight at once) and both can pass the "key doesn't exist yet" check before either has written a row. The fix is to make the claim itself atomic: the <code>idempotency_key</code> column carries a <strong>unique constraint</strong>, and the first <code>INSERT ... IN_PROGRESS</code> to land wins; the second one fails on the constraint violation, and that failure is exactly the signal to fall back to the "someone else is already processing this" branch above rather than proceeding to charge. The correctness of the whole pattern rests on the database enforcing uniqueness, not on an application-level check-then-act sequence, which is inherently racy under concurrency.</p>
+<div class="callout">
+<div class="callout-title">Idempotency keys expire — and that's deliberate</div>
+<p>Stripe and similar gateways retain idempotency keys for roughly 24 hours, not forever. Keeping every key indefinitely would grow the dedupe table without bound; a 24-hour window comfortably covers any realistic retry (a client that waits longer than a day to retry a checkout attempt is going to re-render a fresh checkout page anyway, which is correctly treated as a new attempt with a new key).</p>
+</div>
+
+<h2>3. Webhook Handling: At-Least-Once Delivery From the Gateway</h2>
+<p>Idempotency-keys solve duplicate requests that ShopSphere's own client sends <em>to</em> payment-service. But the payment gateway (Stripe, PayPal) also sends requests <em>to</em> ShopSphere, asynchronously, in the other direction: a <strong>webhook</strong> — an HTTP POST the gateway fires at a URL ShopSphere registered, notifying it that something happened (a charge was captured, a dispute was opened, a refund completed). This matters because card capture is not always synchronous from the gateway's point of view — some payment methods settle asynchronously, and even for ones that don't, the webhook is the gateway's authoritative, durable notification channel, independent of whether ShopSphere's original synchronous API response was received.</p>
+<pre><code>POST /webhooks/stripe HTTP/1.1
+Stripe-Signature: t=1756000000,v1=5257a869e7...
+Content-Type: application/json
+
+{
+  "id": "evt_1Nxyz",
+  "type": "payment_intent.succeeded",
+  "data": { "object": { "id": "pi_3Nxyz", "amount": 4999, "metadata": { "orderId": "501" } } }
+}</code></pre>
+<h3>3.1 Verifying the webhook signature</h3>
+<p>A webhook endpoint is a public URL that accepts unauthenticated POST bodies from the internet — there is no <code>Authorization: Bearer</code> token to check, because the caller is Stripe's infrastructure, not a logged-in ShopSphere user. Without some other proof of authenticity, anyone who discovers the endpoint URL could POST a forged <code>payment_intent.succeeded</code> event claiming order 501 was paid, and a naive handler would mark the order paid and ship it for free. The gateway solves this the same way a JWT proves authenticity (see <a href="#/spring-security">JWT signature verification</a>): it signs the raw request body with a secret only ShopSphere and the gateway know, and sends the signature in a header (<code>Stripe-Signature</code> above). ShopSphere's handler recomputes the same HMAC over the exact raw bytes it received and rejects the request if the signatures don't match.</p>
+<pre><code>@PostMapping("/webhooks/stripe")
+public ResponseEntity&lt;Void&gt; handleStripeWebhook(
+        @RequestBody String rawBody,                        // raw bytes, NOT a deserialized object -
+        @RequestHeader("Stripe-Signature") String sigHeader) { // the signature is computed over these exact bytes
+
+    if (!webhookVerifier.isValid(rawBody, sigHeader, webhookSecret)) {
+        return ResponseEntity.status(400).build(); // reject: not actually from Stripe, or tampered in transit
+    }
+    StripeEvent event = parse(rawBody);
+    processEventIdempotently(event);              // see 3.2 - this is where duplicate deliveries are handled
+    return ResponseEntity.ok().build();
+}</code></pre>
+<p>Note the raw body is captured before any JSON deserialization — signature verification must run over the exact bytes the gateway signed. Deserializing first and re-serializing to check the signature (or checking the signature against a re-serialized, potentially differently-formatted JSON string) can produce a byte sequence that no longer matches what was actually signed, causing valid webhooks to fail verification for reasons unrelated to actual tampering.</p>
+<h3>3.2 At-least-once delivery means the handler itself must be idempotent</h3>
+<p>Payment gateways deliver webhooks with <strong>at-least-once</strong> semantics: if ShopSphere's endpoint is slow, returns a non-2xx status, or times out, the gateway retries the same event later — deliberately, because the alternative (giving up after one attempt) risks ShopSphere silently never learning that a payment succeeded. The consequence is that ShopSphere's webhook handler will, as a matter of routine operation and not just failure scenarios, receive the same event more than once. Every gateway event carries a stable <code>id</code> (<code>evt_1Nxyz</code> above) specifically so the receiver can deduplicate:</p>
+<pre><code>@Transactional
+public void processEventIdempotently(StripeEvent event) {
+    // unique constraint on processed_events.event_id makes this the same atomic-claim
+    // pattern as section 2.2's idempotency table - first write wins, duplicates no-op.
+    boolean alreadyProcessed = !processedEventsRepository.tryInsert(event.getId());
+    if (alreadyProcessed) {
+        return; // seen this exact event before - no-op, NOT an error
+    }
+
+    Payment payment = paymentRepository.findByProviderRef(event.getPaymentIntentId());
+    payment.setStatus(PaymentStatus.CAPTURED);
+    paymentRepository.save(payment);
+    orderService.markOrderPaid(payment.getOrderId());   // publishes PaymentCaptured, see section 5
+}</code></pre>
+<p>This is structurally identical to the idempotency-key pattern in section 2 — an atomic claim on a unique key, checked before any side-effecting work runs — applied to an inbound event instead of an inbound request. The lesson generalizes: <strong>any at-least-once delivery channel pushes the idempotency burden onto the receiver</strong>, because the sender's guarantee ("I will make sure you get this at least once") is only achievable by sometimes sending it more than once; there is no delivery mechanism that can guarantee exactly-once over an unreliable network without the receiver's cooperation.</p>
+<div class="callout tip">
+<div class="callout-title">Return 2xx only after durably recording the event, not after fully processing it</div>
+<p>A subtlety worth being deliberate about: the handler above records <code>event.getId()</code> as processed and updates the <code>Payment</code>/<code>Order</code> in the same transaction, then returns 200. If the handler instead returned 200 immediately after receiving the webhook and processed it asynchronously afterward, a crash between those two steps would lose the event with no record it was ever received, and Stripe would consider it successfully delivered (since it got a 2xx) and never retry. Returning 2xx is a promise that the event has been durably, atomically accounted for — not merely received.</p>
+</div>
+
+<h2>4. Reconciliation: When the Gateway and ShopSphere Disagree</h2>
+<p>Idempotency keys and signed, deduplicated webhooks handle the common cases, but they don't make the two systems' views of the world <em>always</em> consistent in real time. A gap can open up between "what the payment gateway's ledger says happened" and "what ShopSphere's own <code>Payment</code>/<code>Order</code> rows say happened," and it can persist for a meaningful window:</p>
+<ul>
+<li>ShopSphere calls the gateway to capture a payment, the gateway processes it and updates its own ledger to <code>captured</code>, but the response never reaches ShopSphere (network partition, ShopSphere's process crashes mid-call) — ShopSphere's local <code>Payment</code> row is stuck at <code>PENDING</code> even though the gateway's side is done.</li>
+<li>The webhook that was supposed to close this gap is itself delayed, dropped by an intermediate proxy, or fails signature verification due to a misconfigured secret and is silently rejected without anyone noticing.</li>
+<li>A bug in payment-service's webhook handler throws an exception after recording the event as processed but before actually updating the <code>Payment</code> row, leaving the event marked "handled" (so no retry ever arrives) while the local state never updated.</li>
+</ul>
+<p>Webhooks are the fast path, not the only path. The safety net is a periodic <strong>reconciliation job</strong> — a scheduled batch process (see <a href="#/batch-processing-scheduled-jobs">batch job scheduling patterns</a>) that queries the gateway's API directly for the authoritative status of every payment ShopSphere considers still <code>PENDING</code> past some age threshold, and repairs any mismatch:</p>
+<pre><code>@Scheduled(cron = "0 */15 * * * *")  // every 15 minutes
+public void reconcilePendingPayments() {
+    List&lt;Payment&gt; stalePending = paymentRepository
+        .findByStatusAndCreatedAtBefore(PENDING, now().minusMinutes(10));
+
+    for (Payment payment : stalePending) {
+        GatewayStatus actual = paymentGateway.fetchStatus(payment.getProviderRef());
+        if (actual == CAPTURED &amp;&amp; payment.getStatus() == PENDING) {
+            payment.setStatus(CAPTURED);
+            paymentRepository.save(payment);
+            orderService.markOrderPaid(payment.getOrderId());   // catch up on the missed webhook's effect
+            log.warn("Reconciliation corrected drift: payment {} was CAPTURED at gateway but " +
+                     "PENDING locally - likely a missed/failed webhook", payment.getId());
+        } else if (actual == FAILED &amp;&amp; payment.getStatus() == PENDING) {
+            payment.setStatus(FAILED);
+            paymentRepository.save(payment);
+            orderService.markOrderPaymentFailed(payment.getOrderId());
+        }
+    }
+}</code></pre>
+<p>Reconciliation is deliberately treated as the <strong>source of truth of last resort</strong>, not a redundant nicety: the gateway's ledger is authoritative because it is the system that actually moved money, and ShopSphere's local rows are a cache of that reality that can drift. The reconciliation job's whole job is detecting and correcting that drift, and it must itself be safe to run repeatedly and concurrently with the webhook handler — reusing the exact same "only transition PENDING to a terminal state, and check-then-act under a transaction" discipline as sections 2 and 3, for the same reason: it too can race against a webhook arriving at nearly the same moment.</p>
+<div class="callout warn">
+<div class="callout-title">Alerting on reconciliation corrections, not just logging them</div>
+<p>A reconciliation job that silently fixes drift every 15 minutes without anyone noticing is masking a real, ongoing problem — a genuinely healthy webhook pipeline should make reconciliation corrections rare. If the job is routinely correcting a nontrivial number of payments every run, that's a signal something upstream (webhook delivery, signature configuration, handler bugs) is actually broken, not evidence the safety net is unnecessary.</p>
+</div>
+
+<h2>5. The Distributed Transaction Problem: Order, Payment, and Inventory</h2>
+<p>ShopSphere's checkout touches at least three independently deployed services with their own databases: order-service creates the <code>Order</code>, inventory-service reserves stock (<code>Inventory.reservedQty</code>), and payment-service captures the charge. All three must end up in a mutually consistent state — either the order is placed, stock is reserved, and payment is captured, or none of it is — but there is no single database transaction that can span all three, because each owns its own data store and a local ACID transaction can't cross a network boundary to another service's database.</p>
+<h3>5.1 The naive answer: Two-Phase Commit (2PC), and why it doesn't fit</h3>
+<p>Two-Phase Commit is the classical distributed-transaction protocol: a coordinator asks every participant to <em>prepare</em> (lock the relevant rows, do everything short of committing, and vote yes/no), and only once every participant has voted yes does the coordinator tell everyone to actually <em>commit</em>; if any participant votes no, everyone is told to <em>abort</em> instead.</p>
+<pre><code>Coordinator                 order-service      inventory-service      payment-service
+    |--- PREPARE placeOrder ------->|                  |                     |
+    |--- PREPARE reserveStock ------------------------->|                     |
+    |--- PREPARE captureCharge -------------------------------------------->|
+    |<---------------- vote: YES / YES / YES ------------------------------|
+    |--- COMMIT -------------------->|                  |                     |
+    |--- COMMIT -----------------------------------------------------------|
+    (all three durably commit only after every participant already voted yes)</code></pre>
+<p>This works, but it fits poorly with the kind of system ShopSphere actually is, for reasons that generalize to almost any microservice checkout flow:</p>
+<ul>
+<li><strong>Locks held across a slow, external call.</strong> The <em>prepare</em> phase requires every participant to hold its locks open until the coordinator's final decision arrives — and payment-service's participation in this transaction includes an outbound call to an actual card network (Stripe/the card issuer), which can take anywhere from tens of milliseconds to several seconds. inventory-service's reserved-stock rows for a hot product during a <a href="#/hld-ecommerce-flash-sale">flash sale</a> would sit locked for the entire duration of that external call, blocking every other checkout attempting to reserve the same stock.</li>
+<li><strong>A single coordinator is a new availability bottleneck and single point of failure.</strong> If the coordinator crashes after some participants have voted yes but before sending the commit decision, those participants are stuck holding locks indefinitely, unsure whether to commit or abort, until the coordinator recovers.</li>
+<li><strong>Payment gateways don't speak 2PC.</strong> Stripe has no "prepare to charge this card, but don't actually settle it yet, and wait for my second message" API — capturing a charge against a card network is not a operation any external gateway exposes as a two-phase protocol. 2PC requires every participant to support the protocol; ShopSphere's most important participant, the actual money-movement step, structurally cannot.</li>
+</ul>
+
+<h3>5.2 The practical answer: Saga, with compensating actions</h3>
+<p>A <strong>saga</strong> replaces one atomic, all-or-nothing transaction with a sequence of local transactions, each committed independently and immediately (no cross-service locks held open), where every step that can fail has a corresponding <strong>compensating action</strong> — an explicit, separate operation that semantically undoes an already-committed step, run if a later step in the sequence fails. Nothing is rolled back in the database sense (there is no cross-service rollback); instead, the system moves forward through a second, corrective sequence of real operations.</p>
+<pre><code>order-service:      create Order (status=CREATED)              ----> commits immediately
+inventory-service:  reserve stock (reservedQty += qty)          ----> commits immediately
+payment-service:    capture charge via gateway                  ----> commits immediately (or fails)
+order-service:      mark Order PAID                             ----> commits immediately
+
+If capture FAILS after inventory was already reserved:
+inventory-service:  COMPENSATE - release the reservation (reservedQty -= qty)
+order-service:      mark Order CANCELLED (compensating the initial create)
+notification-service: notify Customer the order could not be completed</code></pre>
+<p>Concretely, in event-driven form (see <a href="#/async-messaging">async messaging</a> for the underlying Kafka mechanics), each service reacts to the previous step's event and either advances the saga or triggers a compensation:</p>
+<pre><code>// order-service, on receiving InventoryReserved
+@KafkaListener(topics = "inventory-reserved")
+public void onInventoryReserved(InventoryReservedEvent event) {
+    Order order = orderRepository.findById(event.getOrderId());
+    paymentClient.requestCapture(order.getId(), order.getTotalAmount());  // idempotency key = order.getId()
+}
+
+// payment-service, on capture failure - publishes an event rather than throwing across a network
+@KafkaListener(topics = "payment-capture-requested")
+public void onCaptureRequested(CaptureRequestedEvent event) {
+    try {
+        Payment payment = paymentGateway.capture(event.getOrderId(), event.getAmount());
+        kafkaTemplate.send("payment-captured", new PaymentCapturedEvent(event.getOrderId(), payment.getId()));
+    } catch (CardDeclinedException ex) {
+        kafkaTemplate.send("payment-capture-failed", new PaymentCaptureFailedEvent(event.getOrderId()));
+    }
+}
+
+// inventory-service listens for the failure and runs the compensating action
+@KafkaListener(topics = "payment-capture-failed")
+public void onCaptureFailed(PaymentCaptureFailedEvent event) {
+    inventoryService.releaseReservation(event.getOrderId());   // compensating action: undo the reservation
+    kafkaTemplate.send("order-cancelled", new OrderCancelledEvent(event.getOrderId()));
+}</code></pre>
+<p>Every step above must itself be idempotent for exactly the reasons established in sections 2–3: Kafka consumers, like webhooks, are an at-least-once delivery channel — a rebalance or a consumer crash-and-restart can redeliver <code>InventoryReserved</code> or <code>PaymentCaptureFailed</code> more than once, and <code>releaseReservation</code> being called twice for the same order must not double-release stock that was only reserved once. The saga pattern doesn't remove the idempotency requirement from section 2 — it multiplies it across every step, because every step is itself a retry-prone, at-least-once-delivered operation.</p>
+<h3>5.3 Choreography vs. orchestration</h3>
+<table>
+<tr><th></th><th>Choreography</th><th>Orchestration</th></tr>
+<tr><td>How steps are coordinated</td><td>Each service listens for the events it cares about and reacts independently — no central coordinator (the Kafka listeners above are choreography)</td><td>A dedicated orchestrator (e.g. a <code>CheckoutSagaOrchestrator</code> service, or a workflow engine) explicitly calls each step in sequence and decides what to do on failure</td></tr>
+<tr><td>Coupling</td><td>Loose — services only need to know event names/schemas, not each other's existence</td><td>Tighter — the orchestrator explicitly knows every participant and the full sequence</td></tr>
+<tr><td>Visibility into the whole flow</td><td>Implicit, spread across every service's listeners — harder to answer "what state is order 501's checkout saga in right now?" from any one place</td><td>Explicit — the orchestrator's own state machine directly answers that question</td></tr>
+<tr><td>Best fit</td><td>A small number of steps, where the event chain is simple enough to reason about without a central map</td><td>Longer or more conditional workflows, where an explicit state machine is worth the added coupling for the sake of debuggability</td></tr>
+</table>
+<div class="callout">
+<div class="callout-title">A saga trades atomicity for availability and locality</div>
+<p>This is the same fundamental trade-off that shows up throughout distributed systems design (see <a href="#/distributed-systems-core">distributed systems core</a>): a saga gives up the clean, all-or-nothing guarantee 2PC provides, and replaces it with eventual consistency plus an explicit, engineered recovery path (compensation) for the failure cases. In exchange, no service ever holds a lock waiting on another service's slow external call, and no single coordinator failure can freeze the whole system mid-transaction. The cost is real: there's a window, between the first committed step and the last, where the system is observably inconsistent (inventory reserved for an order that hasn't been paid yet) — code anywhere that reads state during that window has to be written with that possibility in mind, exactly the same "the data you're reading might be mid-flight" caution that eventual consistency demands everywhere else.</p>
+</div>
+
+<h2>6. Payment Lifecycle: A State Diagram</h2>
+<p>Tying idempotency, webhooks, and reconciliation together, a ShopSphere <code>Payment</code> row moves through a small, strict set of states, and the mechanisms above are precisely what drive each transition:</p>
+<pre><code>                    capture request sent to gateway
+                    (idempotency-key protects this step - section 2)
+                              |
+                              v
+                        +-----------+
+              +-------->|  PENDING  |
+              |         +-----------+
+              |            |      |
+   webhook: payment_intent.succeeded   webhook: payment_intent.payment_failed
+   OR reconciliation catch-up (sec 4)     OR gateway synchronously declines
+              |            |      |
+              v            v      v
+        +-----------+          +----------+
+        | CAPTURED  |          |  FAILED  |
+        +-----------+          +----------+
+              |                      |
+   Admin issues refund          (terminal - saga compensation
+   (refundOrder, ADMIN-only -    releases inventory reservation,
+    see spring-security.html     order-service marks order CANCELLED)
+    section 7.1)
+              |
+              v
+        +-----------+
+        | REFUNDED  |
+        +-----------+
+        (terminal)</code></pre>
+<p>Two properties of this diagram are worth being explicit about. First, <code>CAPTURED</code> and <code>FAILED</code> are each reached by <em>either</em> a webhook arriving in real time <em>or</em> the reconciliation job discovering the terminal state later — the state machine itself doesn't care which of the two triggered the transition, which is exactly why reconciliation can be a true safety net rather than a parallel, inconsistent path: both mechanisms drive the identical transition through identical code. Second, every arrow into <code>CAPTURED</code> and <code>FAILED</code> must be idempotent — a webhook redelivery and a reconciliation pass can both attempt the same <code>PENDING → CAPTURED</code> transition for the same payment, and the transition logic (guarded by checking the current status before applying it, inside a transaction) must make the second attempt a safe no-op rather than a duplicate side effect.</p>
+
+<h2>7. Idempotent, At-Least-Once, and Exactly-Once — Precise Definitions</h2>
+<p>These three terms get casually conflated, but they answer different questions, and the whole design in this page rests on keeping them separate:</p>
+<table>
+<tr><th>Term</th><th>What it actually means</th><th>Where it applies here</th></tr>
+<tr><td>Idempotent</td><td>A property of an <em>operation</em>: performing it N times has the same effect as performing it once</td><td>ShopSphere's <code>POST /payments</code> handler, made idempotent via the dedupe table in section 2</td></tr>
+<tr><td>At-least-once delivery</td><td>A property of a <em>delivery mechanism</em>: the sender guarantees the message/event arrives one or more times, never zero, but makes no promise about exactly once</td><td>Stripe's webhook delivery (section 3), and Kafka consumer delivery in the saga (section 5.2)</td></tr>
+<tr><td>Exactly-once (processing)</td><td>The <em>effect</em> of combining an at-least-once delivery mechanism with an idempotent handler on the receiving end — not a property any real distributed delivery mechanism provides on its own</td><td>The end-to-end outcome ShopSphere actually needs: a card charged exactly once, an inventory reservation released exactly once, regardless of how many times the underlying messages were delivered</td></tr>
+</table>
+<p>The reason this table matters: "exactly-once delivery" is often requested as if it were achievable purely at the transport layer (Kafka, a message queue, an HTTP client), but no transport can truly guarantee it across a network that can drop acknowledgments — the sender can never be certain whether a lost ack means "the receiver never got it" or "the receiver got it and processed it, but the ack was lost," so a transport that wants to guarantee delivery at all is forced to choose at-least-once (retry when in doubt) over at-most-once (never retry, risk silent loss). Exactly-once <em>processing</em> is achievable, but only as an emergent property of pairing at-least-once delivery with idempotent handlers — which is exactly the pattern applied identically in sections 2, 3, and 5.2.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why is a naive POST /payments endpoint dangerous, and why can't the client simply avoid retrying to fix it?</summary>
+<div class="qa-body">A POST's default semantic is "create a new resource" - a naive handler creates a new Payment row and initiates a new charge on every call it receives, with no memory of whether an identical request already succeeded. The danger is that retries are not avoidable by client discipline: a dropped connection, a timeout enforced by an intermediate load balancer, or a user double-clicking a slow checkout button all produce a second, identical request through no fault of correct client code, and the client fundamentally cannot distinguish "my request never reached the server" from "it reached the server, succeeded, and the response was lost." Since the client can never safely assume a response's absence means "nothing happened," the only sound fix is on the server: make the operation itself safe to receive more than once, via the idempotency-key and dedupe-table pattern, rather than trying to prevent retries from occurring in the first place.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why must the idempotency key be generated once by the client and reused across retries, rather than generated fresh on each request?</summary>
+<div class="qa-body">The entire mechanism works by having the server treat "same idempotency key" as "same logical request," so it can recognize a retry and replay the original result instead of re-executing the charge. If the client generated a new key on every retry, the server would see each retry as an entirely new, distinct request with nothing to deduplicate against, and the naive double-charge problem returns unchanged - the dedupe table would faithfully record two different keys, each processed once, which is exactly the failure this pattern exists to prevent. The key has to be scoped to one user intent (one checkout attempt) and persisted client-side across that attempt's retries; it should only change when the customer genuinely starts a new, separate attempt, such as re-entering their card details after cancelling.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does the idempotency dedupe table need a unique constraint on the key column instead of a check-then-insert in application code?</summary>
+<div class="qa-body">A check-then-insert sequence in application code - query for the key, see it doesn't exist, then insert it - has a race window between the check and the insert. Two retries of the same request can arrive concurrently, both pass the "key doesn't exist yet" check before either has written its row, and both proceed to actually charge the card, which is precisely the double-charge the whole pattern exists to prevent. A unique constraint on the key column moves the atomicity into the database itself: the first INSERT to physically land succeeds, and any concurrent second INSERT for the same key fails immediately on the constraint violation, which is the correct, unambiguous signal to fall back to "someone else is already processing this" rather than proceeding to charge. This is the same class of fix as using a database-level unique constraint instead of an application-level existence check anywhere concurrent writers are possible - the constraint is enforced by the database's own locking, which application code checking and branching cannot replicate correctly under concurrency.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why must a webhook handler verify a signature instead of trusting the payload, and why must that verification run over the raw request body?</summary>
+<div class="qa-body">A webhook endpoint is a public URL accepting unauthenticated POSTs - there's no logged-in session or bearer token proving the caller is really the payment gateway, because the caller is the gateway's own infrastructure, not a browser with a user's credentials attached. Without a signature check, anyone who discovers the URL could POST a forged event - for example, claiming an order was paid when it wasn't - and a handler that trusted the payload at face value would mark the order paid and let it ship for free. The gateway signs the exact raw bytes of the request body with a shared secret, so the receiver must recompute that signature over the identical raw bytes it received; if the handler deserializes the JSON first and only signature-checks a re-serialized version, formatting differences (key order, whitespace, number formatting) can change the byte sequence enough that a legitimately-signed webhook fails verification for reasons having nothing to do with actual tampering, or worse, mask a case where the check doesn't actually protect what's being acted on.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What does "at-least-once delivery" actually guarantee, and why does that push the idempotency burden onto the receiver rather than the sender?</summary>
+<div class="qa-body">At-least-once delivery guarantees a message or event arrives one or more times - never zero - but makes no promise about arriving exactly once. This guarantee exists because a sender that wants to be certain a message was received, in the presence of a network that can lose acknowledgments, has only two honest choices: retry whenever it's uncertain the message got through (risking duplicates), or never retry (risking silent loss). Since silent loss of a payment-captured notification is far worse than an occasional duplicate delivery, every serious payment gateway and message broker chooses the retry-and-risk-duplicates option, which means the receiver will, as routine operation and not just failure handling, sometimes see the same event twice. The sender cannot eliminate this by trying harder - it's a structural consequence of not being able to distinguish "ack lost" from "message never received" - so the only place duplicates can actually be neutralized is on the receiving end, via an idempotent handler that recognizes and no-ops on a repeat.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why doesn't Two-Phase Commit fit ShopSphere's order/inventory/payment flow, even though it would give a clean atomic guarantee?</summary>
+<div class="qa-body">Two-Phase Commit requires every participant to hold its locks open through a prepare phase until a central coordinator collects all votes and issues a final commit or abort decision, and payment-service's participation in that transaction includes an outbound call to an actual card network, which can take anywhere from tens of milliseconds to multiple seconds. That means inventory-service would have to keep a hot product's stock reservation locked for the full duration of an external network call it has no control over, which is disastrous for throughput during something like a flash sale where many checkouts are contending for the same limited stock. Beyond the performance problem, 2PC requires every participant to actually speak the two-phase protocol, and real payment gateways like Stripe expose no such API - there's no "prepare to charge, then wait for a second message to actually settle it" operation available, so the most important participant in the transaction structurally cannot take part in 2PC at all. A coordinator failure mid-protocol is also a single point of failure that can leave every participant holding locks indefinitely, which is an availability risk 2PC accepts in exchange for atomicity that this flow can't afford.</div>
+</details>
+
+<details class="concept-qa">
+<summary>How does a saga achieve the same end goal as a distributed transaction without ever holding a cross-service lock, and what is the real cost of that approach?</summary>
+<div class="qa-body">A saga replaces one atomic, all-or-nothing cross-service transaction with a sequence of independent local transactions, each committed immediately in its own service's database with no lock held open waiting on any other service. Instead of rolling anything back in the database sense, every step that can be undone has an explicit compensating action - a separate, real operation that semantically reverses an already-committed step - and if a later step fails (like a card being declined after inventory was already reserved), the saga runs the compensating actions for the steps that already succeeded, such as releasing the inventory reservation and marking the order cancelled. The real cost is that the system passes through an observably inconsistent intermediate state - inventory reserved for an order not yet paid - for the entire window between the first committed step and the last, and any code reading state during that window has to be written with that possibility in mind. This is a deliberate trade of strict atomicity for availability and locality: no participant ever blocks on another's slow external call, and no single coordinator crash can freeze the whole flow, but the system must be engineered to tolerate and correctly resolve that temporary inconsistency instead of assuming it can never occur.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why must every step of a saga's event-driven implementation be idempotent, not just the initial payment API call?</summary>
+<div class="qa-body">A saga implemented via Kafka listeners inherits Kafka's own at-least-once consumer delivery semantics - a consumer group rebalance, a consumer crash-and-restart, or an at-least-once producer retry can cause any event in the chain, such as InventoryReserved or PaymentCaptureFailed, to be delivered and processed more than once. If the handler for PaymentCaptureFailed that releases an inventory reservation isn't itself idempotent, a redelivered copy of that same event would release the reservation a second time, which could incorrectly free up stock that was only ever reserved once, corrupting the inventory count. The idempotency requirement established for the payment API in section 2 doesn't disappear once the flow becomes a multi-step saga - it multiplies across every step, because every step in a saga is itself a retry-prone, at-least-once-delivered operation, and the saga as a whole is only as safe as its least idempotent individual step.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/hld-ecommerce-flash-sale'"><div class="rc-title">HLD: E-Commerce Flash Sale</div><div class="rc-sub">Flash-sale checkout is exactly where 2PC's lock-holding cost and saga compensation for failed payment/inventory steps matter most</div></div>
+<div class="related-card" onclick="window.location.hash='/async-messaging'"><div class="rc-title">Async Messaging</div><div class="rc-sub">The Kafka event chain (InventoryReserved, PaymentCaptured, OrderCancelled) behind the saga pattern in section 5 is built on these delivery guarantees</div></div>
+<div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Saga vs. 2PC is a direct instance of the atomicity-vs-availability trade-off covered there</div></div>
+<div class="related-card" onclick="window.location.hash='/api-design-versioning'"><div class="rc-title">API Design &amp; Versioning</div><div class="rc-sub">Idempotency-Key is a header-level API contract decision with the same design weight as versioning and pagination conventions</div></div>
+<div class="related-card" onclick="window.location.hash='/batch-processing-scheduled-jobs'"><div class="rc-title">Batch Processing &amp; Scheduled Jobs</div><div class="rc-sub">The reconciliation job in section 4 is a scheduled batch process, with the same idempotent-rerun requirements covered there</div></div>
+<div class="related-card" onclick="window.location.hash='/data-privacy-compliance'"><div class="rc-title">Data Privacy &amp; Compliance: GDPR &amp; PCI-DSS</div><div class="rc-sub">Payment data handling here is exactly what PCI-DSS scope and card-data minimization rules govern</div></div>
+</div>

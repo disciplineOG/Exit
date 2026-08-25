@@ -63,41 +63,57 @@
 
 <h2>3. OAuth2 From First Principles</h2>
 <p>OAuth2 solves one specific problem: letting a third-party application act on a resource owner's behalf against some resource, <strong>without that application ever seeing the resource owner's actual password</strong>. Before OAuth2 existed in practice, the common (bad) pattern was: a third-party app asks the user for their password to some other service directly, stores it, and uses it to log in as the user whenever needed. This is broken for obvious reasons — the third party now permanently holds a credential that can do everything the real password can do, there's no way to grant partial/scoped access, and there's no way to revoke the third party's access without changing the user's actual password everywhere.</p>
-<p>OAuth2 replaces "give the app your password" with "the app gets a scoped, revocable token, issued directly by the service that owns the data, after you approve it — the app never touches your password." This requires distinguishing four roles precisely, because conflating them is where most confusion about OAuth2 comes from:</p>
+<p>OAuth2 replaces "give the app your password" with "the app gets a scoped, revocable token, issued directly by the service that owns the data, after you approve it — the app never touches your password." This requires distinguishing four roles precisely, because conflating them is where most confusion about OAuth2 comes from. Concretely, for ShopSphere letting customers "Sign in with Google" instead of creating a ShopSphere-specific password:</p>
 <table>
-<tr><th>Role</th><th>Who it is</th></tr>
-<tr><td>Resource Owner</td><td>The user — the person who owns the data/account and can grant access to it</td></tr>
-<tr><td>Client</td><td>The third-party application requesting access (e.g., a web app wanting to read a user's calendar)</td></tr>
-<tr><td>Authorization Server</td><td>The system that authenticates the resource owner and issues tokens after consent (e.g., Google's OAuth endpoint)</td></tr>
-<tr><td>Resource Server</td><td>The API that actually holds the protected data and accepts the token as proof of authorized access (may be the same physical system as the authorization server, or a separate one)</td></tr>
+<tr><th>Role</th><th>Who it is</th><th>In the ShopSphere "Sign in with Google" example</th></tr>
+<tr><td>Resource Owner</td><td>The user — the person who owns the data/account and can grant access to it</td><td>The Customer, who owns their Google account/profile</td></tr>
+<tr><td>Client</td><td>The third-party application requesting access</td><td>ShopSphere's own backend (<code>shopsphere-web</code>), which wants to know who this customer is</td></tr>
+<tr><td>Authorization Server</td><td>The system that authenticates the resource owner and issues tokens after consent</td><td>Google's OAuth2/OIDC endpoint (<code>accounts.google.com</code>)</td></tr>
+<tr><td>Resource Server</td><td>The API that actually holds the protected data and accepts the token as proof of authorized access</td><td>Google's userinfo API (for this login step) — <strong>not</strong> ShopSphere's own order-service/inventory-service, which sit behind ShopSphere's <em>own</em> tokens, issued after this login completes (see section 3.2)</td></tr>
 </table>
-<h3>3.1 The Authorization Code flow, step by step</h3>
-<p>This is the flow used by server-side (confidential) clients — applications that have a backend capable of keeping a secret. It's built specifically to avoid ever putting a usable access token where a browser, a browser history entry, or an HTTP <code>Referer</code> header could leak it.</p>
+<h3>3.1 The Authorization Code flow, step by step — a Customer logging into ShopSphere via Google</h3>
+<p>This is the flow used by server-side (confidential) clients — applications that have a backend capable of keeping a secret. ShopSphere's backend qualifies: it renders the "Sign in with Google" button, but the actual token exchange happens on ShopSphere's server, never in the customer's browser. The flow is built specifically to avoid ever putting a usable access token where a browser, a browser history entry, or an HTTP <code>Referer</code> header could leak it.</p>
 <ol>
-<li>The client redirects the user's browser to the authorization server's <code>/authorize</code> endpoint, including its <code>client_id</code>, a <code>redirect_uri</code>, the requested <code>scope</code>, and a <code>state</code> parameter (an opaque, client-generated value used to prevent CSRF against the callback — the client verifies on return that the <code>state</code> it gets back matches what it sent).</li>
-<li>The authorization server authenticates the resource owner (login form) if not already authenticated, and shows a consent screen describing exactly what the client is asking to access.</li>
-<li>If the user approves, the authorization server redirects the browser back to the client's <code>redirect_uri</code> with a short-lived, single-use <strong>authorization code</strong> appended as a query parameter (and the original <code>state</code> echoed back).</li>
-<li>The client's backend — not the browser — makes a direct, server-to-server POST request to the authorization server's <code>/token</code> endpoint, presenting the authorization code along with its <code>client_id</code> and <code>client_secret</code>, and exchanges the code for an <strong>access token</strong> (and typically a <strong>refresh token</strong>).</li>
-<li>The client now calls the resource server's APIs, attaching the access token (normally as <code>Authorization: Bearer &lt;token&gt;</code>).</li>
+<li>The customer clicks "Sign in with Google" on ShopSphere's checkout/login page. ShopSphere's backend redirects the customer's browser to Google's <code>/authorize</code> endpoint, including ShopSphere's <code>client_id</code>, a <code>redirect_uri</code> pointing back at <code>shopsphere.com/login/oauth2/callback</code>, the requested <code>scope</code> (e.g. <code>openid email profile</code>), and a <code>state</code> parameter (an opaque, ShopSphere-generated value used to prevent CSRF against the callback — ShopSphere verifies on return that the <code>state</code> it gets back matches what it sent).</li>
+<li>Google authenticates the customer (its own login form) if not already logged into a Google session, and shows a consent screen: "ShopSphere wants to access your email and basic profile."</li>
+<li>If the customer approves, Google redirects the browser back to ShopSphere's <code>redirect_uri</code> with a short-lived, single-use <strong>authorization code</strong> appended as a query parameter (and the original <code>state</code> echoed back).</li>
+<li>ShopSphere's backend — not the browser — makes a direct, server-to-server POST request to Google's <code>/token</code> endpoint, presenting the authorization code along with ShopSphere's <code>client_id</code> and <code>client_secret</code>, and exchanges the code for an <strong>access token</strong>, an <strong>ID token</strong> (because <code>openid</code> was in the scope — see section 4), and typically a <strong>refresh token</strong>.</li>
+<li>ShopSphere's backend validates the ID token to learn who the customer is (email, Google subject id), looks up or creates a matching <code>Customer</code> row, and — critically — <strong>stops using Google's tokens at this point</strong>. It mints its own ShopSphere-issued JWT (section 3.2), carrying ShopSphere-specific claims like <code>roles: ["ROLE_CUSTOMER"]</code>, and returns that to the browser. From here on, every call from the browser to ShopSphere's own APIs (cart, checkout, orders) is authenticated with ShopSphere's own token, not Google's — Google's access token was only ever needed to fetch the customer's profile from Google, and has no purpose against ShopSphere's own resource servers.</li>
 </ol>
-<pre><code>Browser                Client backend            Authorization Server        Resource Server
-   |--- GET /authorize?client_id&amp;redirect_uri&amp;scope&amp;state -->|
-   |<---------- login + consent screen -----------------------|
-   |---- user approves -------------------------------------->|
-   |<--- 302 redirect to redirect_uri?code=XYZ&amp;state=... ------|
-   |--- GET redirect_uri?code=XYZ ---->|
-                                       |--- POST /token {code, client_id, client_secret} -->|
-                                       |<--------------- access_token, refresh_token --------|
-                                       |--- GET /resource  Authorization: Bearer &lt;token&gt; -------------------------->|
-                                       |<---------------------------------- protected data ---------------------------|</code></pre>
+<pre><code>Browser (Customer)     ShopSphere backend         Google (Authz Server)        Google userinfo API
+   |--- GET /authorize?client_id&amp;redirect_uri&amp;scope=openid+email+profile&amp;state -->|
+   |<---------- Google login + consent screen -----------------------------------|
+   |---- customer approves -------------------------------------------------------->|
+   |<--- 302 redirect to shopsphere.com/login/oauth2/callback?code=XYZ&amp;state=... ---|
+   |--- GET /login/oauth2/callback?code=XYZ ---->|
+                                       |--- POST /token {code, client_id, client_secret} -------------->|
+                                       |<--------------- access_token, id_token, refresh_token ----------|
+                                       |--- GET /userinfo  Authorization: Bearer &lt;google access_token&gt; ----------------------->|
+                                       |<---------------------------------- profile (email, name) ------------------------------|
+                                       | [ShopSphere mints its OWN JWT here, with ROLE_CUSTOMER, and returns it to the browser ]
+   |<--- Set-Cookie / JSON { shopsphereAccessToken: "eyJ..." } -----------|</code></pre>
 <div class="callout tip">
 <div class="callout-title">Why exchange a code instead of returning the token directly in the redirect</div>
-<p>Step 3 could, in principle, skip the code and put the access token directly in the redirect back to the client (this is essentially what the older, now-discouraged Implicit flow did). The reason the Authorization Code flow deliberately adds this indirection is that the redirect in step 3 travels through the browser — and anything that passes through a browser redirect can end up in browser history, in server access logs on the client's own infrastructure, or leaked via the <code>Referer</code> header if the resulting page then loads any third-party resource. A one-time, short-lived authorization code that is useless without also presenting the client's confidential <code>client_secret</code> (known only to the client's backend, never exposed to the browser) can safely pass through the browser, because possessing the code alone is not sufficient to obtain a token — the actual token exchange happens over a direct, unobserved server-to-server channel. This is precisely why the Authorization Code flow is the standard for any client with a backend, and why public clients that cannot hold a secret (mobile apps, single-page apps) use a variant, <strong>Authorization Code with PKCE</strong>, which replaces the static <code>client_secret</code> with a per-request, dynamically generated proof (a <code>code_verifier</code>/<code>code_challenge</code> pair) so the code still can't be redeemed by anyone who merely intercepts it in transit.</p>
+<p>Step 3 could, in principle, skip the code and put the access token directly in the redirect back to the client (this is essentially what the older, now-discouraged Implicit flow did). The reason the Authorization Code flow deliberately adds this indirection is that the redirect in step 3 travels through the browser — and anything that passes through a browser redirect can end up in browser history, in server access logs on the client's own infrastructure, or leaked via the <code>Referer</code> header if the resulting page then loads any third-party resource. A one-time, short-lived authorization code that is useless without also presenting the client's confidential <code>client_secret</code> (known only to ShopSphere's backend, never exposed to the browser) can safely pass through the browser, because possessing the code alone is not sufficient to obtain a token — the actual token exchange happens over a direct, unobserved server-to-server channel. This is precisely why the Authorization Code flow is the standard for any client with a backend, and why public clients that cannot hold a secret (a ShopSphere mobile app, a ShopSphere single-page app with no backend of its own) use a variant, <strong>Authorization Code with PKCE</strong>, which replaces the static <code>client_secret</code> with a per-request, dynamically generated proof (a <code>code_verifier</code>/<code>code_challenge</code> pair) so the code still can't be redeemed by anyone who merely intercepts it in transit.</p>
 </div>
+<h3>3.2 Why ShopSphere mints its own JWT instead of just using Google's tokens everywhere</h3>
+<p>Google's access token is scoped to Google's own APIs (its <code>aud</code>, effectively, is Google) — it says nothing about whether this customer is a ShopSphere <code>ROLE_CUSTOMER</code>, whether they're also a <code>ROLE_SELLER</code> on ShopSphere, or what their internal ShopSphere customer id is, because Google has no concept of any of that. ShopSphere's own microservices — order-service, inventory-service, payment-service — need a token that carries ShopSphere-specific authorization data and is verifiable by ShopSphere's own services without calling out to Google on every request. So the pattern is: <strong>use an external OAuth2/OIDC provider once, at login, purely to establish identity</strong> (this is exactly the OIDC ID-token use case from section 4) <strong>and then issue a first-party token scoped to your own system</strong> for everything downstream. This is also why a ShopSphere-issued JWT can carry claims Google's token never could — <code>roles</code>, <code>customerId</code>, <code>sellerId</code> — because ShopSphere itself, as the issuer, decides what goes in the payload.</p>
 
 <h2>4. OIDC: Identity Layered on Top of OAuth2</h2>
-<p>OAuth2, by itself, was never designed to answer "who is this user?" — it was designed to answer "does this bearer of a token have permission to call this API?" An access token is, from the client's point of view, an opaque string; OAuth2 does not standardize what's inside it or require it to say anything about identity at all. Yet in practice, almost every application using OAuth2 for third-party login also needs to know who just logged in — a name, an email, a stable user identifier. OpenID Connect (OIDC) is the standard built directly on top of OAuth2 to answer exactly that, without inventing a parallel authentication protocol.</p>
+<p>OAuth2, by itself, was never designed to answer "who is this user?" — it was designed to answer "does this bearer of a token have permission to call this API?" An access token is, from the client's point of view, an opaque string; OAuth2 does not standardize what's inside it or require it to say anything about identity at all. Yet in practice, almost every application using OAuth2 for third-party login also needs to know who just logged in — a name, an email, a stable user identifier. OpenID Connect (OIDC) is the standard built directly on top of OAuth2 to answer exactly that, without inventing a parallel authentication protocol. This is exactly the piece ShopSphere needs in section 3.1's flow: ShopSphere isn't trying to call Google's APIs on an ongoing basis, it just needs to reliably learn "this is customer jane@example.com, and Google just verified that."</p>
 <p>OIDC adds one crucial new artifact to the Authorization Code flow: alongside the access token, the token endpoint also returns an <strong>ID Token</strong> — a signed JWT whose entire purpose is to assert facts about the authentication event and the user's identity (who authenticated, when, using what method, and stable identity claims like an email or subject identifier). It is not used to call APIs; the client's backend decodes and verifies it once, right after receiving it, to establish local identity/session, and then generally discards it.</p>
+<pre><code>// Google's ID token for a ShopSphere login, decoded (header.payload.signature - see section 5)
+{
+  "iss": "https://accounts.google.com",
+  "aud": "shopsphere-web-client-id",   // this token was minted specifically for ShopSphere's client_id
+  "sub": "108234...991",               // Google's stable, unique identifier for this user
+  "email": "jane@example.com",
+  "email_verified": true,
+  "name": "Jane Doe",
+  "iat": 1756000000,
+  "exp": 1756003600
+}</code></pre>
+<p>ShopSphere's backend verifies this ID token's signature against Google's published public keys (section 5.2), checks <code>iss</code> is really Google and <code>aud</code> is really ShopSphere's own <code>client_id</code>, then uses <code>sub</code> + <code>email</code> to find or create a matching <code>Customer</code> row (<code>customerId=8841</code>, say). It's only after this step — and never using Google's ID token or access token again — that ShopSphere mints its own JWT carrying <code>customerId: "8841"</code> and <code>roles: ["ROLE_CUSTOMER"]</code>, which is the token every subsequent ShopSphere API call actually uses (section 6).</p>
 <table>
 <tr><th></th><th>Access Token</th><th>ID Token</th></tr>
 <tr><td>Purpose</td><td>Authorize calls to a resource server's API</td><td>Assert identity of the user who just authenticated</td></tr>
@@ -112,22 +128,24 @@
 </div>
 
 <h2>5. JWT Structure and Signature Verification</h2>
-<p>A JSON Web Token is three base64url-encoded segments joined by dots: <code>header.payload.signature</code>. Critically, the header and payload are only <em>encoded</em>, not encrypted — anyone who has the token can decode and read both without any key. The signature is the only part that provides a security guarantee, and the guarantee it provides is narrow and specific: <strong>integrity and authenticity</strong> (this exact payload was produced by whoever holds the signing key, and has not been altered since) — not confidentiality. Never put a secret directly in a JWT payload expecting it to be hidden from the token's bearer.</p>
+<p>A JSON Web Token is three base64url-encoded segments joined by dots: <code>header.payload.signature</code>. Critically, the header and payload are only <em>encoded</em>, not encrypted — anyone who has the token can decode and read both without any key. The signature is the only part that provides a security guarantee, and the guarantee it provides is narrow and specific: <strong>integrity and authenticity</strong> (this exact payload was produced by whoever holds the signing key, and has not been altered since) — not confidentiality. Never put a secret directly in a JWT payload expecting it to be hidden from the token's bearer. The example below is exactly the token ShopSphere's own authorization server mints for customer 8841 after the Google login in sections 3–4 completes — this is the token every ShopSphere microservice (order-service, inventory-service, payment-service) actually verifies on every request from here on:</p>
 <pre><code>// header (base64url)
 { "alg": "RS256", "typ": "JWT", "kid": "2024-08-key" }
 
 // payload (base64url) - the "claims"
 {
-  "sub": "user-8841",        // subject - stable identifier of who this token is about
-  "iss": "https://auth.example.com",  // issuer
-  "aud": "orders-api",       // intended audience - which resource server should accept this
-  "iat": 1756000000,         // issued-at (epoch seconds)
-  "exp": 1756003600,         // expiry (epoch seconds) - token is invalid after this
-  "scope": "orders:read orders:write",
-  "roles": ["ROLE_USER"]
+  "sub": "customer-8841",             // subject - stable identifier of who this token is about
+  "iss": "https://auth.shopsphere.com", // issuer - ShopSphere's own authorization server
+  "aud": "shopsphere-api",            // intended audience - ShopSphere's microservices should accept this
+  "iat": 1756000000,                  // issued-at (epoch seconds)
+  "exp": 1756003600,                  // expiry (epoch seconds) - token is invalid after this
+  "scope": "orders:read orders:write cart:write",
+  "roles": ["ROLE_CUSTOMER"],
+  "customerId": "8841"                // ShopSphere-specific claim, meaningless to Google, essential to order-service
 }
 
 // signature = sign(base64url(header) + "." + base64url(payload), signingKey)</code></pre>
+<p>A Seller's token would carry <code>"roles": ["ROLE_SELLER"]</code> and a <code>sellerId</code> claim instead of (or alongside) a <code>customerId</code>; an Admin's token carries <code>"roles": ["ROLE_ADMIN"]</code>. Nothing stops a single account from carrying multiple roles — the array is just a list of authority strings (recall section 2.1's point that roles are only <code>GrantedAuthority</code> strings with a naming convention).</p>
 <h3>5.1 How verification actually works</h3>
 <p>The verifying party (a resource server, or your custom JWT filter) does three separate things, and all three must pass:</p>
 <ol>
@@ -150,7 +168,7 @@
 </div>
 
 <h2>6. Wiring a JWT Filter Into Spring Security</h2>
-<p>For a stateless, token-based API, the authentication filter's job is: pull the token out of the <code>Authorization: Bearer &lt;token&gt;</code> header, verify it using the mechanics above, and — only if it's valid — populate <code>SecurityContextHolder</code> with an authenticated <code>Authentication</code> built from its claims, before the request reaches <code>AuthorizationFilter</code>.</p>
+<p>For a stateless, token-based API, the authentication filter's job is: pull the token out of the <code>Authorization: Bearer &lt;token&gt;</code> header, verify it using the mechanics above, and — only if it's valid — populate <code>SecurityContextHolder</code> with an authenticated <code>Authentication</code> built from its claims, before the request reaches <code>AuthorizationFilter</code>. This is the filter that every ShopSphere microservice (order-service, inventory-service, payment-service) runs on every incoming request, verifying the ShopSphere-issued JWT from section 5 — none of them call back to Google, or even to ShopSphere's own auth server, to do this; verification is purely local against a cached public key.</p>
 <pre><code>public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     private final JwtDecoder jwtDecoder; // wraps signature + exp/iss/aud verification
@@ -164,8 +182,10 @@
             try {
                 Jwt jwt = jwtDecoder.decode(header.substring(7)); // throws if invalid/expired/bad sig
                 List&lt;GrantedAuthority&gt; authorities = jwt.getClaimAsStringList("roles").stream()
-                        .map(SimpleGrantedAuthority::new)
+                        .map(SimpleGrantedAuthority::new) // e.g. "ROLE_CUSTOMER" -> GrantedAuthority
                         .collect(Collectors.toList());
+                // ShopSphereUserPrincipal wraps the jwt's customerId/sellerId claim so
+                // downstream code (e.g. @PreAuthorize ownerId checks in section 7) can read it
                 Authentication auth = new JwtAuthenticationToken(jwt, authorities);
                 SecurityContextHolder.getContext().setAuthentication(auth);
             } catch (JwtException ex) {
@@ -196,25 +216,68 @@
 <li><strong>URL-level (filter-chain) authorization</strong>, configured via <code>authorizeHttpRequests()</code> in a <code>SecurityFilterChain</code> bean — coarse-grained rules matched against the request path and method, evaluated by <code>AuthorizationFilter</code> before the request ever reaches a controller.</li>
 <li><strong>Method-level authorization</strong>, via <code>@PreAuthorize</code>/<code>@PostAuthorize</code>/<code>@Secured</code> annotations on individual service or controller methods — fine-grained rules evaluated per-invocation, implemented (unsurprisingly, given <a href="#/spring-core-mechanics">how AOP works</a>) as proxy-based advice wrapped around the annotated method.</li>
 </ul>
+<p>ShopSphere has three roles — <code>ROLE_CUSTOMER</code>, <code>ROLE_SELLER</code>, <code>ROLE_ADMIN</code> — and the URL-level rules below establish the coarse boundary between them before any controller method runs:</p>
 <pre><code>http.authorizeHttpRequests(auth -> auth
     .requestMatchers("/api/admin/**").hasRole("ADMIN")
-    .requestMatchers(HttpMethod.GET, "/api/orders/**").hasAnyRole("USER", "ADMIN")
-    .requestMatchers("/api/public/**").permitAll()
+    .requestMatchers("/api/sellers/**").hasAnyRole("SELLER", "ADMIN")
+    .requestMatchers(HttpMethod.GET, "/api/catalog/**").permitAll()          // public product browsing
+    .requestMatchers("/api/orders/**", "/api/cart/**").hasAnyRole("CUSTOMER", "ADMIN")
     .anyRequest().authenticated()
 );</code></pre>
 <p>Method security must be explicitly turned on with <code>@EnableMethodSecurity</code> (the modern annotation; older code bases use <code>@EnableGlobalMethodSecurity(prePostEnabled = true)</code>) on a configuration class — it is not active by default, because wrapping every candidate method in an authorization-checking proxy has a cost, and most applications only need it on a subset of service methods.</p>
-<pre><code>@PreAuthorize("hasRole('ADMIN') or #order.ownerId == authentication.principal.id")
-public Order cancelOrder(Order order) { ... }
+<h3>7.1 Ownership checks: cancelOrder and refundOrder</h3>
+<p>The URL rule above only establishes "you must be a logged-in customer (or an admin) to hit <code>/api/orders/**</code> at all" — it cannot express "and it must be <em>your own</em> order," because the filter chain has no idea which order a given request path refers to until a controller/service method actually loads it. That's precisely the gap method-level security fills:</p>
+<pre><code>@PreAuthorize("hasRole('ADMIN') or #order.customerId == authentication.principal.customerId")
+public Order cancelOrder(Order order) {
+    // only reachable if the caller is an Admin, or the order actually belongs to them
+    order.setStatus(OrderStatus.CANCELLED);
+    return orderRepository.save(order);
+}
 
-@PostAuthorize("returnObject.ownerId == authentication.principal.id")
+@PreAuthorize("hasRole('ADMIN')")
+public Payment refundOrder(Long orderId) {
+    // refunds are Admin-only, full stop - a Customer cannot self-service a refund,
+    // even on their own order, because refunds move real money back through payment-service
+    Payment payment = paymentRepository.findByOrderId(orderId);
+    payment.setStatus(PaymentStatus.REFUNDED);
+    return paymentRepository.save(payment);
+}</code></pre>
+<p><code>#order</code> and <code>#orderId</code> refer directly to the annotated method's parameters by name — SpEL (Spring Expression Language) resolves them against the actual arguments passed at the call site. <code>authentication.principal</code> is the same <code>Authentication</code>/principal object populated by the JWT filter in section 6 — for ShopSphere this is the decoded JWT (or a wrapper around it) carrying the <code>customerId</code> claim, so <code>authentication.principal.customerId</code> reads straight out of the verified token, not from a separate database call. <code>cancelOrder</code>'s expression allows either path — Admin, <em>or</em> the order's own customer — because cancellation before shipment is something a customer should reasonably be able to do themselves. <code>refundOrder</code> intentionally allows only Admin: a refund is a financial reversal that ShopSphere restricts to staff who can also be held accountable for it, not a self-service action, regardless of who owns the order.</p>
+<pre><code>@PostAuthorize("returnObject.customerId == authentication.principal.customerId or hasRole('ADMIN')")
 public Order getOrder(Long id) { ... }</code></pre>
-<p><code>@PreAuthorize</code> evaluates its SpEL expression <em>before</em> the method body runs, and can reference method parameters directly by name (<code>#order</code>) — appropriate when the decision doesn't depend on the method's result. <code>@PostAuthorize</code> evaluates <em>after</em> the method has already executed, with access to <code>returnObject</code> — necessary when the authorization decision depends on data the method itself loads (e.g. "you may view this order only if you own it," where ownership is only known once the order has been fetched). This distinction matters operationally: a <code>@PostAuthorize</code> check that denies access still means the method's side effects (a database write, an external call) already happened — it only blocks the result from being returned to the caller. If a method has side effects, gating access with <code>@PreAuthorize</code> instead is almost always the correct choice, precisely because it can prevent the method body from running at all.</p>
+<p><code>@PreAuthorize</code> evaluates its SpEL expression <em>before</em> the method body runs, and can reference method parameters directly by name (<code>#order</code>) — appropriate when the decision doesn't depend on the method's result, which is why it's the right choice for <code>cancelOrder</code> and <code>refundOrder</code> above (the caller's identity vs. the order's owner is knowable purely from the parameter, no fetch required). <code>@PostAuthorize</code> evaluates <em>after</em> the method has already executed, with access to <code>returnObject</code> — necessary when the authorization decision depends on data the method itself loads, as in <code>getOrder(Long id)</code> above: ShopSphere can't know whose order id <code>47</code> is until the repository has actually fetched it, so the ownership check can only run against the loaded <code>Order</code>'s <code>customerId</code>, after the fact. This distinction matters operationally: a <code>@PostAuthorize</code> check that denies access still means the method's side effects (a database write, an external call) already happened — it only blocks the result from being returned to the caller. If a method has side effects — exactly the case for <code>cancelOrder</code> (mutates order status) and <code>refundOrder</code> (moves money) — gating access with <code>@PreAuthorize</code> instead is almost always the correct choice, precisely because it can prevent the method body from running at all.</p>
+<h3>7.2 A Seller-only catalog endpoint and an Admin-only refund endpoint</h3>
+<p>Combining the URL-level and method-level layers gives ShopSphere defense in depth for its highest-consequence endpoints. A Seller managing their own <code>Product</code> catalog needs both "you must be a Seller at all" (URL rule) and "it must be <em>your own</em> product" (method rule, since two different sellers both hit the same <code>/api/sellers/products/{id}</code> path):</p>
+<pre><code>@RestController
+@RequestMapping("/api/sellers/products")
+public class SellerCatalogController {
+
+    // URL rule already restricts /api/sellers/** to ROLE_SELLER or ROLE_ADMIN (section 7 top).
+    // This method-level check adds the ownership dimension the URL pattern can't express.
+    @PreAuthorize("hasRole('ADMIN') or #product.sellerId == authentication.principal.sellerId")
+    @PutMapping("/{id}")
+    public Product updateProduct(@PathVariable Long id, @RequestBody Product product) {
+        return productRepository.save(product); // update price, stockQuantity, etc.
+    }
+}
+
+@RestController
+@RequestMapping("/api/admin/refunds")
+@PreAuthorize("hasRole('ADMIN')")   // class-level: every method on this controller is Admin-only
+public class AdminRefundController {
+
+    @PostMapping("/{orderId}")
+    public Payment issueRefund(@PathVariable Long orderId) {
+        return refundService.refundOrder(orderId); // delegates to the @PreAuthorize-guarded service method
+    }
+}</code></pre>
+<p><code>@PreAuthorize</code> can be placed at the class level (as on <code>AdminRefundController</code>) to apply the same rule to every method the class exposes, rather than repeating it per-method — appropriate when, as here, the entire controller exists for exactly one privileged purpose and there's no legitimate unprivileged path through it at all. Notice the deliberate redundancy: <code>issueRefund</code> is behind an Admin-only URL prefix, an Admin-only class-level <code>@PreAuthorize</code>, <em>and</em> it calls into <code>refundOrder</code> from section 7.1, which independently re-checks <code>hasRole('ADMIN')</code> at the service layer. That's not accidental duplication — section 7.3 explains why stacking these checks is a deliberate design choice for the highest-consequence operations.</p>
 <div class="callout warn">
 <div class="callout-title">Method security is still proxy-based AOP — the same self-invocation limit applies</div>
-<p>Because <code>@PreAuthorize</code>/<code>@PostAuthorize</code> are implemented as advice on a proxy, calling an <code>@PreAuthorize</code>-annotated method via <code>this.someMethod()</code> from inside the same bean bypasses the check entirely, for exactly the reason described in <a href="#/spring-core-mechanics">Spring's AOP self-invocation trap</a> — the call never passes back out through the proxy that carries the authorization advice. A method-level security rule is not actually enforced unless every call path to that method goes through the bean from outside, or through the bean's own proxy reference.</p>
+<p>Because <code>@PreAuthorize</code>/<code>@PostAuthorize</code> are implemented as advice on a proxy, calling an <code>@PreAuthorize</code>-annotated method via <code>this.someMethod()</code> from inside the same bean bypasses the check entirely, for exactly the reason described in <a href="#/spring-core-mechanics">Spring's AOP self-invocation trap</a> — the call never passes back out through the proxy that carries the authorization advice. A method-level security rule is not actually enforced unless every call path to that method goes through the bean from outside, or through the bean's own proxy reference. Concretely: if <code>AdminRefundController.issueRefund</code> called <code>this.refundOrder(orderId)</code> on a service bean injected as a field but invoked through a plain internal helper method that itself bypasses the Spring-managed proxy, the <code>@PreAuthorize("hasRole('ADMIN')")</code> on <code>refundOrder</code> would silently never fire.</p>
 </div>
-<h3>7.1 Why both layers, rather than just one</h3>
-<p>URL-level rules are coarse and cheap — they run once per request, before any business logic, and are the right place for broad boundaries ("nothing under <code>/api/admin/**</code> is reachable without the ADMIN role"). But URL patterns can't express decisions that depend on data loaded during the request (like "only the order's owner may cancel it") — that requires the method to actually run far enough to know whose order it is. Method-level security fills that gap. In a well-designed system, URL rules act as a coarse first gate that rejects obviously unauthorized traffic as cheaply as possible, and method-level rules handle the finer-grained, data-dependent decisions that can only be evaluated once you're inside the call — the two layers are deliberately redundant at the boundary (an admin-only URL segment might also double-check the role at the method level) precisely so that a mistake in one configuration doesn't silently become the only line of defense.</p>
+<h3>7.3 Why both layers, rather than just one</h3>
+<p>URL-level rules are coarse and cheap — they run once per request, before any business logic, and are the right place for broad boundaries ("nothing under <code>/api/admin/**</code> is reachable without the ADMIN role"). But URL patterns can't express decisions that depend on data loaded during the request (like "only the order's owner may cancel it," or "only the product's own seller may edit it") — that requires the method to actually run far enough to know whose order or product it is. Method-level security fills that gap. In a well-designed system, URL rules act as a coarse first gate that rejects obviously unauthorized traffic as cheaply as possible, and method-level rules handle the finer-grained, data-dependent decisions that can only be evaluated once you're inside the call — the two layers are deliberately redundant at the boundary (an admin-only URL segment might also double-check the role at the method level, as <code>AdminRefundController</code> does above) precisely so that a mistake in one configuration doesn't silently become the only line of defense. For ShopSphere specifically, refunds are exactly the kind of operation worth this redundancy: a single missed check anywhere in the chain — a mistyped URL pattern, a forgotten annotation — would mean real customer money moving without an authorization boundary catching it, which is a materially worse failure mode than an over-cautious extra check that occasionally does nothing.</p>
 
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
 
@@ -253,10 +316,22 @@ public Order getOrder(Long id) { ... }</code></pre>
 <div class="qa-body">@PostAuthorize is proxy-based advice that evaluates its expression only after the underlying method has already fully executed, because the expression is allowed to reference returnObject, which doesn't exist until the method has returned a value. This means any side effect the method performed while producing that return value — a database write, a message published, an external API call — has already happened by the time the authorization check runs and potentially denies the caller the result. The denial only blocks the return value from propagating back to the caller; it does not, and structurally cannot, undo work the method already did. Any method with side effects should be gated by @PreAuthorize instead, since that check runs before the method body executes at all and can prevent it from running in the first place.</div>
 </details>
 
+<details class="concept-qa">
+<summary>After a ShopSphere customer logs in via Google, why doesn't ShopSphere just keep using Google's access token for all its own APIs?</summary>
+<div class="qa-body">Google's access token is scoped to Google's own resource servers — its audience is Google's APIs, and Google's authorization server has no concept of ShopSphere-specific facts like which role a user holds on ShopSphere, or what their internal customerId or sellerId is, because those concepts don't exist in Google's system at all. If ShopSphere's order-service tried to verify a Google access token, it would need to call back to Google on every request just to ask "is this still valid," reintroducing a network round-trip and an external dependency into ShopSphere's own request path — and even then, Google's token still couldn't carry ROLE_CUSTOMER/ROLE_SELLER/ROLE_ADMIN or a customerId, since only the actual issuer of a token controls what claims go into it. The correct pattern is to use Google purely as an identity provider at login time — validate its ID token once, resolve it to a local Customer record — and then have ShopSphere's own authorization server mint a first-party JWT scoped to ShopSphere's own audience, carrying exactly the claims ShopSphere's microservices need. This also means ShopSphere's services keep working, verifying tokens purely locally against ShopSphere's own public key, even if Google's login service is briefly unreachable after the initial login.</div>
+</details>
+
+<details class="concept-qa">
+<summary>In @PreAuthorize("hasRole('ADMIN') or #order.customerId == authentication.principal.customerId"), what is actually being evaluated, and why can refundOrder not reuse this same pattern?</summary>
+<div class="qa-body">This is a SpEL (Spring Expression Language) expression evaluated by the method-security AOP advice before cancelOrder's body runs. hasRole('ADMIN') checks the current Authentication's authorities for "ROLE_ADMIN" (recall that hasRole silently prefixes the string). #order refers to the actual Order object passed as a parameter to this specific invocation, resolved by parameter name. authentication.principal is the same principal populated by the JWT filter — for a JWT-based setup this exposes the verified token's claims, so .customerId reads a claim straight out of a cryptographically verified token rather than requiring an extra database lookup to establish identity. The whole expression short-circuits to true if either the caller is an Admin, or the order's own customerId claim matches the caller's customerId claim. refundOrder deliberately does not offer this same "or it's your own" branch, because a refund is not treated as equivalent in risk to a cancellation: cancelling your own unshipped order is a low-stakes convenience operation, but a refund reverses an actual payment capture, and ShopSphere's design choice is that only Admins may trigger that reversal — ownership of the order is irrelevant to that decision, which is exactly why the expression is just hasRole('ADMIN') with no ownership clause at all.</div>
+</details>
+
 <h2>Related Topics</h2>
 <div class="related-grid">
 <div class="related-card" onclick="window.location.hash='/spring-core-mechanics'"><div class="rc-title">Spring Core Mechanics</div><div class="rc-sub">Days 21–25 · method-level security (@PreAuthorize) is proxy-based AOP, and inherits the same self-invocation limitation covered there</div></div>
 <div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Foundational distributed-systems mechanics · stateless JWT verification and its revocation trade-off are a direct instance of the state-vs-coordination tension in distributed design</div></div>
 <div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience &amp; Fault Tolerance</div><div class="rc-sub">Failure-handling patterns · token expiry, refresh flows, and blocklists are resilience/mitigation patterns applied specifically to auth</div></div>
 <div class="related-card" onclick="window.location.hash='/observability-production'"><div class="rc-title">Observability in Production</div><div class="rc-sub">Production operations · diagnosing 401 vs 403 misclassification and key-rotation failures requires tracing requests through the filter chain</div></div>
+<div class="related-card" onclick="window.location.hash='/security-hardening-owasp'"><div class="rc-title">Security Hardening: Input Validation, Secrets Management &amp; OWASP Top 10</div><div class="rc-sub">Signing keys, client secrets, and JWT claims covered here are exactly the secrets and trust boundaries OWASP hardening practices protect</div></div>
+<div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'"><div class="rc-title">Payment Systems &amp; Idempotent Transactions</div><div class="rc-sub">refundOrder's Admin-only gate protects the same money-moving path that idempotency keys protect from duplicate payment capture/refund</div></div>
 </div>

@@ -16,22 +16,45 @@
 </div>
 
 <h2>1. Why Resilience Patterns Exist: Cascading Failure</h2>
-<p>Consider a checkout service that calls an inventory service over HTTP. Under normal conditions the inventory service responds in 20ms. Now suppose the inventory database starts running a slow migration and response times climb to 30 seconds. Nothing has crashed — the inventory service is technically "up." But here is what happens to the checkout service if nothing is in place to stop it:</p>
+<p>Consider ShopSphere's <code>order-service</code> calling <code>inventory-service</code> over HTTP to reserve stock during checkout. Under normal conditions inventory-service responds in 20ms. Now suppose inventory-service's database starts running a slow migration and response times climb to 30 seconds. Nothing has crashed — inventory-service is technically "up." But here is what happens to order-service if nothing is in place to stop it:</p>
 <ul>
-  <li>Every incoming checkout request opens a connection to inventory and blocks a thread waiting for a response.</li>
-  <li>Checkout's HTTP server (say, Tomcat with a 200-thread pool) fills up within seconds, because threads that used to return in 20ms now hold on for 30 seconds — a 1500x increase in occupancy time per request.</li>
-  <li>Once all 200 threads are blocked on inventory calls, checkout can no longer accept <em>any</em> new request — including requests that don't even touch inventory, like "get my order history."</li>
-  <li>Upstream of checkout, whatever calls checkout (an API gateway, a UI backend-for-frontend) now sees checkout itself as slow/unresponsive, and the same thread-exhaustion pattern repeats one layer up.</li>
+  <li>Every incoming checkout request opens a connection to inventory-service and blocks a thread waiting for a response.</li>
+  <li>order-service's HTTP server (say, Tomcat with a 200-thread pool) fills up within seconds, because threads that used to return in 20ms now hold on for 30 seconds — a 1500x increase in occupancy time per request.</li>
+  <li>Once all 200 threads are blocked on inventory-service calls, order-service can no longer accept <em>any</em> new request — including requests that don't even touch inventory, like a customer fetching their order history.</li>
+  <li>Upstream of order-service, whatever calls it (an API gateway, a UI backend-for-frontend) now sees order-service itself as slow/unresponsive, and the same thread-exhaustion pattern repeats one layer up — a customer's checkout page hangs, and a flash-sale spike hammering checkout makes the whole thing collapse faster because there are simply more concurrent requests racing to exhaust the same pool.</li>
 </ul>
-<p>This is <strong>cascading failure</strong>: a localized, partial degradation in one node propagates outward and amplifies, because the resource that failure consumes (threads, connections, memory) is shared with unrelated work. The single most important mental model in this whole topic is that resilience patterns exist to protect a service's <em>own</em> finite resources from being consumed by someone else's problem — not to fix the downstream service. Nothing here makes inventory faster; everything here is about containing the blast radius in checkout.</p>
+<p>This is <strong>cascading failure</strong>: a localized, partial degradation in one node propagates outward and amplifies, because the resource that failure consumes (threads, connections, memory) is shared with unrelated work. The single most important mental model in this whole topic is that resilience patterns exist to protect a service's <em>own</em> finite resources from being consumed by someone else's problem — not to fix the downstream service. Nothing here makes inventory-service faster; everything here is about containing the blast radius in order-service.</p>
 <p>The four mechanisms in this page attack four different points in that chain: <strong>timeouts</strong> bound how long a thread can be held hostage; <strong>circuit breakers</strong> stop sending requests to a downstream that is already failing, so threads stop queuing up at all; <strong>bulkheads</strong> make sure that even if one dependency's pool is fully consumed, other dependencies keep working; and <strong>rate limiting</strong> protects a service from being overwhelmed by callers (including well-behaved ones retrying) in the first place. This composes directly with <a href="#/microservice-patterns">microservice-patterns</a>, since the whole reason these mechanisms are load-bearing is that a call graph now crosses process and network boundaries instead of staying in-process.</p>
+
+<h3>A taxonomy of the patterns on this page</h3>
+<p>All five mechanisms below are answers to the same question — "what do we do when a dependency is slow, down, or overwhelmed?" — but they differ in <em>which side</em> of the call they protect and <em>when</em> they act. It helps to see them laid out as one tree before going through each in depth:</p>
+<pre><code>Resilience Patterns
+  │
+  ├─ Protect the CALLER from a failing/slow DOWNSTREAM
+  │    │
+  │    ├─ Timeout            — bound how long one attempt can block (§2)
+  │    ├─ Retry + Backoff     — re-attempt a transient failure, spaced out safely (§5)
+  │    ├─ Circuit Breaker     — stop calling a downstream once it's known to be failing (§3)
+  │    └─ Bulkhead            — isolate resource pools so one dependency's failure
+  │                              can't starve calls to a different dependency (§4)
+  │
+  └─ Protect a SERVICE from being overwhelmed by its own CALLERS
+       │
+       └─ Rate Limiting       — reject/queue excess incoming requests before they
+                                  consume resources at all (§6)
+             ├─ Token Bucket
+             ├─ Leaky Bucket
+             ├─ Fixed Window Counter
+             └─ Sliding Window (Log / Counter)
+</code></pre>
+<p>Notice the asymmetry: the first four patterns are things order-service does when it is the <em>client</em> of inventory-service, payment-service, or any other downstream — they live in the calling code, wrapped around the outbound call. Rate limiting is the mirror image — it's what payment-service or inventory-service does at its own front door to protect itself from order-service (or a flash sale's worth of customers) sending too much traffic. A mature service typically plays both roles simultaneously: it rate-limits its inbound API, and it wraps its own outbound calls to other services in timeouts, retries, circuit breakers, and bulkheads.</p>
 
 <h2>2. Timeouts: The Primitive Everything Else Builds On</h2>
 <p>A network call without an explicit timeout is a call that can block forever — or, more precisely, until the underlying TCP stack or OS gives up, which can be minutes. Most HTTP clients (Apache HttpClient, OkHttp, Java's <code>HttpClient</code>, Spring's <code>RestTemplate</code>/<code>WebClient</code>) default to <em>no timeout</em> or an extremely long one unless you set it explicitly. That default exists because a generic library can't know what a reasonable wait is for your use case — but it means "no timeout" is the actual behavior unless someone configures otherwise.</p>
 <p>There are two timeouts that matter for every outbound call, and they protect against different failure modes:</p>
 <ul>
   <li><strong>Connect timeout</strong> — how long to wait to establish the TCP connection (and TLS handshake). Protects against a downstream host that is unreachable or a network partition where SYN packets vanish. Typically short: 1-3 seconds.</li>
-  <li><strong>Read/response timeout</strong> — how long to wait for the response body once the request has been sent. Protects against a downstream that accepted the connection but is stuck (slow query, deadlock, GC pause). This is the one that matters most for the cascading-failure scenario above.</li>
+  <li><strong>Read/response timeout</strong> — how long to wait for the response body once the request has been sent. Protects against a downstream that accepted the connection but is stuck (slow query, deadlock, GC pause). This is the one that matters most for the cascading-failure scenario above — e.g. order-service waiting on payment-service to finish capturing a card charge against a payment gateway that's currently degraded.</li>
 </ul>
 <div class="callout warn">
   <div class="callout-title">Setting a timeout without a plan for what happens after it fires solves half the problem</div>
@@ -40,8 +63,9 @@
 <p>Choosing the value itself is a trade-off, not a constant you can look up: too short and you abort requests that would have succeeded a moment later (turning transient slowness into hard errors); too long and you've only weakened, not solved, thread exhaustion. A common approach is to set the timeout close to a high percentile (p99) of the downstream's normal latency distribution, obtained from <a href="#/observability-production">observability-production</a> data, not guessed.</p>
 
 <h2>3. Circuit Breaker: Fail Fast Instead of Queuing Behind a Dying Dependency</h2>
-<p>A timeout still makes every caller pay the full timeout duration before failing — if inventory is completely down, every request still burns 3 seconds finding that out. Worse, every one of those requests is still landing on inventory, adding load to a system that is already struggling, possibly making its recovery slower. The circuit breaker pattern solves both problems: once it has enough evidence that a dependency is unhealthy, it stops sending requests to it entirely for a while, failing immediately (or falling back) without even attempting the network call.</p>
+<p>A timeout still makes every caller pay the full timeout duration before failing — if payment-service's upstream payment gateway is completely down, every checkout request still burns 3 seconds finding that out. Worse, every one of those requests is still landing on the gateway, adding load to a system that is already struggling, possibly making its recovery slower. The circuit breaker pattern solves both problems: once it has enough evidence that a dependency is unhealthy, it stops sending requests to it entirely for a while, failing immediately (or falling back) without even attempting the network call.</p>
 <p>The name is a deliberate analogy to an electrical circuit breaker: rather than letting current (requests) keep flowing into a short circuit (a failing dependency) and causing more damage, the breaker trips and cuts the circuit until it's safe to test again.</p>
+<p>The canonical ShopSphere example is exactly the payment path: payment-service calls out to a third-party payment gateway to capture a card charge for an <code>Order</code>. That gateway is outside ShopSphere's control — it can slow down, rate-limit ShopSphere, or go fully unavailable during a provider-side incident, and payment-service has no ability to fix any of that. What it can control is not making things worse for itself and its own callers (order-service, and the checkout flow behind it) while the gateway is unhealthy.</p>
 
 <h3>The three states and their exact transitions</h3>
 <table>
@@ -74,64 +98,67 @@
     .permittedNumberOfCallsInHalfOpenState(5)     // trial requests before deciding
     .build();
 
-CircuitBreaker breaker = CircuitBreaker.of("inventoryService", config);
+CircuitBreaker breaker = CircuitBreaker.of("paymentGateway", config);
 
-Supplier&lt;InventoryResponse&gt; decorated = CircuitBreaker
-    .decorateSupplier(breaker, () -&gt; inventoryClient.checkStock(sku));
+Supplier&lt;PaymentResult&gt; decorated = CircuitBreaker
+    .decorateSupplier(breaker, () -&gt; paymentGatewayClient.capture(payment));
 
-InventoryResponse response = Try.ofSupplier(decorated)
-    .recover(CallNotPermittedException.class, ex -&gt; InventoryResponse.assumeAvailable())
+PaymentResult result = Try.ofSupplier(decorated)
+    .recover(CallNotPermittedException.class, ex -&gt; PaymentResult.pendingRetryLater(payment.getId()))
     .get();
 </code></pre>
-<p>That <code>recover</code> step matters as much as the breaker configuration itself: a breaker that's Open and has no fallback just converts one kind of failure (slow timeout) into another (immediate exception) — which is progress for thread exhaustion, but the caller still needs a decision about what to return to <em>its</em> caller. Common fallbacks: return cached/stale data, return a default/degraded response ("assume in stock, reconcile later"), or propagate a fast, clear error rather than a vague timeout.</p>
+<p>That <code>recover</code> step matters as much as the breaker configuration itself: a breaker that's Open and has no fallback just converts one kind of failure (slow timeout) into another (immediate exception) — which is progress for thread exhaustion, but the caller still needs a decision about what to return to <em>its</em> caller. For a payment capture specifically, the fallback cannot be "assume it succeeded" — money is on the line, so a payment must never be optimistically marked <code>CAPTURED</code> without genuine confirmation from the gateway. The correct fallback here is to leave the <code>Payment</code> in <code>PENDING</code>, return a clear "try again shortly" response to the customer, and let a reconciliation job (or the customer retrying checkout) resolve it once the gateway recovers — never silently mark the order <code>PAID</code> on a fallback path. This is exactly the kind of decision covered in depth in <a href="#/payment-systems-idempotency">payment-systems-idempotency</a>, alongside the <code>idempotencyKey</code> on <code>Payment</code> that makes it safe to retry a capture call at all without risking a double charge.</p>
 
 <h2>4. Bulkhead: Isolating Resource Pools Per Dependency</h2>
-<p>A circuit breaker stops a caller from sending more requests to a dependency that's already been observed failing — but it does nothing to prevent the damage from the requests that were in flight <em>while</em> the breaker was still Closed and the failure rate was climbing toward the threshold. If checkout uses one shared thread pool for calls to inventory, pricing, and shipping, and inventory starts slowing down, the requests to inventory can consume all the threads in that shared pool before the breaker even trips — starving pricing and shipping calls that have nothing wrong with them.</p>
-<p>The bulkhead pattern, named after the watertight compartments that divide a ship's hull so that flooding in one compartment doesn't sink the whole vessel, fixes this by giving each dependency (or each class of work) its own isolated resource pool. If inventory's pool is exhausted, calls to pricing and shipping proceed normally on their own separate pools, because there is no shared resource left to contend over.</p>
+<p>A circuit breaker stops a caller from sending more requests to a dependency that's already been observed failing — but it does nothing to prevent the damage from the requests that were in flight <em>while</em> the breaker was still Closed and the failure rate was climbing toward the threshold. Suppose ShopSphere's checkout page render path calls both <code>catalog-service</code> (to fetch product names/images for the order summary) and <code>inventory-service</code> (to confirm stock is still reserved) from the same backend-for-frontend. If both calls share one thread pool, and inventory-service starts slowing down under a flash-sale spike, the requests to inventory-service can consume all the threads in that shared pool before the breaker even trips — starving catalog-service calls that have nothing wrong with them, and now a customer can't even see their order summary because of a problem entirely unrelated to the catalog.</p>
+<p>The bulkhead pattern, named after the watertight compartments that divide a ship's hull so that flooding in one compartment doesn't sink the whole vessel, fixes this by giving each dependency (or each class of work) its own isolated resource pool. If inventory-service's pool is exhausted, calls to catalog-service proceed normally on their own separate pool, because there is no shared resource left to contend over.</p>
 <h3>Two implementations of bulkhead isolation</h3>
 <table>
   <tr><th>Style</th><th>Mechanism</th><th>Trade-off</th></tr>
-  <tr><td><strong>Thread pool isolation</strong></td><td>Each dependency gets its own dedicated executor/thread pool with a fixed size. Calls run on that pool; if it's full, new calls are rejected immediately (or queued up to a bounded queue).</td><td>Strong isolation — a stuck thread calling inventory literally cannot touch shipping's threads. Costs more memory/context-switch overhead per pool, and requires calls to be dispatched onto another thread if the calling code is otherwise synchronous.</td></tr>
+  <tr><td><strong>Thread pool isolation</strong></td><td>Each dependency gets its own dedicated executor/thread pool with a fixed size. Calls run on that pool; if it's full, new calls are rejected immediately (or queued up to a bounded queue).</td><td>Strong isolation — a stuck thread calling inventory-service literally cannot touch catalog-service's threads. Costs more memory/context-switch overhead per pool, and requires calls to be dispatched onto another thread if the calling code is otherwise synchronous.</td></tr>
   <tr><td><strong>Semaphore isolation</strong></td><td>All calls still run on the caller's own thread (e.g. the servlet thread that received the request), but a counting semaphore caps how many concurrent calls to a given dependency are allowed; extra calls are rejected immediately rather than blocking.</td><td>Cheaper (no extra threads), but a slow call still occupies the original calling thread for its full duration — it limits <em>concurrency</em> to the dependency, not the time a caller thread is held.</td></tr>
 </table>
-<pre><code>ThreadPoolBulkheadConfig inventoryPool = ThreadPoolBulkheadConfig.custom()
+<pre><code>ThreadPoolBulkheadConfig inventoryServicePool = ThreadPoolBulkheadConfig.custom()
     .maxThreadPoolSize(10)
     .coreThreadPoolSize(5)
     .queueCapacity(20)
     .build();
 
-ThreadPoolBulkheadConfig pricingPool = ThreadPoolBulkheadConfig.custom()
+ThreadPoolBulkheadConfig catalogServicePool = ThreadPoolBulkheadConfig.custom()
     .maxThreadPoolSize(10)
     .coreThreadPoolSize(5)
     .queueCapacity(20)
     .build();
-// Two independent registries -&gt; inventory saturating its pool
-// cannot delay a single pricing call.
+// Two independent registries -&gt; inventory-service saturating its pool
+// during a flash sale cannot delay a single catalog-service call.
+
+Bulkhead inventoryBulkhead = ThreadPoolBulkhead.of("inventoryService", inventoryServicePool);
+Bulkhead catalogBulkhead   = ThreadPoolBulkhead.of("catalogService", catalogServicePool);
 </code></pre>
 <div class="callout tip">
   <div class="callout-title">Bulkheads and connection pools need the same treatment</div>
-  <p>The thread pool is only half the resource. If checkout's HTTP client uses one shared connection pool (e.g. one Apache <code>PoolingHttpClientConnectionManager</code>) for all downstreams, a dependency that's slow to respond will hold onto its checked-out connections, starving the connection pool the same way it would starve a thread pool — even if the threads themselves are bulkheaded correctly. Per-dependency connection pools (or at minimum a per-route max-connections cap, which most HTTP clients support) are the connection-level equivalent of a bulkhead.</p>
+  <p>The thread pool is only half the resource. If the BFF's HTTP client uses one shared connection pool (e.g. one Apache <code>PoolingHttpClientConnectionManager</code>) for all downstreams, a dependency that's slow to respond will hold onto its checked-out connections, starving the connection pool the same way it would starve a thread pool — even if the threads themselves are bulkheaded correctly. Per-dependency connection pools (or at minimum a per-route max-connections cap, which most HTTP clients support) are the connection-level equivalent of a bulkhead.</p>
 </div>
 <p>This composes directly with thread pool sizing and executor design in <a href="#/concurrency-multithreading">concurrency-multithreading</a> — a bulkhead is, mechanically, just a dedicated <code>ExecutorService</code> or semaphore per dependency; the resilience insight is entirely about <em>why</em> you partition them that way, not a new concurrency primitive.</p>
 
 <h2>5. Retries: Necessary, But a Naive Retry Can Turn a Blip Into an Outage</h2>
 <p>Not every failure is worth failing hard on. A single dropped packet, a momentary GC pause, a load balancer routing one request to an instance mid-restart — these are exactly the transient failures that a retry can paper over invisibly. But retrying is not free, and done naively it actively makes things worse in exactly the scenario where it matters most: when the downstream is already under load.</p>
 <h3>Retry storms</h3>
-<p>Suppose 1,000 concurrent requests all hit a downstream that's briefly overloaded and returns errors for a window of 2 seconds. If every caller retries immediately, you now have roughly 2,000 requests hitting the downstream right after the blip — precisely when it's least able to absorb extra load, since it's already the reason for the errors. If those retries also fail and are retried again, the load multiplies again. This is a <strong>retry storm</strong>: retries that were meant to smooth over transient failure instead amplify load at the worst possible moment, and can turn a brief blip into a sustained outage because the downstream never gets a chance to drain its backlog.</p>
+<p>Suppose a flash sale drops and 1,000 concurrent checkout requests all hit payment-service's payment gateway integration right as the gateway becomes briefly overloaded and returns errors for a window of 2 seconds. If every caller retries immediately, you now have roughly 2,000 requests hitting the gateway right after the blip — precisely when it's least able to absorb extra load, since it's already the reason for the errors. If those retries also fail and are retried again, the load multiplies again. This is a <strong>retry storm</strong>: retries that were meant to smooth over transient failure instead amplify load at the worst possible moment, and can turn a brief blip into a sustained outage because the downstream never gets a chance to drain its backlog.</p>
 <h3>The standard mitigations</h3>
 <ul>
   <li><strong>Exponential backoff</strong> — instead of retrying immediately, wait an exponentially increasing interval between attempts (e.g. 100ms, 200ms, 400ms, 800ms...), capped at some maximum. This spreads retries out over time instead of concentrating them right after the failure.</li>
   <li><strong>Jitter</strong> — add randomness to the backoff interval (e.g. a random value in <code>[0, backoff]</code>, or <code>backoff/2 + random(0, backoff/2)</code>) so that many callers who failed at the same moment don't all retry at the same moment. Without jitter, exponential backoff alone can produce a "thundering herd" that's merely delayed rather than eliminated — 1,000 callers with the exact same backoff schedule all retry in near-perfect sync at t+100ms, t+300ms, etc. AWS's own architecture guidance is explicit that "full jitter" (a fully randomized backoff, not just a randomized offset around a fixed backoff) gives the best reduction in total work done against the downstream.</li>
   <li><strong>Retry budgets / caps</strong> — a hard limit on total retry attempts (e.g. max 2 retries per request), and often a service-wide budget (e.g. retries may not exceed 10% of total request volume in a given window). A budget prevents the degenerate case where a systemic outage causes every single request to be retried the maximum number of times, multiplying total load by (1 + max_retries) right when capacity is lowest.</li>
-  <li><strong>Retry only on the right failures</strong> — retry on timeouts, connection failures, and 5xx/503 responses; never retry on 4xx client errors (the request is wrong, retrying won't fix it) and never retry non-idempotent operations (a POST that charges a card) unless the operation has been made idempotent via an idempotency key.</li>
+  <li><strong>Retry only on the right failures</strong> — retry on timeouts, connection failures, and 5xx/503 responses; never retry on 4xx client errors (the request is wrong, retrying won't fix it) and never retry non-idempotent operations (a POST that charges a card via ShopSphere's payment gateway, for instance) unless the operation has been made idempotent via an idempotency key — see <a href="#/payment-systems-idempotency">payment-systems-idempotency</a> for exactly how that key prevents a retried payment capture from charging a customer twice.</li>
 </ul>
 <div class="callout warn">
   <div class="callout-title">Retries and circuit breakers must be layered in the right order</div>
-  <p>If you configure a circuit breaker per attempt <em>inside</em> a retry loop, each retry re-evaluates the same already-tripped breaker and fails fast correctly. But if you retry <em>around</em> the breaker in the wrong order, or run retries against a breaker with a window so small that a burst of retries alone can trip it, you can get surprising trips that have nothing to do with the downstream's real health. The composition in <a href="#section-7">section 7</a> below (timeout → retry → circuit breaker → bulkhead, outside-in) is the ordering that avoids this: the breaker sits outside the retry loop, seeing the aggregate outcome, and once it's Open, the retry loop itself never fires because the call fails immediately before a retry is even attempted.</p>
+  <p>If you configure a circuit breaker per attempt <em>inside</em> a retry loop, each retry re-evaluates the same already-tripped breaker and fails fast correctly. But if you retry <em>around</em> the breaker in the wrong order, or run retries against a breaker with a window so small that a burst of retries alone can trip it, you can get surprising trips that have nothing to do with the downstream's real health. The composition in section 7 below (timeout → retry → circuit breaker → bulkhead, outside-in) is the ordering that avoids this: the breaker sits outside the retry loop, seeing the aggregate outcome, and once it's Open, the retry loop itself never fires because the call fails immediately before a retry is even attempted.</p>
 </div>
 
 <h2>6. Rate Limiting: Protecting a Service From Its Callers</h2>
-<p>Everything above protects a caller from a downstream that's failing. Rate limiting inverts the direction: it protects a service from being overwhelmed by its callers, whether that's a client sending too much legitimate traffic, an abusive/misbehaving client, or — notably — a fleet of callers all retrying at once against a service that's trying to recover. A well-designed retry policy and a rate limiter address the same underlying risk (surge amplification) from opposite sides of the connection.</p>
+<p>Everything above protects a caller from a downstream that's failing. Rate limiting inverts the direction: it protects a service from being overwhelmed by its callers, whether that's a client sending too much legitimate traffic, an abusive/misbehaving client, or — notably — a fleet of callers all retrying at once against a service that's trying to recover. Picture a flash sale: thousands of customers hit ShopSphere's checkout API in the same 10-second window, and order-service needs to reject excess traffic at the door rather than let every request queue up and exhaust its thread pool the way section 1 described. A well-designed retry policy and a rate limiter address the same underlying risk (surge amplification) from opposite sides of the connection.</p>
 <h3>Token Bucket</h3>
 <p>A bucket holds up to <em>capacity</em> tokens. Tokens are added at a fixed rate (e.g. 10 tokens/second) up to that capacity; each incoming request consumes one token; if no token is available, the request is rejected (or queued, in some variants). Because tokens can accumulate up to the bucket's capacity during idle periods, a client that's been quiet can burst up to <em>capacity</em> requests instantly before being throttled back to the steady refill rate. This is the algorithm of choice when bounded bursts are acceptable or even desirable (e.g. a user loading a page that fires 15 API calls at once).</p>
 <h3>Leaky Bucket</h3>
@@ -150,16 +177,17 @@ ThreadPoolBulkheadConfig pricingPool = ThreadPoolBulkheadConfig.custom()
 </table>
 
 <h3>Distributed rate limiting with Redis</h3>
-<p>A single instance can rate limit in-process with a local counter, but any service running more than one instance behind a load balancer needs the counter to be shared — otherwise a limit of "100 requests/minute" becomes "100 requests/minute/instance," silently multiplying the effective limit by the instance count. Redis is the standard choice because it's fast, supports atomic operations, and every instance can reach it.</p>
+<p>A single instance can rate limit in-process with a local counter, but any service running more than one instance behind a load balancer needs the counter to be shared — otherwise a limit of "100 checkout requests/minute per customer" becomes "100 requests/minute/instance," silently multiplying the effective limit by the instance count across order-service's fleet. Redis is the standard choice because it's fast, supports atomic operations, and every instance can reach it.</p>
 <p>The naive approach — <code>GET</code> the counter, check it in application code, then <code>INCR</code> it — has a race: two instances can both <code>GET</code> the same value below the limit, both decide to allow the request, and both <code>INCR</code>, letting the count exceed the limit. The fix is to make the read-check-increment sequence atomic, either by leaning on Redis's own atomic primitives or with a Lua script:</p>
 <pre><code>-- INCR + EXPIRE combined atomically via Lua so the counter's TTL
 -- is only set once, on the first request in a fresh window.
+-- KEYS[1] = "ratelimit:checkout:{customerId}"
 local current = redis.call("INCR", KEYS[1])
 if tonumber(current) == 1 then
     redis.call("EXPIRE", KEYS[1], ARGV[1])   -- window length in seconds
 end
 if tonumber(current) > tonumber(ARGV[2]) then
-    return 0   -- over the limit, reject
+    return 0   -- over the limit, reject this checkout attempt
 end
 return 1       -- allowed
 </code></pre>
@@ -169,7 +197,7 @@ return 1       -- allowed
   <p>A rate limiter at the API gateway protects the whole fleet from a single abusive client and is the right place for per-client/per-API-key quotas. A rate limiter inside a service, guarding calls <em>to</em> a specific downstream, is really acting as a self-imposed throttle to avoid being the source of a retry storm against that downstream — conceptually closer to a bulkhead than to gateway-level throttling, even though the algorithm is identical.</p>
 </div>
 
-<h2 id="section-7">7. How These Patterns Compose in a Real Call Path</h2>
+<h2>7. How These Patterns Compose in a Real Call Path</h2>
 <p>None of these mechanisms replace each other — a mature outbound call is wrapped by all of them, in a specific nesting order, each one guarding against a different failure mode that the others don't cover:</p>
 <pre><code>Bulkhead
   └─ Circuit Breaker
@@ -179,14 +207,14 @@ return 1       -- allowed
 </code></pre>
 <p>Reading from the inside out: the <strong>timeout</strong> bounds a single attempt so it cannot hang forever. The <strong>retry</strong> wraps the timeout, so a single failed/timed-out attempt gets a bounded number of further attempts, spaced out to avoid amplifying load. The <strong>circuit breaker</strong> wraps the whole retry sequence, watching the aggregate success/failure rate across many calls (not just one call's retries) so that once the downstream is reliably failing, subsequent calls skip the retry loop entirely and fail in microseconds instead of spending a full timeout-times-retries budget finding out again. The <strong>bulkhead</strong> is the outermost boundary — it's not really "around" the call in a temporal sense, it's the resource pool (thread pool, semaphore, connection pool) that the entire stack above executes inside, ensuring that whatever this dependency does to its own slice of resources, it cannot spill into calls to a different dependency.</p>
 <p>Concretely, with Resilience4j, this is exactly how the decorators are meant to be stacked (order matters — decorators apply in the reverse order they're composed, so the outermost-registered decorator is the outermost behavior):</p>
-<pre><code>Supplier&lt;Response&gt; call = () -&gt; inventoryClient.checkStock(sku);
+<pre><code>Supplier&lt;PaymentResult&gt; call = () -&gt; paymentGatewayClient.capture(payment);
 
-Supplier&lt;Response&gt; withTimeout   = TimeLimiter.decorateFutureSupplier(timeLimiter, futureSupplier(call));
-Supplier&lt;Response&gt; withRetry     = Retry.decorateSupplier(retry, withTimeout);
-Supplier&lt;Response&gt; withBreaker   = CircuitBreaker.decorateSupplier(breaker, withRetry);
-Supplier&lt;Response&gt; withBulkhead  = Bulkhead.decorateSupplier(bulkhead, withBreaker);
+Supplier&lt;PaymentResult&gt; withTimeout   = TimeLimiter.decorateFutureSupplier(timeLimiter, futureSupplier(call));
+Supplier&lt;PaymentResult&gt; withRetry     = Retry.decorateSupplier(retry, withTimeout);
+Supplier&lt;PaymentResult&gt; withBreaker   = CircuitBreaker.decorateSupplier(breaker, withRetry);
+Supplier&lt;PaymentResult&gt; withBulkhead  = Bulkhead.decorateSupplier(bulkhead, withBreaker);
 
-Response response = withBulkhead.get();
+PaymentResult result = withBulkhead.get();
 </code></pre>
 <p>It's worth internalizing why the circuit breaker must sit <em>outside</em> the retry rather than inside it: if the breaker were inside, it would only ever see the outcome of a single attempt within one retry loop and reset its perspective on every new incoming request, never accumulating the cross-request failure signal it needs to actually trip. Sitting outside, the breaker sees "this logical call, after all its retries, succeeded or failed," aggregates that across many logical calls, and once it trips, its Open state causes the entire retry-plus-timeout stack underneath it to be skipped — which is precisely the fast-fail behavior that stops a struggling downstream from being retried into the ground in the first place.</p>
 
@@ -225,6 +253,10 @@ Response response = withBulkhead.get();
   <div class="related-card" onclick="window.location.hash='/microservice-patterns'">
     <div class="rc-title">Microservice Patterns</div>
     <div class="rc-sub">Days 26–30 · Resilience exists because calls now cross process/network boundaries, not in-process ones</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'">
+    <div class="rc-title">Payment Systems & Idempotent Transactions</div>
+    <div class="rc-sub">Retrying a payment gateway call safely depends on the idempotency key mechanics covered there in depth</div>
   </div>
   <div class="related-card" onclick="window.location.hash='/concurrency-multithreading'">
     <div class="rc-title">Concurrency & Multithreading</div>

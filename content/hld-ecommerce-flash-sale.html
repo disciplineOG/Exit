@@ -5,6 +5,7 @@
 <span class="tag">Optimistic vs Pessimistic Concurrency</span>
 <span class="tag">Redis Atomic Counters</span>
 <span class="tag">Async Order Queueing</span>
+<span class="tag">Backpressure Taxonomy</span>
 <span class="tag">Cache Pre-Warming</span>
 <span class="tag">Saga Pattern</span>
 <span class="tag">Rate Limiting &amp; Bot Mitigation</span>
@@ -30,21 +31,21 @@
 
 <h2>2. The Inventory-Locking Problem</h2>
 <h3>The race condition in the naive approach</h3>
-<p>The obviously-wrong-but-instructive implementation is "check, then act":</p>
+<p>The obviously-wrong-but-instructive implementation is "check, then act" against the <code>Inventory</code> table (<code>productId</code>, <code>warehouseId</code>, <code>availableQty</code>, <code>reservedQty</code>):</p>
 <pre><code>// NOT safe under concurrency
-SELECT quantity FROM inventory WHERE product_id = 42;
-// application code checks: quantity > 0 ?
-UPDATE inventory SET quantity = quantity - 1 WHERE product_id = 42;</code></pre>
-<p>This looks correct read top-to-bottom in isolation, but correctness under concurrency is not a property of one thread's code path — it's a property of every possible interleaving of many threads' code paths. With 10,000 concurrent requests for a product with 1 unit left, all 10,000 can execute the <code>SELECT</code> at nearly the same moment, all read <code>quantity = 1</code>, all conclude "available," and all proceed to decrement. The database will happily execute 10,000 <code>UPDATE</code> statements (possibly driving the count negative, or requiring an application-side floor check that still doesn't prevent multiple successful "purchases" being recorded before anyone notices the count is wrong). The bug isn't in either statement individually — it's in the gap between them, during which the "check" result goes stale for every concurrent reader.</p>
+SELECT available_qty FROM inventory WHERE product_id = 'prod-42';
+// application code checks: available_qty > 0 ?
+UPDATE inventory SET available_qty = available_qty - 1 WHERE product_id = 'prod-42';</code></pre>
+<p>This looks correct read top-to-bottom in isolation, but correctness under concurrency is not a property of one thread's code path — it's a property of every possible interleaving of many threads' code paths. With 10,000 concurrent <code>Customer</code>s hitting checkout for a <code>Product</code> with 1 unit left, all 10,000 can execute the <code>SELECT</code> at nearly the same moment, all read <code>available_qty = 1</code>, all conclude "available," and all proceed to decrement. The database will happily execute 10,000 <code>UPDATE</code> statements (possibly driving the count negative, or requiring an application-side floor check that still doesn't prevent multiple successful "purchases" being recorded before anyone notices the count is wrong). The bug isn't in either statement individually — it's in the gap between them, during which the "check" result goes stale for every concurrent reader.</p>
 <p>This is exactly the classic lost-update anomaly, and it's why "it worked in my local test with one browser tab" is meaningless evidence for this code path — the failure only appears under genuine concurrent access, which is precisely what a flash sale guarantees.</p>
 
 <h3>Solution A: Pessimistic row-level locking</h3>
 <p>The direct fix is to make the check-then-act sequence atomic by acquiring an exclusive lock on the row before reading it, so no other transaction can read-and-race until the first transaction commits or rolls back:</p>
 <pre><code>BEGIN;
-SELECT quantity FROM inventory WHERE product_id = 42 FOR UPDATE;
+SELECT available_qty FROM inventory WHERE product_id = 'prod-42' FOR UPDATE;
 -- row is now locked; every other transaction requesting
 -- FOR UPDATE on this row blocks here until we commit/rollback
-UPDATE inventory SET quantity = quantity - 1 WHERE product_id = 42;
+UPDATE inventory SET available_qty = available_qty - 1 WHERE product_id = 'prod-42';
 COMMIT;
 </code></pre>
 <p><code>SELECT ... FOR UPDATE</code> tells the database to take a row-level exclusive lock as part of the read, not just the write, closing the gap where a stale read could be acted on. This is genuinely correct — no amount of concurrency can cause an overshoot, because the database itself is now the serialization point.</p>
@@ -52,23 +53,23 @@ COMMIT;
 
 <h3>Solution B: Optimistic locking with a version column</h3>
 <p>Optimistic locking assumes contention is the exception rather than the rule and only pays a penalty when a conflict actually happens, rather than serializing every access up front:</p>
-<pre><code>SELECT quantity, version FROM inventory WHERE product_id = 42;
--- application checks quantity > 0
+<pre><code>SELECT available_qty, version FROM inventory WHERE product_id = 'prod-42';
+-- application checks available_qty > 0
 
 UPDATE inventory
-SET quantity = quantity - 1, version = version + 1
-WHERE product_id = 42 AND version = :versionReadEarlier;
+SET available_qty = available_qty - 1, version = version + 1
+WHERE product_id = 'prod-42' AND version = :versionReadEarlier;
 -- if 0 rows affected, someone else updated first: retry from the SELECT</code></pre>
 <p>No lock is held between the read and the write. Instead, the <code>WHERE version = :versionReadEarlier</code> clause makes the update conditional on nothing else having changed the row in between. If another transaction won the race and updated the row first, the version no longer matches, zero rows are affected, and the application detects this and retries the whole read-modify-write cycle.</p>
 <p>Under moderate contention this is a clear win — most requests succeed on the first try with no blocking at all, so throughput is much closer to the database's raw update capacity than the pessimistic approach. But it degrades badly under <em>extreme</em> contention, which is exactly the flash-sale regime: if 10,000 requests are racing for the last few units, the vast majority will fail their version check and retry, and those retries re-contend with the next wave of retries, producing a retry storm — a self-inflicted amplification of load where the system spends most of its capacity re-attempting work that will mostly fail again, rather than making forward progress. Optimistic locking assumes conflicts are rare; a flash sale on a scarce item is a scenario engineered to make conflicts the common case.</p>
 
 <h3>Solution C: Move the hot counter into Redis</h3>
 <p>The insight that actually resolves the tension is that the database doesn't need to be the arbiter of the hot counter at all. Redis is single-threaded for command execution, which means a single <code>DECR</code> is inherently atomic with no locking overhead — there's no interleaving to race against because commands execute one at a time, in order, by construction:</p>
-<pre><code>DECR inventory:product:42
+<pre><code>DECR inventory:available:prod-42
 -- returns the new value atomically; if it goes below 0,
 -- that request "lost" and should not proceed to checkout</code></pre>
 <p>This alone handles the decrement atomically, but a plain <code>DECR</code> can't express "decrement only if the result would stay non-negative" as a single operation — you'd be back to check-then-act if you read the value first. The fix is a Lua script, which Redis executes atomically as a single unit (no other command can run in the middle of it):</p>
-<pre><code>-- KEYS[1] = inventory:product:42
+<pre><code>-- KEYS[1] = inventory:available:prod-42
 local stock = tonumber(redis.call('GET', KEYS[1]))
 if stock and stock > 0 then
     redis.call('DECR', KEYS[1])
@@ -92,13 +93,52 @@ end</code></pre>
 </div>
 
 <h2>3. Queueing Instead of Processing Synchronously</h2>
-<p>Even with an atomic Redis decrement, synchronously handling every incoming "buy" request end-to-end — validate, reserve inventory, charge payment, create order, confirm — means every one of the 100-1000x spike of requests is doing real, non-trivial work on the request thread, including a call to an external payment provider that the system does not control the latency of. The pattern that actually survives the spike is to shrink the synchronous critical path down to the bare minimum needed to make a correctness decision, and defer everything else.</p>
-<p>Concretely: the purchase endpoint does only the atomic inventory check-and-reserve (the Lua script in Section 2), and if a unit was successfully reserved, it publishes a "process this order" message to a queue and immediately returns an acknowledgment to the user — something like "we've received your request, you'll be notified" — rather than a final "your order is confirmed" response. A pool of consumer workers, sized to what the payment provider and order database can sustainably handle (not sized to match the spike), drains the queue at a controlled rate and performs the slower steps: payment capture, order persistence, shipping kickoff.</p>
-<p>This is a direct application of load leveling: the queue acts as a buffer that absorbs the burst and lets consumers process at a smooth, sustainable rate instead of being forced to scale instantaneously to match an instantaneous spike. It connects directly to the mechanics in <a href="#/async-messaging">async-messaging</a> — the queue needs at-least-once delivery with idempotent consumers (a network retry or consumer crash-and-redeliver must not double-charge or double-reserve), and a dead-letter path for orders that fail processing repeatedly (a declined card, a payment provider timeout) so they don't block the queue indefinitely.</p>
+<p>Even with an atomic Redis decrement, synchronously handling every incoming "buy" request end-to-end — validate, reserve inventory, charge payment, create the <code>Order</code>, confirm — means every one of the 100-1000x spike of requests is doing real, non-trivial work on the request thread, including a call to an external <code>Payment</code> provider that the system does not control the latency of. The pattern that actually survives the spike is to shrink the synchronous critical path down to the bare minimum needed to make a correctness decision, and defer everything else.</p>
+<p>Concretely: the checkout endpoint in <code>order-service</code> does only the atomic inventory check-and-reserve (the Lua script in Section 2), and if a unit was successfully reserved, it publishes an <code>OrderPlaced</code> event to a queue and immediately returns an acknowledgment to the <code>Customer</code> — something like "we've received your request, you'll be notified" — rather than a final "your order is confirmed" response. A pool of consumer workers in <code>payment-service</code> and <code>inventory-service</code>, sized to what the payment provider and the <code>Order</code>/<code>Inventory</code> tables can sustainably handle (not sized to match the spike), drains the queue at a controlled rate and performs the slower steps: <code>Payment</code> capture, order persistence, shipping kickoff.</p>
+<p>This is a direct application of load leveling: the queue acts as a buffer that absorbs the burst and lets consumers process at a smooth, sustainable rate instead of being forced to scale instantaneously to match an instantaneous spike. It connects directly to the mechanics in <a href="#/async-messaging">async-messaging</a> — the queue needs at-least-once delivery (a message is guaranteed to be delivered, but a crash or network blip between "processed" and "acknowledged" can cause the same message to be redelivered and processed twice) with idempotent consumers (each consumer must produce the same end result whether it processes a given message once or several times — typically enforced with the <code>Payment.idempotencyKey</code>, so a redelivered "charge this order" message doesn't double-charge the <code>Customer</code> or double-reserve the same unit). It also needs a dead-letter path: a separate queue that a message is automatically routed to after it has failed processing some configured number of times (a declined card, a payment provider timeout that never resolves), so a handful of permanently-failing orders don't sit at the head of the queue being retried forever and blocking every healthy order queued behind them.</p>
 <div class="callout tip">
 <div class="callout-title">The user experience genuinely changes, and that's the point</div>
 <p>This is a real product trade-off, not just an implementation detail: the user no longer gets an instant "confirmed" response, they get an instant "accepted" response followed by an asynchronous confirmation (push notification, email, or a status they can poll). This is the correct trade during a spike because a synchronous confirmation for every request would require synchronous capacity for every request, which is precisely what the system cannot provide at 100-1000x baseline. Communicating this honestly in the UI (a countdown, a queue position, or just "processing your order") is what makes the asynchronous model feel intentional rather than broken.</p>
 </div>
+
+<h3>3.1 The queueing/backpressure taxonomy</h3>
+<p>"Put it on a queue" is really a choice among several distinct strategies for what to do when arrival rate exceeds processing rate, and they trade off differently between latency, memory, and correctness. It's worth seeing them as one taxonomy rather than as unrelated tricks, because a flash sale typically uses more than one layer of it at once:</p>
+<pre><code>Backpressure / overload-handling strategies
+  |
+  ├── Do nothing (let the queue grow unbounded)
+  |     -> smooths bursts perfectly, but memory grows without limit and
+  |        latency for the last-in message grows without limit too --
+  |        never acceptable on a checkout path with real users waiting
+  |
+  ├── Bounded queue + block the producer
+  |     -> caller (the checkout request) blocks until there's room;
+  |        this just moves the pile-up from the queue to blocked
+  |        request threads/connections -- same problem, different location
+  |
+  ├── Bounded queue + reject/shed load (this design's checkout endpoint)
+  |     -> once the queue (or the Redis reservation gate) is full/exhausted,
+  |        new requests fail fast with a clear "sold out" / "try again"
+  |        response instead of waiting -- correctness-preserving, and the
+  |        fast Redis DECR check in Section 2 IS this: a full rejection
+  |        the instant stock hits zero, no request left dangling
+  |
+  ├── Rate limiting the producer (Section 7)
+  |     -> cap how fast requests are even allowed to attempt to enqueue,
+  |        independent of queue depth -- protects against a burst arriving
+  |        faster than the admission check itself can run
+  |
+  ├── Load leveling via async queue (this section)
+  |     -> decouple arrival rate from processing rate entirely; a bounded
+  |        number of consumers drain at a sustainable, constant rate while
+  |        the queue absorbs the difference for a bounded time window
+  |
+  └── Priority/SLA-aware draining
+        -> not all queued orders are equal (e.g. a VIP customer's order,
+           or one closest to a promised delivery cutoff); drain in
+           priority order instead of strict FIFO, the same PriorityQueue
+           idea covered on the collections-internals page, applied to a
+           durable message queue instead of an in-memory heap</code></pre>
+<p>The flash-sale design in this page actually layers three of these: the Redis gate in Section 2 sheds load the instant stock is exhausted (reject, not queue), the checkout-to-fulfillment hop in this section uses load leveling (queue, don't reject, because a reserved unit deserves to be fulfilled), and Section 7 adds rate limiting in front of both so the admission check itself is never overwhelmed.</p>
 
 <h2>4. Pre-Warming Caches Before the Sale Starts</h2>
 <p>A cache that is cold — empty, or evicted due to inactivity — is invisible during normal traffic because the first request that misses simply pays a one-time penalty populating it, and subsequent requests are fast. During a flash sale this dynamic is catastrophic instead of mild: the sale start time is a known, scheduled instant at which the entire spike arrives simultaneously, so if the cache is cold at that exact moment, the full 100-1000x request volume all misses at once and falls through to the origin (database, product service) simultaneously — which is worse than having no cache at all, because now every one of those requests also pays the overhead of a failed cache lookup on top of the origin hit, and the origin receives a thundering herd it was never sized for.</p>
@@ -117,36 +157,37 @@ end</code></pre>
 <p>The net effect is that the purchase path — the part of the system doing hot, contended, correctness-critical writes — only ever sees traffic from users who have actually decided to buy, not the much larger population still browsing or refreshing. Without this separation, read traffic alone could saturate the same database connections and application servers the purchase path depends on, causing the write path to degrade even though none of that read traffic was itself trying to buy anything.</p>
 
 <h2>6. The Saga Pattern for Order Fulfillment</h2>
-<p>Once an order moves past the initial inventory reservation, it typically spans multiple services or resources that cannot be updated in a single local database transaction: payment (often an external provider), inventory (a decrement that should become durable, not just reserved in Redis), order records, and shipping/fulfillment kickoff. Distributed transactions across these boundaries (two-phase commit) don't scale well and don't fit well with an external payment provider that has no notion of participating in your internal transaction protocol. The Saga pattern solves this by breaking the overall operation into a sequence of local transactions, each with a corresponding <strong>compensating action</strong> that undoes its effect if a later step in the sequence fails:</p>
-<pre><code>Step 1: Reserve inventory (Redis DECR, or a "reserved" status row)
-Step 2: Create order record (status = PENDING_PAYMENT)
-Step 3: Charge payment via provider
-Step 4: Confirm inventory decrement as final/durable
-Step 5: Kick off shipping/fulfillment
+<p>Once an <code>Order</code> moves past the initial inventory reservation, it typically spans multiple services or resources that cannot be updated in a single local database transaction: <code>payment-service</code> (talking to an external <code>Payment</code> provider), <code>inventory-service</code> (a decrement that should become durable, not just reserved in Redis), the <code>Order</code> record itself, and shipping/fulfillment kickoff. Distributed transactions across these boundaries (two-phase commit) don't scale well and don't fit well with an external payment provider that has no notion of participating in your internal transaction protocol. The Saga pattern solves this by breaking the overall operation into a sequence of local transactions, each with a corresponding <strong>compensating action</strong> that undoes its effect if a later step in the sequence fails:</p>
+<pre><code>Step 1: Reserve inventory (Redis DECR against Inventory.reservedQty,
+         or a "reserved" status row)
+Step 2: Create Order record (status = CREATED, then PENDING_PAYMENT)
+Step 3: Charge Payment via provider (Payment.status: PENDING -> CAPTURED/FAILED)
+Step 4: Confirm inventory decrement as final/durable (Inventory.availableQty--)
+Step 5: Kick off shipping/fulfillment (Order.status -> SHIPPED)
 
-If Step 3 (payment) fails:
-  -> Compensate Step 2: mark order CANCELLED
-  -> Compensate Step 1: release the reserved unit back to available stock
+If Step 3 (payment) fails (Payment.status = FAILED):
+  -> Compensate Step 2: mark Order CANCELLED
+  -> Compensate Step 1: release the reserved unit back to Inventory.availableQty
 
 If Step 5 (shipping kickoff) fails after payment succeeded:
   -> Retry shipping kickoff (idempotent), do NOT unwind payment —
      compensate forward, not backward, once money has moved</code></pre>
-<p>The critical design decision in a saga is choosing, for each step, whether a failure should be handled by compensating backward (undoing prior steps) or retrying forward (because undoing would itself be more disruptive or impossible — refunding a payment that already succeeded, for instance, is a much heavier operation than retrying a shipping API call). This is why the ordering in the pipeline above matters: inventory reservation happens before payment specifically so that a failed payment can cheaply release inventory that was only ever "reserved," not yet durably committed, whereas nothing after a successful payment should trigger an inventory-release compensation, because that would mean taking someone's money for an item no longer being reserved for them.</p>
-<p>This composes directly with the queueing model from Section 3: each saga step is naturally implemented as a queue consumer that, on success, publishes the next step's message, and on failure, publishes a compensation message rather than throwing an exception that's invisible to the rest of the pipeline. The full mechanics of choreographed versus orchestrated sagas, and how compensating actions are tracked and replayed reliably, are covered in <a href="#/distributed-systems-core">distributed-systems-core</a> — the flash sale is simply the domain where the consequence of getting this wrong (a charged customer with no reserved inventory, or reserved inventory nobody paid for) is maximally visible.</p>
+<p>The critical design decision in a saga is choosing, for each step, whether a failure should be handled by compensating backward (undoing prior steps) or retrying forward (because undoing would itself be more disruptive or impossible — refunding a <code>Payment</code> that already succeeded, for instance, is a much heavier operation than retrying a shipping API call). This is why the ordering in the pipeline above matters: inventory reservation happens before payment specifically so that a failed payment can cheaply release inventory that was only ever "reserved," not yet durably committed, whereas nothing after a successful payment should trigger an inventory-release compensation, because that would mean taking a <code>Customer</code>'s money for an item no longer being reserved for them.</p>
+<p>This composes directly with the queueing model from Section 3: each saga step is naturally implemented as a queue consumer that, on success, publishes the next step's event (<code>InventoryReserved</code>, <code>PaymentCaptured</code>, <code>OrderShipped</code>), and on failure, publishes a compensation message rather than throwing an exception that's invisible to the rest of the pipeline. The full mechanics of choreographed versus orchestrated sagas, and how compensating actions are tracked and replayed reliably, are covered in <a href="#/distributed-systems-core">distributed-systems-core</a>; the mechanics of making the <code>Payment</code> charge itself safe to retry without double-charging are covered in <a href="#/payment-systems-idempotency">payment-systems-idempotency</a> — the flash sale is simply the domain where the consequence of getting either wrong (a charged <code>Customer</code> with no reserved inventory, or reserved inventory nobody paid for) is maximally visible.</p>
 <div class="callout">
 <div class="callout-title">Reservation is a distinct state from a final decrement</div>
-<p>It's worth keeping "reserved" and "sold" as explicitly different states rather than collapsing them into one decrement. A reservation (the Redis <code>DECR</code> at request time) says "don't let anyone else take this unit while we find out if this order will actually complete." Only after payment succeeds does that reservation become a final, durable sale. If payment fails and the two states were never distinguished, releasing the unit back to available stock requires re-incrementing a counter that other concurrent operations are also mutating — reintroducing exactly the kind of race this design was built to avoid. A short-lived reservation with an expiry (release automatically if payment doesn't complete within, say, 5-10 minutes) also protects against a client that reserves a unit and simply abandons the checkout flow.</p>
+<p>It's worth keeping "reserved" (<code>Inventory.reservedQty</code>) and "sold" (a decremented <code>Inventory.availableQty</code>) as explicitly different states rather than collapsing them into one decrement. A reservation (the Redis <code>DECR</code> at request time) says "don't let anyone else take this unit while we find out if this <code>Order</code> will actually complete." Only after payment succeeds does that reservation become a final, durable sale. If payment fails and the two states were never distinguished, releasing the unit back to available stock requires re-incrementing a counter that other concurrent operations are also mutating — reintroducing exactly the kind of race this design was built to avoid. A short-lived reservation with an expiry (release automatically if payment doesn't complete within, say, 5-10 minutes) also protects against a <code>Customer</code> that reserves a unit and simply abandons the checkout flow.</p>
 </div>
 
 <h2>7. Rate Limiting and Bot Mitigation on the Purchase Endpoint</h2>
-<p>A flash sale creates a strong, direct financial incentive for automated buying — scripts that hit the purchase endpoint far faster and more reliably than a human clicking a button, often to acquire scarce inventory for resale. This isn't an edge case to shrug off; unmitigated, bots can claim a disproportionate share of limited stock within the first fraction of a second, before most legitimate users have even finished loading the page. Protecting against this requires layering several distinct mechanisms, because no single one is sufficient on its own:</p>
+<p>A flash sale creates a strong, direct financial incentive for automated buying — scripts that hit the purchase endpoint far faster and more reliably than a human clicking a button, often to acquire scarce inventory for resale. This isn't an edge case to shrug off; unmitigated, bots can claim a disproportionate share of limited stock within the first fraction of a second, before most legitimate <code>Customer</code>s have even finished loading the page. Protecting against this requires layering several distinct mechanisms, because no single one is sufficient on its own:</p>
 <ul>
-<li><strong>Per-user/per-IP rate limiting</strong> on the purchase endpoint (e.g., a token bucket allowing a small number of purchase attempts per minute per account) blunts the simplest scripted attacks, though it's easily defeated by an attacker with many accounts or many IPs.</li>
-<li><strong>A queueing/virtual-waiting-room step before checkout</strong> — admitting users into the purchase flow at a controlled rate (matching what the backend can sustain) rather than letting the entire spike hit the purchase endpoint simultaneously — protects the backend regardless of whether the incoming load is legitimate or automated, and has the side benefit of making the experience fairer and more predictable for real users.</li>
+<li><strong>Per-customer/per-IP rate limiting</strong> on the purchase endpoint — commonly implemented as a <strong>token bucket</strong>: each account/IP has a bucket that holds a fixed maximum number of tokens, refilled at a steady rate (e.g. one token every few seconds), and each purchase attempt consumes one token; once the bucket is empty, further attempts are rejected until it refills. This bounds a single account/IP's burst rate without needing to track a sliding time window, blunts the simplest scripted attacks, and is easily defeated by an attacker with many accounts or many IPs.</li>
+<li><strong>A queueing/virtual-waiting-room step before checkout</strong> — admitting <code>Customer</code>s into the purchase flow at a controlled rate (matching what the backend can sustain) rather than letting the entire spike hit the purchase endpoint simultaneously — protects the backend regardless of whether the incoming load is legitimate or automated, and has the side benefit of making the experience fairer and more predictable for real users.</li>
 <li><strong>CAPTCHA or proof-of-work challenges</strong> at the point of adding to cart or checking out add friction that is cheap for a human doing it once but expensive for a script trying to do it thousands of times per second, though they add real friction for legitimate users too and are an arms race against increasingly sophisticated bypass tooling.</li>
 <li><strong>Behavioral and device signals</strong> (request timing patterns too regular to be human, missing browser fingerprint signals, known data-center IP ranges rather than residential ones) can be scored to flag likely automation without necessarily blocking outright, feeding into a soft throttle rather than a hard reject that risks false-positiving real customers.</li>
 </ul>
-<p>None of these are perfect in isolation, which is why production systems layer them: rate limiting handles the crude case cheaply, a waiting-room step caps absolute throughput to what the backend can handle regardless of traffic legitimacy, and challenge/behavioral signals raise the cost of automation without fully relying on any single signal being unbeatable. The rate limiter and circuit-breaking concerns here share the same first-principles grounding as the general resilience patterns in <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a> — a flash sale is simply the scenario where the "what if load exceeds capacity by orders of magnitude" question stops being hypothetical.</p>
+<p>None of these are perfect in isolation, which is why production systems layer them: rate limiting handles the crude case cheaply, a waiting-room step caps absolute throughput to what the backend can handle regardless of traffic legitimacy, and challenge/behavioral signals raise the cost of automation without fully relying on any single signal being unbeatable. The rate limiter here shares the same first-principles grounding as the general resilience patterns in <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a> — including circuit breaking, which stops calling a downstream dependency (like the payment provider) entirely once it's failing past a threshold, rather than continuing to send it doomed requests — a flash sale is simply the scenario where the "what if load exceeds capacity by orders of magnitude" question stops being hypothetical. Input validation and secrets handling for the purchase endpoint and payment credentials specifically are covered in <a href="#/security-hardening-owasp">security-hardening-owasp</a>.</p>
 
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
 <details class="concept-qa">
@@ -181,7 +222,8 @@ If Step 5 (shipping kickoff) fails after payment succeeded:
 <h2>Related Topics</h2>
 <div class="related-grid">
 <div class="related-card" onclick="window.location.hash='/distributed-systems-core'"><div class="rc-title">Distributed Systems Core</div><div class="rc-sub">Phase 1-2 · Saga steps, compensating actions, and concurrent state races generalize the mechanics used here</div></div>
-<div class="related-card" onclick="window.location.hash='/caching-strategies'"><div class="rc-title">Caching Strategies</div><div class="rc-sub">Phase 2 · TTL, eviction, and warming mechanics that pre-warming and read-path separation build directly on</div></div>
 <div class="related-card" onclick="window.location.hash='/async-messaging'"><div class="rc-title">Async Messaging</div><div class="rc-sub">Phase 2-3 · Delivery guarantees and idempotent consumers underpin the order-queueing and saga steps</div></div>
-<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience &amp; Fault Tolerance</div><div class="rc-sub">Phase 3 · Rate limiting, load shedding, and graceful degradation under load spikes beyond capacity</div></div>
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience &amp; Fault Tolerance</div><div class="rc-sub">Phase 3 · Rate limiting, load shedding, circuit breaking, and graceful degradation under load spikes beyond capacity</div></div>
+<div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'"><div class="rc-title">Payment Systems &amp; Idempotent Transactions</div><div class="rc-sub">Idempotency keys and safe retries for the exact Payment-capture step in the saga above</div></div>
+<div class="related-card" onclick="window.location.hash='/security-hardening-owasp'"><div class="rc-title">Security Hardening: Input Validation, Secrets Management &amp; OWASP Top 10</div><div class="rc-sub">Hardening the checkout endpoint itself against abuse beyond rate limiting and bot mitigation</div></div>
 </div>

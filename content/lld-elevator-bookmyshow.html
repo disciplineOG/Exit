@@ -148,6 +148,43 @@ class DoorOpenState implements ElevatorState {
 </code></pre>
 <p>The controller never checks "what state am I in" — it just calls <code>elevator.getState().requestMove(elevator)</code> and reassigns the returned state. Every illegal transition either doesn't compile as a reachable path or throws immediately at the point of misuse, instead of silently corrupting the elevator's physical behavior three method calls later.</p>
 
+<h3>The elevator's legal state-transition graph</h3>
+<p>Laying out every state alongside only the transitions it actually exposes makes the "closed set of legal moves" property visible at a glance — notice there is no edge anywhere going directly <em>from</em> DoorOpen back <em>to</em> Idle or vice versa without passing through Moving first (closing the door always hands control back to Moving, never straight to Idle), which is precisely the kind of invariant this pattern enforces structurally rather than by convention:</p>
+<pre><code>   +---------+   requestMove()      +---------+
+   |  IDLE   |  ------------------>  | MOVING  |
+   +---------+                       +---------+
+        |    ^                            |
+        |    |      arriveAtFloor()       | openDoor()
+        |    +---- [no pending stops] ----+
+        |                                 v
+        |         openDoor()        +---------+
+        +-------------------------->|DOOR OPEN|
+                                     +---------+
+                                          |
+                     closeDoor() ---------+
+                     (returns to MOVING, never to IDLE directly)
+                          |
+                          v
+                     +---------+
+                     | MOVING  |
+                     +---------+
+
+Self-loops (no state change, but a legal call):
+  IDLE      --arriveAtFloor()--> IDLE     (already idle, no-op)
+  MOVING    --requestMove()----> MOVING   (already moving, no-op)
+  MOVING    --closeDoor()------> MOVING   (no-op: door wasn't open to begin with)
+  DOOR OPEN --arriveAtFloor()--> DOOR OPEN
+  DOOR OPEN --openDoor()-------> DOOR OPEN (door already open, no-op)
+
+Illegal / structurally absent edges (would require the caller to catch
+an IllegalStateException, i.e. they are reachable only as bugs):
+   DOOR OPEN --requestMove()--> forbidden: cannot move with door open
+   IDLE      --closeDoor()----> forbidden: door was never open
+   MOVING    --openDoor()-----> forbidden: cannot open door while moving
+</code></pre>
+<p>Two edges are worth calling out explicitly because they're easy to miss on a first read of the code: <strong>Idle can go straight to DoorOpen</strong> (an elevator that's already idle at a floor can still open its doors — e.g. someone presses the hall call for the floor it's already sitting on), and <strong>DoorOpen always returns to Moving on close, never directly to Idle</strong> — the elevator re-enters the Moving state's own <code>arriveAtFloor</code> logic to decide whether pending stops remain, rather than the door-closing step itself deciding whether to idle.</p>
+<p>The diagram deliberately shows two kinds of arrow: the ones each state class actually returns a <em>new</em> state object for, and the ones it only has by virtue of returning <code>this</code> (a no-op, like <code>MovingState.requestMove</code> when already moving). The absent edges in the second block aren't missing by oversight — each one corresponds to a state class's method body that does nothing but <code>throw</code>, which is the compile-time-adjacent guarantee described above: the only way to reach those edges at runtime is a bug in the caller, not a legitimate path through the machine.</p>
+
 <h2>5. The Booking System — Entities</h2>
 <p>Switch domains but keep the same discipline. A ticket-booking system's core entities:</p>
 <ul>
@@ -245,6 +282,36 @@ class BookedState implements SeatState {
 </code></pre>
 <p>Notice that <code>confirmBooking</code> re-checks expiry and ownership <em>inside</em> the state transition itself, rather than trusting that the caller already validated those things — because the caller's validation and this call are separated by the payment gateway round trip, during which the hold could have expired. The state object is the last line of defense, and it's exactly one atomic check away from the underlying storage-level conditional write described in Section 6 — the in-memory state machine and the database-level atomic transition are two layers enforcing the same invariant, which is the correct amount of redundancy for a bug class this costly (a double-booked seat usually means a refund, an angry customer, and a support escalation, not just a retried request).</p>
 
+<h3>The seat's legal state-transition graph</h3>
+<p>The same three-state shape recurs constantly in resource-allocation problems (compare it to the elevator's graph above): one "free" state, one "provisionally claimed, time-bounded" state, and one "permanently committed" terminal state, with the time-bounded state able to fall back to "free" either by explicit release or by TTL expiry:</p>
+<pre><code>   +-----------+   hold(userId)        +------------+
+   | AVAILABLE | --------------------> |    HELD    |
+   +-----------+ &lt;-------------------- +------------+
+        ^              release()            |
+        |                                    | confirmBooking(userId)
+        |     [also reached via TTL:          [only if NOT expired AND
+        |      HELD -> AVAILABLE fires         held by this same userId]
+        |      automatically once                    v
+        |      ctx.isExpired(), with          +------------+
+        |      no explicit release()          |   BOOKED   |  (terminal)
+        |      call needed]                   +------------+
+        |
+        +--- (an expired hold's confirmBooking() call replays this exact
+              AVAILABLE edge, then immediately re-acquires a fresh HELD
+              for the same caller - one atomic call, not a new edge)
+
+Illegal / structurally absent edges (thrown, not silently allowed):
+   AVAILABLE --confirmBooking()--> forbidden: no active hold to confirm
+   HELD      --hold()------------> forbidden: already held by someone else
+   BOOKED    --hold()------------> forbidden: already booked
+   BOOKED    --release()---------> forbidden: a confirmed booking isn't released this way -
+                                    reversing a BOOKED seat is a refund/cancellation flow,
+                                    a deliberately separate, audited operation, not a bare
+                                    state-machine transition an ordinary hold/release cycle
+                                    can trigger
+</code></pre>
+<p>The one edge that looks like a shortcut — <code>HeldState.confirmBooking</code> internally calling <code>new AvailableState().hold(ctx, userId)</code> when the hold has expired — is not actually a violation of the graph above; it's the code re-deriving the correct state by replaying the two real transitions (expiry reverts to AVAILABLE, then the same caller immediately re-acquires a fresh HELD) rather than inventing a new edge that bypasses AVAILABLE entirely. It behaves identically to two sequential legal transitions, just performed atomically in one call.</p>
+
 <h2>8. Where These Two Designs Rhyme</h2>
 <table>
 <tr><th>Concern</th><th>Elevator System</th><th>Booking System</th></tr>
@@ -293,4 +360,5 @@ class BookedState implements SeatState {
 <div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Concurrency &amp; Multithreading</div><div class="rc-sub">Phase 3 · check-then-act races, atomic conditional writes, and lock semantics</div></div>
 <div class="related-card" onclick="window.location.hash='/lld-rate-limiter-cache'"><div class="rc-title">LLD: Rate Limiter &amp; Cache</div><div class="rc-sub">Phase 3 · the TTL-expiry mechanic reused for seat holds</div></div>
 <div class="related-card" onclick="window.location.hash='/lld-parking-lot'"><div class="rc-title">LLD: Parking Lot</div><div class="rc-sub">Phase 3 · another exclusive-resource-allocation design with the same shape</div></div>
+<div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'"><div class="rc-title">Payment Systems &amp; Idempotent Transactions</div><div class="rc-sub">Why the payment round trip inside the seat hold's TTL window needs an idempotency key, not just a status check, to survive retries safely</div></div>
 </div>

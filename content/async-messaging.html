@@ -4,6 +4,7 @@
 <div class="topic-tags">
   <span class="tag">Kafka Internals</span>
   <span class="tag">RabbitMQ</span>
+  <span class="tag">Exchange Types</span>
   <span class="tag">Partitioning</span>
   <span class="tag">Consumer Groups</span>
   <span class="tag">Outbox Pattern</span>
@@ -33,7 +34,40 @@
 <p>These two systems are often compared as if they were interchangeable "message queues," but they are built around fundamentally different data structures, and that difference — not benchmark numbers — is what should drive the choice.</p>
 
 <h3>RabbitMQ: a traditional broker built on queues and exchanges</h3>
-<p>RabbitMQ implements the classic message-broker model. A producer publishes a message to an <strong>exchange</strong>, which applies routing logic (direct, topic, fanout, or headers-based routing) to decide which <strong>queue(s)</strong> the message should be copied into. Consumers subscribe to queues and receive messages pushed to them. Once a consumer acknowledges a message, RabbitMQ <strong>deletes it from the queue</strong> — the message is transient by design; it exists only until it has been successfully consumed. This makes RabbitMQ excellent at complex routing topologies (route this message to five different queues based on its type, prioritize certain messages, implement request/reply with correlation IDs) and at low-latency task distribution such as work queues for background jobs.</p>
+<p>RabbitMQ implements the classic message-broker model. A producer never publishes directly to a queue — it publishes a message to an <strong>exchange</strong>, which applies routing logic to decide which <strong>queue(s)</strong> the message should be copied into. A <strong>binding</strong> is the configured relationship between an exchange and a queue (optionally with a routing key or header pattern) that tells the exchange where to copy matching messages. Consumers subscribe to queues and receive messages pushed to them by the broker. Once a consumer acknowledges a message, RabbitMQ <strong>deletes it from the queue</strong> — the message is transient by design; it exists only until it has been successfully consumed. This makes RabbitMQ excellent at complex routing topologies (route this message to five different queues based on its type, prioritize certain messages, implement request/reply with correlation IDs) and at low-latency task distribution such as work queues for background jobs.</p>
+
+<h3>Exchange types: four different routing algorithms</h3>
+<p>All the routing flexibility RabbitMQ offers comes down to which of four exchange types you bind your queues to. Each type is just a different algorithm for deciding, given an incoming message and its routing key/headers, which bound queues get a copy.</p>
+<pre><code>Exchange (routing algorithm)
+  ├── Direct     — exact routing-key match
+  │     e.g. exchange "order.events", routing key "order.cancelled"
+  │     -> delivered only to queues bound with that exact key
+  │
+  ├── Topic      — pattern match on a dot-separated routing key
+  │     wildcards: * matches exactly one word, # matches zero-or-more words
+  │     e.g. routing key "order.us-west.cancelled"
+  │     -> a queue bound with "order.*.cancelled" matches
+  │     -> a queue bound with "order.#" matches everything order-related
+  │
+  ├── Fanout     — ignores the routing key entirely; copies to every bound queue
+  │     e.g. exchange "shopsphere.order-placed.fanout"
+  │     -> inventory-service queue, notification-service queue, and
+  │        analytics-service queue all receive every OrderPlaced message
+  │
+  └── Headers    — match on message header key/value pairs, not the routing key
+        e.g. bind a queue to match headers {"region":"eu","priority":"high"}
+        -> used when routing depends on more than one independent
+           attribute at once, which a single dot-separated key can't express cleanly</code></pre>
+<table>
+  <tr><th>Exchange type</th><th>Routing decision</th><th>ShopSphere example</th></tr>
+  <tr><td>Direct</td><td>Exact string match between routing key and binding key</td><td>Route <code>PaymentFailed</code> messages with routing key <code>payment.failed</code> to exactly the queue that retries or alerts on failed charges</td></tr>
+  <tr><td>Topic</td><td>Wildcard pattern match on a structured, dot-separated routing key</td><td>A single audit-logging queue bound with <code>order.#</code> captures every order lifecycle event, while a fraud-review queue binds only <code>order.*.flagged</code></td></tr>
+  <tr><td>Fanout</td><td>No matching at all — broadcast to every bound queue</td><td><code>OrderPlaced</code> fanned out simultaneously to inventory-service (reserve stock), notification-service (send confirmation email), and analytics-service (update dashboards) — each gets its own queue, so one slow consumer never blocks another</td></tr>
+  <tr><td>Headers</td><td>Match arbitrary header key/value pairs, independent of any routing-key structure</td><td>Route a <code>Payment</code> event to a region-specific compliance queue based on independent <code>country</code> and <code>paymentMethod</code> headers, a combination awkward to encode as one dot-separated key</td></tr>
+</table>
+<div class="callout">
+  <p>This taxonomy is the RabbitMQ analogue of Kafka's "everything is a partitioned log" simplicity — Kafka gives you one routing primitive (topic + partition key) and pushes all fan-out logic to how many consumer groups subscribe, whereas RabbitMQ gives you four routing primitives at the broker itself. Neither is strictly more powerful; they encode the same trade-off from section 2 in miniature: Kafka keeps routing simple and pushes complexity to consumers, RabbitMQ keeps consumers simple (each just reads its one queue) and pushes routing complexity into exchange/binding configuration.</p>
+</div>
 
 <h3>Kafka: a distributed, partitioned, append-only commit log</h3>
 <p>Kafka is not a queue at all under the hood. A Kafka <strong>topic</strong> is a durable, append-only log split into <strong>partitions</strong>, and every message written to a partition is retained (for a configured time or size, not deleted on read) at a numbered offset. Consumers do not have messages pushed to them and removed on ack; instead they <strong>pull</strong> from a partition starting at whatever offset they choose, and reading a message never deletes it. This is what makes Kafka replayable — a new consumer, or an existing consumer that needs to reprocess history (say, after a bug fix), can rewind to an earlier offset and read the same messages again, something that is structurally impossible in RabbitMQ once a message has been acknowledged and deleted. Kafka's design center is very high sustained throughput, ordered logs, and multiple independent consumers reading the same stream of facts at their own pace.</p>
@@ -90,6 +124,34 @@
   <p>The cost of this loose coupling is that the overall business process is no longer visible in any one place. A synchronous call chain reads top to bottom in one service's code; an event-driven flow spans N services' event handlers, and tracing "what happens when an order is placed" requires either strong observability (distributed tracing, correlation IDs propagated through message headers) or dedicated tooling. This is a genuine complexity trade-off, not a free upgrade over synchronous calls.</p>
 </div>
 
+<h3>A full ShopSphere checkout, worked through as event choreography</h3>
+<p>Concretely, tying together everything so far: when a customer clicks "place order," the resulting checkout flow is not one service calling three others synchronously — it's a chain of services each reacting to a fact published by the previous one, with <code>order-service</code> never knowing that <code>inventory-service</code> or <code>notification-service</code> exist.</p>
+<pre><code>order-service                    inventory-service              payment-service            notification-service
+     |                                   |                             |                          |
+     |-- publish OrderPlaced ----------->|  (topic: order.events,      |                          |
+     |   (key = orderId, so all events   |   key = orderId)            |                          |
+     |    for this order share a         |                             |                          |
+     |    partition and stay ordered)    |                             |                          |
+     |                                   |-- reserve stock,             |                         |
+     |                                   |   publish InventoryReserved  |                         |
+     |                                   |   (or InventoryReservationFailed)                      |
+     |                                   |------------------------------>|                         |
+     |                                   |                             |-- charge card,           |
+     |                                   |                             |   publish PaymentCaptured|
+     |                                   |                             |   (or PaymentFailed)      |
+     |<---------------------------------------------------------------|                            |
+     |-- consumes PaymentCaptured,                                                                 |
+     |   flips Order.status PAID -> SHIPPED once warehouse confirms,                               |
+     |   publishes OrderShipped ------------------------------------------------------------------->|
+     |                                                                                              |-- sends "your order
+     |                                                                                              |   shipped" email/SMS
+</code></pre>
+<p>Each arrow above is a publish to a topic that the next service happens to subscribe to — not a direct call. <code>order-service</code> publishing <code>OrderPlaced</code> has no idea inventory-service will react to it, and could not tell you at runtime how many consumers exist. Every one of these events is keyed by <code>orderId</code> (section 3's partition-key rule), which is what guarantees that, say, an <code>OrderPlaced</code> and a later <code>OrderCancelled</code> for the same order are read by the same partition-owning consumer in the order they were produced, instead of racing each other across partitions.</p>
+<p>Notice also the two distinct failure events, <code>InventoryReservationFailed</code> and <code>PaymentFailed</code> — an EDA flow needs an explicit event for "this step didn't succeed" just as much as for the happy path, because there is no synchronous caller sitting on the stack waiting to catch an exception. <code>order-service</code> must itself subscribe to these failure events to know when to transition an <code>Order</code> to <code>CANCELLED</code> and release any reservation — this is the async equivalent of a saga's compensating action, covered in more depth in <a href="#/microservice-patterns">microservice-patterns</a>.</p>
+<div class="callout warn">
+  <p>A subtlety worth naming explicitly: this choreography has no single service orchestrating it — each service only knows the event(s) it consumes and the event(s) it produces, and the overall order-to-shipment process only exists as an emergent property of everyone's individual subscriptions. This is <strong>choreography</strong>, as opposed to <strong>orchestration</strong> (a dedicated coordinator service that explicitly calls each step and tracks the process as one state machine). Choreography scales better to many independent subscribers with no central bottleneck, but for exactly the reason in the callout above — the flow isn't visible anywhere in one place — a long choreography chain (5+ steps) is where teams often reach for an orchestrator or saga coordinator instead, trading back some coupling for a single place that can be debugged, retried, and reasoned about as one process.</p>
+</div>
+
 <h2>5. The Outbox Pattern</h2>
 
 <h3>The dual-write problem</h3>
@@ -142,6 +204,23 @@ COMMIT;
 <p>The crucial thing to internalize: "exactly-once" is not achieved by some magic broker feature that guarantees a message physically arrives exactly one time over an unreliable network — that is provably impossible in general (this is essentially the Two Generals' Problem). What Kafka's <strong>idempotent producer</strong> (<code>enable.idempotence=true</code>, the default since Kafka 3.0) actually does is attach a producer ID and sequence number to each message, so that if a producer retries a send after a timeout (not knowing whether the broker actually received the first attempt), the broker recognizes and discards the duplicate rather than appending it twice. Kafka's <strong>transactions API</strong> extends this so that a consume-process-produce loop (read from topic A, write to topic B, commit offset on A) either fully commits or fully rolls back as one unit, which is what stream-processing frameworks like Kafka Streams rely on for EOS between Kafka topics.</p>
 <p>But none of this covers side effects outside Kafka — if your consumer, on processing a message, calls an external payment API or writes to a separate database, Kafka's transactional guarantees stop at its own topics. Achieving effectively-once behavior for that external effect is on you: typically via an idempotency key derived from the message (e.g., the outbox row's UUID) that the downstream system checks before applying the effect a second time. This is exactly why the Outbox Pattern's "at-least-once, dedupe on the consumer" framing, rather than a promise of true exactly-once delivery, is the realistic and honest way to describe most production event pipelines, and it composes directly with the retry and idempotency mechanisms covered in <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a>.</p>
 
+<p>Concretely, here is what an idempotent consumer looks like in <code>notification-service</code> reacting to <code>OrderShipped</code> — the event will occasionally be redelivered (a rebalance right after processing but before the offset commits, for instance), and without a dedupe check the customer would get the "your order shipped" email twice:</p>
+<pre><code>@KafkaListener(topics = "order.events", groupId = "notification-service")
+public void onOrderEvent(OrderShippedEvent event) {
+    // event.eventId() is the outbox row's UUID from order-service - stable
+    // across redeliveries of the "same" logical event, unlike a fresh
+    // random ID that would be generated differently on each republish
+    boolean alreadyHandled = processedEventRepository.existsById(event.eventId());
+    if (alreadyHandled) {
+        return; // duplicate delivery - no-op, not an error
+    }
+    emailClient.sendShippingConfirmation(event.orderId(), event.customerId());
+    processedEventRepository.save(new ProcessedEvent(event.eventId(), Instant.now()));
+}
+</code></pre>
+<p>The <code>@KafkaListener</code> annotation (from Spring for Apache Kafka) is the Spring-idiomatic way to register a method as a consumer for a topic — under the hood it wraps a poll loop that continually calls the underlying Kafka client's <code>poll()</code>, dispatches each received record to the annotated method, and (by default, with <code>ackMode=RECORD</code> or similar) commits the offset after the method returns without throwing. It is functionally equivalent to writing your own consumer poll loop with <code>KafkaConsumer.poll()</code> and <code>commitSync()</code> by hand, just with the boilerplate — deserialization, thread management, retry/error-handling hooks — handled by the framework.</p>
+<p>The <code>processedEventRepository</code> check-and-record pair is itself only safe if it happens atomically relative to the side effect, or at least in a way that tolerates a crash between the two steps without either double-sending or permanently marking an unsent email as sent — the same idempotency-key discipline covered in depth in <a href="#/payment-systems-idempotency">payment-systems-idempotency</a>, which is exactly why <code>payment-service</code>'s own <code>Payment.idempotencyKey</code> field exists: charging a card twice because of a redelivered <code>PaymentCaptured</code>-triggering message is a far more expensive mistake than a duplicate email.</p>
+
 <div class="callout warn">
   <p>A subtle failure mode: even with <code>enable.idempotence=true</code> and a transactional producer, if your consumer processes a message, produces a side effect (say, calls a third-party API to charge a card), and then crashes before committing its Kafka offset, the message will be redelivered and the side effect repeated — the card gets charged twice. Kafka's exactly-once machinery protects Kafka-to-Kafka pipelines; it does nothing for a consumer's external side effects unless that consumer independently makes those side effects idempotent.</p>
 </div>
@@ -187,7 +266,7 @@ COMMIT;
 <div class="related-grid">
   <div class="related-card" onclick="window.location.hash='/microservice-patterns'">
     <div class="rc-title">Microservice Patterns</div>
-    <div class="rc-sub">Days 21–25 · The synchronous REST/RPC model this async approach is contrasted against</div>
+    <div class="rc-sub">Days 21–25 · The synchronous REST/RPC model this async approach is contrasted against, plus saga orchestration vs. choreography</div>
   </div>
   <div class="related-card" onclick="window.location.hash='/distributed-systems-core'">
     <div class="rc-title">Distributed Systems Core</div>
@@ -197,8 +276,16 @@ COMMIT;
     <div class="rc-title">Resilience &amp; Fault Tolerance</div>
     <div class="rc-sub">Days 31–35 · Idempotency and retry design that at-least-once delivery depends on</div>
   </div>
+  <div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'">
+    <div class="rc-title">Payment Systems &amp; Idempotent Transactions</div>
+    <div class="rc-sub">Idempotency keys for PaymentCaptured/ChargeCard handlers that must survive at-least-once redelivery without double-charging</div>
+  </div>
   <div class="related-card" onclick="window.location.hash='/hld-distributed-messaging'">
     <div class="rc-title">HLD: Distributed Messaging</div>
     <div class="rc-sub">System design applications of message brokers at scale</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/batch-processing-scheduled-jobs'">
+    <div class="rc-title">Batch Processing &amp; Scheduled Jobs</div>
+    <div class="rc-sub">Polling outbox relays and scheduled reconciliation jobs share the same "periodic, retryable, idempotent" design constraints as message consumers</div>
   </div>
 </div>

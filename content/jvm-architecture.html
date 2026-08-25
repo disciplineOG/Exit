@@ -214,6 +214,46 @@ PASS 2 (instance construction for `new Child()`):
   <tr><td><strong>Native Method Stack</strong></td><td>Per-thread</td><td>State for native (JNI) method calls</td></tr>
 </table>
 
+<h3>3.0 The Full Memory Map, All Areas Together</h3>
+<p>Every one of the areas in the table above is a physical region of memory the JVM process actually owns. Laid out together, for a JVM running a ShopSphere <code>order-service</code> instance handling several concurrent HTTP request threads, it looks like this:</p>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                       JVM PROCESS MEMORY                          │
+│                                                                     │
+│  ┌───────────────────────── HEAP (shared) ─────────────────────┐  │
+│  │                                                               │  │
+│  │   Young Generation                                           │  │
+│  │   ┌─────────┐  ┌──────────┐  ┌──────────┐                    │  │
+│  │   │  Eden   │  │Survivor 0│  │Survivor 1│  <- new Order,      │  │
+│  │   │(largest)│  │   (S0)   │  │   (S1)   │     OrderItem,      │  │
+│  │   └─────────┘  └──────────┘  └──────────┘     Cart objects    │  │
+│  │                                                allocated here │  │
+│  │                                                                │  │
+│  │   Old (Tenured) Generation                                    │  │
+│  │   ┌─────────────────────────────────────────┐                 │  │
+│  │   │ long-lived: caches, connection pools,    │                 │  │
+│  │   │ in-flight Order aggregates held across   │                 │  │
+│  │   │ checkout -> payment -> ship, singletons  │                 │  │
+│  │   └─────────────────────────────────────────┘                 │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ┌──────────── METASPACE (native/off-heap, shared) ─────────────┐  │
+│  │  Order.class, OrderItem.class, PaymentClient.class metadata,  │  │
+│  │  method bytecode, constant pools, static field slots          │  │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  ┌── Thread: http-nio-8080-exec-1 ───┐  ┌── Thread: http-nio-...-2 ─┐│
+│  │ JVM Stack: frames for             │  │ JVM Stack: frames for     ││
+│  │   placeOrder() -> reserveStock()  │  │   getOrder() -> ...       ││
+│  │   -> chargePayment() -> ...       │  │ PC Register: current      ││
+│  │ PC Register: current bytecode     │  │   bytecode instruction    ││
+│  │   instruction offset              │  │ Native Method Stack       ││
+│  │ Native Method Stack (JNI calls)   │  │   (JNI calls, if any)     ││
+│  └────────────────────────────────────┘  └───────────────────────┘  │
+│              ... one Stack + PC Register + Native Stack             │
+│                    per live thread, not shared ...                  │
+└─────────────────────────────────────────────────────────────────────┘</code></pre>
+<p>The distinction that matters operationally: the <strong>Heap</strong> and <strong>Metaspace</strong> are singular and shared — every thread in <code>order-service</code> allocates <code>Order</code>, <code>OrderItem</code>, and <code>Payment</code> objects into the same heap, and the garbage collector reasons about that heap as one whole. The <strong>JVM Stack, PC Register, and Native Method Stack</strong> are replicated once per thread — if a flash sale spikes <code>order-service</code> to 500 concurrent request-handling threads, that's 500 separate stacks, each independently sized (controlled by <code>-Xss</code>), which is why a very deep call chain (e.g. a runaway recursive discount-calculation bug walking a <code>Coupon</code> chain) throws a per-thread <code>StackOverflowError</code> without affecting any other thread's stack, while an oversized or leaking heap affects every thread at once because they all share it.</p>
+
 <h3>3.1 Metaspace vs. PermGen — why the change (Java 8)</h3>
 <p>Before Java 8, class metadata lived in <strong>PermGen</strong>, a fixed-size region inside the heap's own contiguous address space. Applications that dynamically generated or reloaded many classes at runtime (heavy use of reflection, dynamic proxies, or repeated redeployment inside a long-running process) routinely exhausted this fixed region and hit <code>OutOfMemoryError: PermGen space</code>, forcing awkward manual tuning of a size limit that had no natural relationship to the rest of heap sizing. Java 8 replaced it with <strong>Metaspace</strong>, allocated out of native (off-heap) memory and, by default, bounded only by total available system memory (a cap can still be set with a sizing flag). This removed most PermGen-related failures, but introduced a different failure mode: because Metaspace draws from the same native memory pool the operating system and other processes share, an unbounded leak there (most commonly a classloader that never becomes garbage because something external still references it, along with every class it loaded) can now destabilize the entire host rather than staying contained inside one process's fixed heap.</p>
 
@@ -237,6 +277,15 @@ PASS 2 (instance construction for `new Child()`):
   <li><strong>Old (Tenured) Generation</strong> — holds objects expected to live a long time. It's collected far less frequently, but because it's typically much larger than the young generation, a collection here (a Major or Full GC) takes proportionally much longer.</li>
 </ul>
 
+<h3>3.3 Applying This to a Real Service: Sizing order-service's Heap</h3>
+<p>Consider <code>order-service</code> in ShopSphere's checkout path. On every checkout request it allocates a fresh <code>Order</code>, a <code>List&lt;OrderItem&gt;</code> (one per cart line), and short-lived DTOs for the calls out to <code>inventory-service</code> and <code>payment-service</code> — all of this is textbook young-generation traffic: allocated in Eden, almost always dead within milliseconds once the response is serialized. A tiny minority of objects live far longer than one request: an in-memory <code>Map&lt;String, Coupon&gt;</code> cache of active coupon codes, an HTTP connection pool to <code>payment-service</code>, and (during a slow multi-step checkout) an in-flight <code>Order</code> object held in a pending-payment map keyed by <code>idempotencyKey</code> until <code>PaymentCaptured</code> arrives — these belong in, and eventually get promoted to, the Old generation.</p>
+<p>Two sizing mistakes are common and directly traceable to this layout:</p>
+<ul>
+  <li><strong>Young generation too small for the request rate.</strong> If Eden is undersized relative to how many <code>Order</code>/<code>OrderItem</code>/DTO objects a burst of concurrent checkouts allocates per second, Eden fills constantly, triggering frequent Young GCs. Each one is individually short, but at high enough frequency the cumulative pause time becomes visible in p99 latency — exactly the failure mode a flash sale exposes (see §5.5).</li>
+  <li><strong>Survivor spaces too small for checkout's actual object lifetime.</strong> A checkout that takes, say, 200ms end-to-end (reserve inventory, call payment-service, wait for the response) keeps its <code>Order</code> object reachable across multiple Young GCs while that request is in flight. If the survivor spaces are too small to hold all such "medium-lived" objects, they get prematurely promoted straight to Old — a pathology called <strong>premature promotion</strong> — which bloats the Old generation with objects that were never actually going to live long, making Old-generation (Major/Full) GCs both more frequent and more expensive than the true long-lived working set would require.</li>
+</ul>
+<p>The practical fix in both cases is the same category of tuning covered in §6.1: size Eden generously enough to absorb the service's peak allocation burst between collections, and size survivor spaces to actually hold objects for the request's real in-flight duration rather than promoting them out of impatience.</p>
+
 <h2>4. Execution Engine: Interpreter, JIT &amp; Bytecode</h2>
 <p>The JVM begins by <strong>interpreting</strong> bytecode directly, instruction by instruction — slow per-instruction, but with zero delay before execution starts. While interpreting, it simultaneously profiles which methods and loops are "hot" (invoked, or iterated, frequently). Once a method crosses an invocation or loop-back-edge count threshold, the <strong>JIT compiler</strong> compiles that method down to native machine code and swaps it in for the interpreted version — this compile-then-swap delay is exactly what "warm-up time" refers to in JVM performance discussions.</p>
 <ul>
@@ -248,6 +297,33 @@ PASS 2 (instance construction for `new Child()`):
 
 <h2>5. Garbage Collection — Algorithms Compared</h2>
 <p>Every modern collector uses the same underlying liveness rule: an object is reachable — and therefore not garbage — if it can be traced from a <strong>GC Root</strong> (a local variable on any thread's stack, an active static field, or a JNI reference held by native code). Anything not reachable from some GC root is garbage and eligible for reclamation.</p>
+
+<h3>5.0 A Taxonomy of the Collectors</h3>
+<p>Rather than treating each collector as an unrelated name to memorize, it helps to place them on a tree by the two design axes that actually distinguish them: whether collection work happens <strong>concurrently</strong> with the running application or requires the world to <strong>stop</strong>, and whether the heap is laid out as classic contiguous generations or as many independent <strong>regions</strong>.</p>
+<pre><code>                         HotSpot Garbage Collectors
+                                    │
+        ┌───────────────────────────┼──────────────────────────────┐
+        │                                                             │
+  STOP-THE-WORLD                                              MOSTLY CONCURRENT
+  (pause for the whole collection)                              (app keeps running
+        │                                                        during most phases)
+        │                                                             │
+  ┌──────┴───────┐                                          ┌──────────┼──────────┐
+  │              │                                          │                       │
+Serial GC   Parallel GC                                Region-based            Non-region
+(1 thread,  (N threads,                                     │                  (legacy)
+generational) generational)                                 │                       │
+  │              │                                    ┌──────┴──────┐               │
+small heaps, throughput-first;                         │             │            CMS
+single-core  batch/offline                            G1           ZGC /       (removed;
+                                                  (default,      Shenandoah    superseded
+                                                   balanced       (very large    by G1 —
+                                                   pause/          heaps, sub-   no compaction,
+                                                   throughput)     10ms pauses)  fragmentation-
+                                                                                  prone)
+
+                    Epsilon (no-op: allocates, never reclaims — measurement/testing only)</code></pre>
+<p>Reading the tree: Serial and Parallel GC are both the "classic" generational Eden/Survivor/Old layout from §3.2 and both stop the application completely for the entire collection — they differ only in whether one thread or many do the stopping-the-world work. G1, ZGC, and Shenandoah abandon the fixed generational blocks in favor of many small, independently-labeled regions (§5.3), which is precisely what lets them do most of their work concurrently: a region-based layout lets the collector work on a bounded subset of regions at a time instead of needing to reason about the whole heap as one contiguous space. CMS sits historically between the two branches — concurrent marking, but no region-based layout and no compaction — which is exactly why it was removed once G1 offered concurrent marking <em>and</em> compaction together.</p>
 
 <h3>5.1 Phases common to most collectors</h3>
 <ol>
@@ -263,7 +339,7 @@ PASS 2 (instance construction for `new Child()`):
   <tr><td><strong>Parallel GC</strong> (the throughput collector)</td><td>The same mark-sweep-compact approach as Serial, but performed by multiple threads simultaneously during the stop-the-world pause</td><td>Workloads where total throughput matters far more than the length of any individual pause — batch and offline processing</td></tr>
   <tr><td><strong>CMS</strong> (removed from modern JDK releases, superseded by G1)</td><td>Concurrent mark-sweep — most of the marking work happens concurrently with the running application, but without compaction, which made it prone to fragmentation over time</td><td>Historically the option for lower pause times before G1 existed</td></tr>
   <tr><td><strong>G1 (Garbage First)</strong> — today's general-purpose default</td><td>The heap is divided into many equal-sized regions rather than fixed contiguous Eden/Old blocks; each region is independently labeled Eden, Survivor, or Old, and G1 always collects the regions containing the most garbage first (hence the name); marking runs mostly concurrently, and compaction happens by copying (evacuating) live objects out of a region rather than sliding them in place</td><td>General-purpose use where you want a configurable balance between throughput and pause time</td></tr>
-  <tr><td><strong>ZGC</strong></td><td>Region-based like G1, but almost all work — including marking, relocation, and even reference updates — happens concurrently with the running application, using colored pointers and load barriers to make this safe</td><td>Very large heaps that need consistently very short pauses (single-digit milliseconds) regardless of heap size</td></tr>
+  <tr><td><strong>ZGC</strong></td><td>Region-based like G1, but almost all work — including marking, relocation, and even reference updates — happens concurrently with the running application, using colored pointers (extra metadata bits stashed in the unused high bits of each object reference to track its GC state, so the collector can tell whether a reference still points at a live location without stopping the app) and load barriers (a tiny check the JVM inserts before every reference read, which fixes up a stale colored pointer on the fly if the object it points to has since moved) to make this safe</td><td>Very large heaps that need consistently very short pauses (single-digit milliseconds) regardless of heap size</td></tr>
   <tr><td><strong>Shenandoah</strong></td><td>Similar goals to ZGC — pause time independent of heap size — achieved via concurrent compaction using forwarding pointers stored alongside each object</td><td>Same use case as ZGC; an alternative implementation with different internal tradeoffs</td></tr>
   <tr><td><strong>Epsilon</strong></td><td>A genuinely no-op collector — it allocates memory but never reclaims any of it</td><td>Measuring pure allocation overhead, or extremely short-lived processes that will exit before ever needing a collection</td></tr>
 </table>
@@ -280,21 +356,42 @@ PASS 2 (instance construction for `new Child()`):
 <h3>5.4 Weak, Soft, and Phantom references</h3>
 <p>Beyond ordinary (strong) references, Java exposes finer-grained levels of reachability for building caches and cleanup hooks without fighting the collector: a <strong>SoftReference</strong> is only cleared when the JVM is genuinely under memory pressure, making it suitable for memory-sensitive caches that should shrink under load rather than cause an OutOfMemoryError; a <strong>WeakReference</strong> is cleared as soon as no strong references to the object remain, regardless of memory pressure (the basis of structures like a weak-keyed map that shouldn't be the thing keeping its keys alive); and a <strong>PhantomReference</strong> refers to an object that has already been finalized and is used together with a <code>ReferenceQueue</code> purely to run cleanup logic after an object is confirmed gone — the modern, more predictable replacement for the old finalizer mechanism.</p>
 
+<h3>5.5 Case Study: GC Pauses During a ShopSphere Flash Sale</h3>
+<p>A flash sale is the scenario that most reliably turns a GC configuration that "seemed fine" into a visible production incident. In the hour before the sale, <code>order-service</code> handles its normal steady traffic; the moment the sale opens, checkout request volume can jump 20–50x within seconds. Walking through what happens to each collector under that spike makes the tradeoffs in §5.2 concrete rather than abstract:</p>
+<ul>
+  <li><strong>Allocation rate spikes first.</strong> Every concurrent checkout allocates a fresh <code>Order</code>, its <code>List&lt;OrderItem&gt;</code>, and request/response DTOs for the calls to <code>inventory-service</code> and <code>payment-service</code>. At 20x normal traffic, Eden fills 20x faster, so Young GCs — already the most frequent kind of pause — start firing far more often. Individually each one is still short (Young GC pause time scales with the number of <em>live</em> objects it has to copy, not with how fast Eden filled), but at high enough frequency the cumulative stolen CPU time shows up directly as elevated p99 checkout latency, even though no single pause looks alarming in isolation.</li>
+  <li><strong>Premature promotion gets worse under load.</strong> If survivor spaces were already borderline-too-small for a normal checkout's in-flight lifetime (§3.3), a flash sale's higher concurrency means more checkouts are simultaneously "in flight" at any instant, competing for the same fixed survivor space. More of them get promoted to Old before they're actually long-lived, which inflates the Old generation and — critically — brings the next Major/Full GC closer, at exactly the worst time to pay for one.</li>
+  <li><strong>The failure mode to watch for with G1 specifically: a Full GC fallback mid-sale.</strong> If Old-generation garbage accumulates faster than G1's concurrent marking cycle can identify garbage-dense regions to reclaim via Mixed GCs (§5.3), G1 runs out of runway and falls back to a single-threaded, stop-the-world Full GC across the entire heap — a multi-second pause landing in the middle of peak checkout traffic, during which every in-flight request stalls. This is the scenario in the "G1 Full GC" concept-QA below, and a flash sale is the textbook real-world trigger for it: a sudden allocation-rate spike that outpaces concurrent marking.</li>
+  <li><strong>Why the response isn't just "add more heap."</strong> A larger heap absorbs a bigger allocation burst before needing to collect, which helps, but a larger heap also means a larger Old generation to scan when a Major/Full GC does eventually happen — for G1/ZGC/Shenandoah this is mitigated by their region-based/concurrent design, but for Serial or Parallel GC a bigger heap can make an eventual Full GC pause considerably longer, trading pause frequency for pause severity. The more targeted fixes are: start G1's concurrent marking earlier (lower the Old-generation occupancy threshold that triggers it, giving marking more head start before the sale's garbage volume arrives), pre-warm and pre-size the heap and connection pools before the sale starts rather than letting the JVM discover the new working set live, and — the highest-leverage fix of all — reduce the allocation rate itself, e.g. reusing DTOs, avoiding unnecessary defensive copies of <code>OrderItem</code> lists, and batching the <code>InventoryReserved</code>/<code>PaymentCaptured</code> event payloads instead of allocating a fresh object graph per event.</li>
+</ul>
+<div class="callout warn">
+  <div class="callout-title">Load-test the GC, not just the endpoint</div>
+  A load test that only checks response correctness under flash-sale-level concurrency can pass cleanly while GC logging (§6.1) quietly shows Young GC frequency climbing and Old-generation occupancy trending upward run over run — exactly the signature of premature promotion. The fix is to load-test with GC logging enabled and specifically watch for a rising Old-generation "floor" after each collection, which is the same diagnostic used for a genuine memory leak in §6.2, except here the trigger is a load spike rather than a bug.
+</div>
+
 <h2>6. JVM Tuning &amp; Profiling</h2>
 <h3>6.1 What the common tuning flags actually control</h3>
-<p>A few categories cover most day-to-day tuning: setting the heap's minimum and maximum size (often to the same value, so the JVM never pays the cost of growing the heap mid-run), sizing Metaspace explicitly (both an initial size, to avoid early resize pauses, and a cap, so a classloader leak fails loudly with an <code>OutOfMemoryError</code> instead of silently consuming all native memory), choosing a garbage collector explicitly, giving G1 a target maximum pause time (a goal it tries to meet, not a hard guarantee), and enabling automatic heap-dump capture and structured GC logging so a production incident leaves behind the evidence needed to diagnose it after the fact rather than requiring a live reproduction.</p>
+<p>A few categories cover most day-to-day tuning: setting the heap's minimum and maximum size (often to the same value, so the JVM never pays the cost of growing the heap mid-run — for <code>order-service</code>, sized generously enough to absorb a flash-sale allocation burst per §5.5 without forcing premature promotion), sizing Metaspace explicitly (both an initial size, to avoid early resize pauses, and a cap, so a classloader leak fails loudly with an <code>OutOfMemoryError</code> instead of silently consuming all native memory), choosing a garbage collector explicitly, giving G1 a target maximum pause time (a goal it tries to meet, not a hard guarantee), and enabling automatic heap-dump capture and structured GC logging so a production incident leaves behind the evidence needed to diagnose it after the fact rather than requiring a live reproduction.</p>
+<pre><code># Example order-service startup flags, sized for a flash-sale-capable JVM
+-Xms4g -Xmx4g                        # fixed heap: no runtime resize pauses
+-XX:MetaspaceSize=256m -XX:MaxMetaspaceSize=512m   # capped, so a classloader leak OOMs loudly
+-XX:+UseG1GC -XX:MaxGCPauseMillis=100              # G1, targeting <=100ms pauses
+-XX:InitiatingHeapOccupancyPercent=35              # start concurrent marking earlier than
+                                                    # the 45% default, ahead of a sale's burst
+-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/dumps
+-Xlog:gc*:file=/var/log/order-service-gc.log:time,uptime,level,tags</code></pre>
 
 <h3>6.2 How to diagnose a memory leak</h3>
 <ol>
   <li>Capture a heap dump automatically at the moment of failure (rather than trying to reproduce the issue under a debugger) so the exact state that caused the failure is preserved.</li>
-  <li>Load the dump into a heap-analysis tool and look at its dominator tree / leak-suspect report — this surfaces which single object graph is retaining a disproportionate share of memory. Classic culprits: an ever-growing static collection, a cache with no eviction policy, listeners or callbacks that get registered but never unregistered, or a <code>ThreadLocal</code> value that never gets cleared in a thread that gets reused from a pool.</li>
-  <li>Cross-check against GC logs: a genuine leak shows Old-generation occupancy that keeps climbing after every Full GC — the "floor" after each collection never comes back down. A pure sizing problem looks different: GC runs frequently, but each collection still reclaims a healthy amount of memory, meaning the working set is simply larger than the heap allows, not that something is being retained forever.</li>
-  <li>For ongoing, low-overhead investigation without needing a full heap dump, sampling profilers can capture CPU or allocation flame graphs directly against a live production process with minimal overhead, since they read stack samples via lightweight OS-level mechanisms rather than instrumenting every method call.</li>
+  <li>Load the dump into a heap-analysis tool and look at its dominator tree / leak-suspect report — this surfaces which single object graph is retaining a disproportionate share of memory. Classic culprits in a service like <code>order-service</code>: an ever-growing static <code>Map</code> of pending orders keyed by <code>idempotencyKey</code> that's never cleaned up after a <code>Payment</code> resolves, a product/coupon cache with no eviction policy, listeners on an <code>OrderPlaced</code>/<code>PaymentCaptured</code> event bus that get registered per-request but never unregistered, or a <code>ThreadLocal</code> holding request context that never gets cleared in a worker thread reused from a pool.</li>
+  <li>Cross-check against GC logs: a genuine leak shows Old-generation occupancy that keeps climbing after every Full GC — the "floor" after each collection never comes back down. A pure sizing problem looks different: GC runs frequently, but each collection still reclaims a healthy amount of memory, meaning the working set (e.g. simply more concurrent in-flight orders than the heap was sized for) is larger than the heap allows, not that something is being retained forever.</li>
+  <li>For ongoing, low-overhead investigation without needing a full heap dump, sampling profilers can capture CPU or allocation flame graphs directly against a live production process with minimal overhead, since they read stack samples via lightweight OS-level mechanisms rather than instrumenting every method call — enough to see, for example, that a disproportionate share of allocations trace back to a defensive copy of every <code>OrderItem</code> list on each checkout call. See <a href="#/jvm-profiling-troubleshooting">JVM Performance Profiling &amp; Production Troubleshooting</a> for the deeper mechanics of how these tools actually attach to and sample a live JVM.</li>
 </ol>
 
 <div class="callout">
   <div class="callout-title">How to choose a collector</div>
-  Frame the decision around the tradeoff between <strong>latency and throughput</strong>, combined with heap size: G1 is the safe general-purpose default for most services; ZGC or Shenandoah when there's a hard requirement for very short, consistent pauses on a large heap; Parallel GC when a workload is offline/batch and total throughput matters far more than any individual pause.
+  Frame the decision around the tradeoff between <strong>latency and throughput</strong>, combined with heap size: G1 is the safe general-purpose default for most services, including <code>order-service</code>, where checkout latency matters but sub-10ms pauses aren't a hard requirement; ZGC or Shenandoah when there's a hard requirement for very short, consistent pauses on a large heap (e.g. a latency-critical <code>inventory-service</code> reserving stock under flash-sale load where even a 100ms G1 pause is unacceptable); Parallel GC when a workload is offline/batch and total throughput matters far more than any individual pause — e.g. a nightly job recomputing seller payout totals across all of ShopSphere's orders (see <a href="#/batch-processing-scheduled-jobs">Batch Processing &amp; Scheduled Jobs</a>).
 </div>
 
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
@@ -334,6 +431,11 @@ PASS 2 (instance construction for `new Child()`):
   <div class="qa-body">Because Metaspace draws from native memory shared with the rest of the operating system rather than a fixed region carved out of the heap, an unbounded leak there (most often a classloader that never becomes unreachable, keeping every class it loaded alive too) can now degrade or crash the entire host rather than staying contained as a clean, isolated OutOfMemoryError inside one process's heap. This is why production configurations should always cap Metaspace explicitly rather than relying on its unbounded default.</div>
 </details>
 
+<details class="concept-qa">
+  <summary>A flash sale spikes order-service's traffic 30x for twenty minutes. GC pause frequency climbs and p99 checkout latency degrades, but no exception is ever thrown. What's actually happening, and how would you confirm it?</summary>
+  <div class="qa-body">This is almost always the allocation-rate story from §5.5, not a leak. Checkout allocates a fresh Order, OrderItem list, and inter-service DTOs on every request; at 30x traffic, Eden fills 30x faster, so Young GCs fire far more often — each individually short, but the cumulative pause time now shows up as real, measurable latency at the tail. If survivor spaces were already borderline for a normal checkout's in-flight duration, the higher concurrency during the sale pushes more objects into premature promotion, inflating the Old generation and bringing a Major/Full GC closer at the worst possible time. To confirm: pull GC logs from during the spike and check whether Young GC frequency rose (expected, and mostly benign on its own) versus whether Old-generation occupancy after each collection is trending upward across the sale window (the signature of premature promotion turning into real pressure) — the same diagnostic as a leak in §6.2, but here the trigger is a load spike with a clear start and end rather than a slow, unbounded climb that never recovers.</div>
+</details>
+
 <h2>Related Topics</h2>
 <div class="related-grid">
   <div class="related-card" onclick="window.location.hash='/collections-internals'">
@@ -347,5 +449,13 @@ PASS 2 (instance construction for `new Child()`):
   <div class="related-card" onclick="window.location.hash='/modern-java-features'">
     <div class="rc-title">Modern Java Features</div>
     <div class="rc-sub">Days 46–50 · Records, sealed classes, and how they interact with classloading</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/jvm-profiling-troubleshooting'">
+    <div class="rc-title">JVM Performance Profiling &amp; Production Troubleshooting</div>
+    <div class="rc-sub">The natural next step · heap dumps, flame graphs, and diagnosing the GC pauses covered here in a live production incident</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/batch-processing-scheduled-jobs'">
+    <div class="rc-title">Batch Processing &amp; Scheduled Jobs</div>
+    <div class="rc-sub">Throughput-first workloads · why Parallel GC's stop-the-world tradeoff is the right choice for offline jobs, unlike order-service's latency-sensitive checkout path</div>
   </div>
 </div>

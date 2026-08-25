@@ -1,0 +1,277 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Extended Bonus · Java / Bonus</p>
+<h1>JVM Performance Profiling &amp; Production Troubleshooting</h1>
+<div class="topic-tags">
+<span class="tag">Thread Dumps / jstack</span>
+<span class="tag">Deadlock Diagnosis</span>
+<span class="tag">Heap Dumps / jmap / MAT</span>
+<span class="tag">Memory Leak Hunting</span>
+<span class="tag">JFR &amp; async-profiler</span>
+<span class="tag">GC Log Correlation</span>
+<span class="tag">Incident Response</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p><a href="#/jvm-architecture">JVM architecture and GC theory</a> tell you what the heap, Metaspace, and collectors are and how they behave in principle; this page is about what you actually do at 2am when <code>order-service</code>'s p99 checkout latency triples during a flash sale, or a pod starts getting OOM-killed every few hours. Reading a stack trace is not the same skill as reading a full thread dump under contention, and knowing GC theory is not the same skill as correlating an actual GC log against an actual latency graph to prove (or rule out) that GC caused a specific incident. These are the tools that turn "the service is slow" or "the service leaks memory" from a vague complaint into a specific, provable root cause — a deadlock between two <code>synchronized</code> blocks, a thread pool exhausted waiting on a slow payment-gateway call, an unbounded <code>Product</code> lookup cache that never evicts. Without them you're guessing and redeploying; with them you're looking directly at what every thread was doing, or which object graph is retaining the memory, at the exact moment things went wrong.</p>
+</div>
+
+<h2>1. Thread Dumps: Seeing What Every Thread Is Actually Doing</h2>
+<p>A thread dump is a snapshot, captured at one instant, of every live thread in the JVM along with its current stack trace, its state (<code>RUNNABLE</code>, <code>BLOCKED</code>, <code>WAITING</code>, <code>TIMED_WAITING</code>), and — critically — which lock (if any) it currently holds or is waiting to acquire. It answers exactly one question, but answers it completely: <em>at this instant, what is every thread in this process doing, and what is it blocked on?</em> This is the first tool to reach for whenever a service appears to <strong>hang</strong> — requests stop completing, but the process is still alive, CPU usage may even be near zero, and nothing has crashed.</p>
+<h3>1.1 Taking a thread dump</h3>
+<pre><code># Attach by PID (the process must be a JVM you can signal/attach to)
+jstack &lt;pid&gt; &gt; threaddump.txt
+
+# Equivalent, sent directly to a running process's stdout/log (Unix only)
+kill -3 &lt;pid&gt;
+
+# jcmd is the modern, unified alternative to jstack/jmap/jinfo as separate binaries
+jcmd &lt;pid&gt; Thread.print &gt; threaddump.txt</code></pre>
+<p>Take at least two or three dumps, a few seconds apart, rather than one. A single dump only proves a thread was blocked at that instant; it can't distinguish a permanent deadlock from a thread that happens to be mid-wait on something that resolves a moment later. If the same threads are stuck on the exact same lock across three consecutive dumps taken seconds apart, that's strong evidence of a genuine stall rather than an ordinary transient wait.</p>
+<h3>1.2 Reading thread state</h3>
+<table>
+<tr><th>State</th><th>Meaning</th><th>ShopSphere example</th></tr>
+<tr><td><code>RUNNABLE</code></td><td>Executing Java code or ready to run on a CPU core (this includes threads doing actual I/O syscalls that the JVM can't distinguish further without OS-level tooling)</td><td>A thread inside a tight loop recalculating flash-sale discount prices</td></tr>
+<tr><td><code>BLOCKED</code></td><td>Waiting to enter a <code>synchronized</code> block/method because another thread currently holds that monitor</td><td>A thread waiting to enter <code>InventoryReservationService</code>'s <code>synchronized</code> reserve method while another thread holds it</td></tr>
+<tr><td><code>WAITING</code></td><td>Parked indefinitely — <code>Object.wait()</code> with no timeout, <code>Thread.join()</code>, or <code>LockSupport.park()</code> — until another thread explicitly notifies/interrupts/unparks it</td><td>A worker thread in a pool sitting idle, parked until a task is submitted</td></tr>
+<tr><td><code>TIMED_WAITING</code></td><td>Same as <code>WAITING</code>, but with a timeout — <code>Thread.sleep(ms)</code>, <code>Object.wait(ms)</code>, or a bounded blocking-queue poll</td><td>A payment-service HTTP client thread waiting on a socket read with a configured 5-second timeout</td></tr>
+<tr><td><code>NEW</code> / <code>TERMINATED</code></td><td>Not yet started / finished running — rarely interesting in a dump of a running service</td><td>—</td></tr>
+</table>
+<div class="callout warn">
+<div class="callout-title">A pile of TIMED_WAITING threads is not automatically a bug — a pile of BLOCKED threads usually is</div>
+<p>Seeing many threads in <code>TIMED_WAITING</code> on a socket read is completely normal for a healthy pool of HTTP client threads waiting on a slow downstream — that's just concurrency doing its job. What's diagnostic is the <em>ratio</em>: if every single request-handling thread in the pool is simultaneously <code>TIMED_WAITING</code> on the same downstream call with none left <code>RUNNABLE</code> to accept new work, the service has exhausted its pool waiting on someone else, which shows up to callers exactly like a hang even though no individual thread is doing anything wrong. A pile of threads genuinely <code>BLOCKED</code> on the same monitor, however, means something is holding a lock for far longer than expected — that's the shape of both a deadlock and an ordinary lock-contention bottleneck, and the dump's "waiting to lock" / "locked" annotations (section 1.3) tell you which.</p>
+</div>
+
+<h3>1.3 Diagnosing a deadlock: two synchronized blocks in order-service</h3>
+<p>Suppose ShopSphere's <code>order-service</code> has two methods that each lock an <code>Order</code> and an <code>Inventory</code> record, but acquire them in opposite orders — a classic lock-ordering bug:</p>
+<pre><code>// Thread A path: cancelOrder() locks Order first, then Inventory
+public void cancelOrder(Order order, Inventory inventory) {
+    synchronized (order) {
+        synchronized (inventory) {
+            order.setStatus(OrderStatus.CANCELLED);
+            inventory.release(order.getItems());
+        }
+    }
+}
+
+// Thread B path: adjustStock() locks Inventory first, then Order
+public void adjustStock(Inventory inventory, Order order) {
+    synchronized (inventory) {
+        synchronized (order) {
+            inventory.decrement(order.getItems());
+            order.touchLastModified();
+        }
+    }
+}</code></pre>
+<p>If Thread A locks <code>order</code> and is about to lock <code>inventory</code> at the exact moment Thread B locks <code>inventory</code> and is about to lock <code>order</code>, both threads now hold one lock the other needs and neither will ever release its own — a permanent deadlock. Neither thread crashes; both simply sit <code>BLOCKED</code> forever, and every request routed to either code path piles up behind them. This is precisely the failure mode a thread dump is built to expose, because the JVM itself detects cycles in monitor ownership among Java-level <code>synchronized</code> locks and prints them explicitly:</p>
+<pre><code>Found one Java-level deadlock:
+=============================
+"http-nio-8080-exec-3":
+  waiting to lock monitor 0x00007f2b... (object 0x000000071a2b3c40, a com.shopsphere.order.Inventory),
+  which is held by "http-nio-8080-exec-7"
+  at com.shopsphere.order.OrderService.cancelOrder(OrderService.java:42)
+  - locked &lt;0x000000071a2b1d10&gt; (a com.shopsphere.order.Order)
+
+"http-nio-8080-exec-7":
+  waiting to lock monitor 0x00007f2c... (object 0x000000071a2b1d10, a com.shopsphere.order.Order),
+  which is held by "http-nio-8080-exec-3"
+  at com.shopsphere.order.OrderService.adjustStock(OrderService.java:58)
+  - locked &lt;0x000000071a2b3c40&gt; (a com.shopsphere.order.Inventory)
+
+Found 1 deadlock.</code></pre>
+<p>The JVM literally names it "Found one Java-level deadlock" and shows the exact cycle: exec-3 waits on a lock exec-7 holds, and exec-7 waits on a lock exec-3 holds. There is nothing to guess here — the fix is purely structural: always acquire locks in the same global order everywhere in the codebase (e.g., always lock <code>Order</code> before <code>Inventory</code>, never the reverse), or, better, avoid holding two independent locks across a call at all by consolidating the operation behind a single lock or an atomic/optimistic update.</p>
+<div class="callout">
+<div class="callout-title">Not every hang is this kind of deadlock</div>
+<p>The JVM's built-in deadlock detector only finds cycles among <code>synchronized</code> monitors (and, in newer JDKs, <code>java.util.concurrent.locks.ReentrantLock</code>s it can also inspect). It cannot detect a "deadlock" that instead involves, say, two threads each waiting on a <code>CompletableFuture</code> the other is supposed to complete, or a thread pool that's simply exhausted (section 1.4) — those don't print "Found one Java-level deadlock" at all, because no monitor cycle exists; they just look like every thread being stuck, and you have to read the actual stack frames to see what each thread is really waiting on.</p>
+</div>
+
+<h3>1.4 Diagnosing thread-pool exhaustion: a slow payment gateway</h3>
+<p>A more common production hang than an actual deadlock: <code>order-service</code>'s checkout endpoint calls out to an external payment gateway over HTTP, and that gateway starts responding slowly (or not at all) during an incident on its side. If every thread in the request-handling pool ends up blocked waiting on that one slow call, the pool has no threads left to accept new requests — new checkout attempts queue up and eventually time out, even though nothing has technically deadlocked. A thread dump taken during this makes the pattern obvious: many threads, same stack trace, same downstream call:</p>
+<pre><code>"http-nio-8080-exec-12" #47 TIMED_WAITING
+  at java.net.SocketInputStream.socketRead0(Native Method)
+  at java.net.SocketInputStream.read(SocketInputStream.java:...)
+  at ...
+  at com.shopsphere.payment.PaymentGatewayClient.charge(PaymentGatewayClient.java:31)
+  at com.shopsphere.order.CheckoutService.processPayment(CheckoutService.java:88)
+  at com.shopsphere.order.CheckoutController.checkout(CheckoutController.java:22)
+
+"http-nio-8080-exec-13" #48 TIMED_WAITING
+  at java.net.SocketInputStream.socketRead0(Native Method)
+  ... (identical stack)
+
+"http-nio-8080-exec-14" #49 TIMED_WAITING
+  ... (identical stack — 40 more threads look exactly like this)</code></pre>
+<p>Seeing forty near-identical stacks, all parked in <code>PaymentGatewayClient.charge</code>, is the signature of pool exhaustion caused by one slow downstream dependency — not a bug in ShopSphere's own code, but a resilience gap in how it calls out to a dependency that can be slow. The fix isn't in the thread dump itself; it's applying <a href="#/resilience-fault-tolerance">timeouts, circuit breakers, and bulkheads</a> so a slow payment-gateway call fails fast and releases the thread back to the pool instead of holding it indefinitely, and sizing the pool with enough headroom (or using a fully async/non-blocking HTTP client) that one dependency's slowness can't single-handedly starve every other request type sharing the same pool.</p>
+
+<h2>2. Heap Dumps: Finding What's Actually Retaining Memory</h2>
+<p>A heap dump is a complete snapshot of every live object on the heap at the moment it's taken — every object's fields, every reference between objects, and (depending on how it was captured) every GC root that's keeping each object reachable. Where a thread dump answers "what is every thread doing right now," a heap dump answers "what does memory actually contain right now, and what's holding onto it." This is the tool for a <strong>memory leak</strong> — a service whose heap usage climbs steadily and never comes back down even after a Full GC, eventually ending in an <code>OutOfMemoryError</code> or repeated pod restarts.</p>
+<h3>2.1 Taking a heap dump</h3>
+<pre><code># On demand, against a running process
+jmap -dump:live,format=b,file=heap.hprof &lt;pid&gt;
+
+# jcmd equivalent (preferred on modern JDKs)
+jcmd &lt;pid&gt; GC.heap_dump heap.hprof
+
+# Automatic capture at the exact moment an OutOfMemoryError is thrown —
+# this is the single most valuable flag for production, because by the time
+# you notice a leak and try to reproduce it live, the evidence is often gone
+-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/dumps</code></pre>
+<p>The <code>live</code> qualifier in the <code>jmap</code> command triggers a full GC first and dumps only objects that survive it — objects genuinely reachable, not garbage waiting to be collected. This matters because without it, a heap dump is cluttered with dead objects the collector simply hasn't gotten around to yet, making the "what's actually leaking" signal much noisier. The cost is that forcing a full GC on a live production process pauses it — capturing a heap dump is inherently disruptive, which is exactly why <code>HeapDumpOnOutOfMemoryError</code> (capturing automatically, only at the moment of actual failure) is preferred over routinely taking manual dumps against a healthy, running process.</p>
+
+<h3>2.2 Reading a dump: the dominator tree and retained size</h3>
+<p>A raw heap dump is enormous — potentially millions of objects and references — so no one reads it as a flat list. Eclipse MAT (Memory Analyzer Tool) and similar tools (VisualVM, YourKit) organize it around two ideas that make the analysis tractable:</p>
+<ul>
+<li><strong>Shallow size</strong> — the memory an object itself occupies (its own fields), ignoring anything it points to. A <code>HashMap</code> instance's shallow size is small and roughly constant regardless of how many entries it holds, because the entries live in separate <code>Node</code> objects the map merely references.</li>
+<li><strong>Retained size</strong> — the total memory that would become garbage if this one object became unreachable, i.e. this object plus everything only reachable <em>through</em> it. A <code>HashMap</code> field holding a million cached <code>Product</code> objects has a tiny shallow size but an enormous retained size, because all million cached products are only reachable through that one map reference.</li>
+</ul>
+<p>The <strong>dominator tree</strong> is the structure MAT builds to compute retained size efficiently: object A "dominates" object B if every path from any GC root to B necessarily passes through A — meaning A is genuinely responsible for keeping B alive, not merely one of several paths that happen to reach it. MAT's "Leak Suspects" report walks this tree looking for objects with disproportionately large retained size relative to the rest of the heap — that's almost always where a leak surfaces first, because a genuine leak is, by definition, one object graph that keeps growing and is never released.</p>
+
+<h3>2.3 A concrete ShopSphere leak: an unbounded Product lookup cache</h3>
+<p>Suppose a well-intentioned but incomplete optimization in ShopSphere's catalog-service adds an in-memory cache to avoid repeatedly hitting the database for frequently-viewed products:</p>
+<pre><code>// THE BUG: a plain static HashMap used as a cache, with no eviction policy at all
+public class ProductLookupCache {
+    private static final Map&lt;String, Product&gt; cache = new HashMap&lt;&gt;();
+
+    public static Product get(String productId, Supplier&lt;Product&gt; loader) {
+        return cache.computeIfAbsent(productId, id -&gt; loader.get());
+    }
+}</code></pre>
+<p>Every distinct <code>productId</code> ever looked up — across the entire lifetime of the process, across every customer, every search, every catalog page view — gets inserted and never removed. In a catalog with millions of products and constant traffic churning through different ones, this map's retained size grows monotonically. A single Full GC reclaims nothing from it, because every entry is still strongly reachable from a live <code>static</code> field — <code>static</code> fields are one of the JVM's GC roots by definition, so anything transitively reachable from one is never eligible for collection regardless of how long ago it was last used.</p>
+<h3>2.4 What the dump actually shows</h3>
+<p>Loading the heap dump into MAT and running "Leak Suspects" surfaces exactly this shape: one object — <code>ProductLookupCache.cache</code>, a <code>HashMap</code> — with a retained size that dwarfs everything else on the heap, and a dominator-tree path straight from a GC root (the static field itself) down through every cached <code>Product</code> entry. The histogram view corroborates it independently: sorting all live instances by total retained size shows millions of live <code>Product</code> and <code>HashMap$Node</code> instances, far more than the number of products a reasonable working set should ever need cached at once.</p>
+<pre><code>Class Name                     | Shallow Heap | Retained Heap
+--------------------------------|--------------|---------------
+com.shopsphere.catalog.Product | 15,832,000   | 1,240,500,000   &lt;- huge retained, obviously wrong
+java.util.HashMap$Node         | 15,832,000   | 1,180,000,000
+java.lang.String                | 8,120,400    | 60,200,000
+...</code></pre>
+<p>The fix is not a bigger heap — that only delays the same <code>OutOfMemoryError</code> — it's giving the cache an actual eviction policy. Replacing the plain <code>HashMap</code> with a bounded structure (a <a href="#/collections-internals"><code>LinkedHashMap</code>-based LRU</a>, or, in production, a purpose-built cache like Caffeine with a max size and/or a time-based expiry) caps retained size at a known ceiling regardless of how many distinct products are ever looked up over the process's lifetime — the cache trades a small amount of avoidable cache-miss cost for a heap footprint that stops growing.</p>
+<div class="callout warn">
+<div class="callout-title">Classic leak culprits worth recognizing by shape, not just this one example</div>
+<p>Beyond an unbounded cache, the same "retained forever because still strongly reachable from a GC root" pattern recurs in a few other common shapes: listeners registered against a long-lived event bus (an <code>OrderPlaced</code> subscriber added per-request but never unregistered) that keep every subscribing object alive for the life of the bus; a <code>ThreadLocal</code> that stores per-request context but is never explicitly cleared, so a thread reused from a pool keeps referencing the previous request's data indefinitely (and, worse, the next request on that thread may silently read stale context); and inner classes or lambdas that implicitly capture an enclosing instance (<code>this</code>) longer than intended, keeping that whole outer object graph alive through a reference the code never explicitly wrote down.</p>
+</div>
+
+<h3>2.5 Distinguishing a leak from a sizing problem</h3>
+<p>A heap dump alone can be ambiguous — a large heap could mean an actual leak, or it could just mean the working set is legitimately larger than the heap was sized for (more concurrent in-flight orders than expected, say). The way to tell them apart is to look at the trend across multiple GC cycles, not a single snapshot:</p>
+<table>
+<tr><th></th><th>Genuine leak</th><th>Undersized heap</th></tr>
+<tr><td>Old-gen occupancy after each Full GC</td><td>Keeps climbing — the post-GC "floor" never comes back down</td><td>Stays roughly flat, collection to collection</td></tr>
+<tr><td>Amount reclaimed per Full GC</td><td>Shrinks over time (less and less garbage relative to what's retained)</td><td>Stays consistently healthy — each GC reclaims a substantial amount</td></tr>
+<tr><td>Behavior if given more heap</td><td>Delays the eventual OutOfMemoryError, doesn't prevent it</td><td>Fixes the symptom outright</td></tr>
+<tr><td>Two heap dumps taken hours apart</td><td>The same object graph (e.g. <code>ProductLookupCache.cache</code>) is visibly larger in the second</td><td>Roughly the same shape, just reflecting more concurrent load</td></tr>
+</table>
+
+<h2>3. Low-Overhead Production Profiling: JFR and async-profiler</h2>
+<p>Thread dumps and heap dumps are point-in-time snapshots — excellent for "what's stuck right now" or "what's leaking right now," but useless for the question "which specific method is burning the most CPU across a five-minute window under real production load," because a snapshot only ever shows one instant. Answering that requires sampling the running process repeatedly over an interval and building up a statistical picture — which is exactly what a profiler does — but traditional instrumenting profilers (that rewrite bytecode to record every method entry/exit) add enough overhead that they distort the very behavior you're trying to measure, and are rarely safe to run against live production traffic at all.</p>
+<h3>3.1 Java Flight Recorder (JFR): built into the JVM</h3>
+<p>JFR is a profiling and event-recording framework shipped inside the JDK itself (OpenJDK 11+, and backported to 8u), designed from the start to run continuously in production with low enough overhead (typically low single-digit percent) that it's safe to leave on by default. It doesn't work by instrumenting bytecode; it hooks into the JVM's own internal event points — safepoints, allocation, GC pauses, lock contention, thread state transitions — and periodically samples stack traces from those points, writing everything into a compact binary <code>.jfr</code> file for later analysis.</p>
+<pre><code># Start order-service with continuous JFR recording enabled from boot
+java -XX:+FlightRecorder \
+     -XX:StartFlightRecording=filename=recording.jfr,duration=60s,settings=profile \
+     -jar order-service.jar
+
+# Attach to an already-running process and start a recording without a restart
+jcmd &lt;pid&gt; JFR.start duration=60s filename=recording.jfr
+
+# Inspect a recording's contents from the command line
+jfr print --events jdk.ExecutionSample recording.jfr</code></pre>
+<p>A JFR recording captures CPU-sample stack traces (which method was on top of the stack, sampled periodically), allocation events (which call sites are allocating the most, and how much — directly relevant to diagnosing the <a href="#/jvm-architecture">GC allocation-pressure story</a> during a ShopSphere flash sale), lock contention events (which monitors threads spend the most time waiting to acquire — a lower-overhead, aggregate complement to the point-in-time view a thread dump gives), and GC pause events with their duration — all correlated by timestamp in one file, which is what makes it possible to answer questions like "during the exact five minutes checkout latency spiked, what was actually consuming CPU, and did GC pause frequency change at the same time." Tools like <strong>JDK Mission Control (JMC)</strong> open a <code>.jfr</code> file and render this as flame graphs, hot-method tables, and timeline views.</p>
+
+<h3>3.2 async-profiler: sampling that survives safepoint bias</h3>
+<p>async-profiler is a separate, widely-used open-source sampling profiler for the JVM, notable for using OS-level signal-based sampling (on Linux, via <code>perf_events</code>) rather than relying purely on JVM safepoints to take a stack sample. This matters because older, naive sampling approaches can only safely inspect a thread's stack when that thread happens to be at a JVM safepoint (a point where all thread state is in a consistent, inspectable condition) — and certain code paths reach safepoints far more often than others, which skews naive sampling toward over-representing whichever methods happen to hit safepoints frequently and under-representing tight loops that don't. This distortion is called <strong>safepoint bias</strong>. async-profiler's signal-based approach can sample a thread's native call stack at essentially any point in its execution, producing a much more accurate picture of where time is actually going, including inside JIT-compiled native code and even native (JNI) library calls that a purely JVM-level profiler can't see into at all.</p>
+<pre><code># Attach to a running ShopSphere order-service process and capture a 30-second CPU flame graph
+./profiler.sh -d 30 -e cpu -f checkout-cpu-flamegraph.html &lt;pid&gt;
+
+# Allocation profiling: which call sites allocate the most during a flash sale
+./profiler.sh -d 30 -e alloc -f checkout-alloc-flamegraph.html &lt;pid&gt;</code></pre>
+<p>The output is typically rendered as a <strong>flame graph</strong> — a horizontal stack of bars where each bar is a stack frame, width proportional to the fraction of samples in which that frame appeared, and stacking upward represents the call chain from caller (bottom) to callee (top). A wide, flat plateau near the top of a flame graph is the visual signature of a hot method — one where a large fraction of all samples land, meaning a disproportionate share of CPU time is spent there. For ShopSphere, a checkout-path CPU flame graph that shows an unexpectedly wide bar in, say, a coupon-discount recalculation method run on every cart item, on every checkout, is a direct, evidence-backed pointer at exactly which method to optimize — not a guess.</p>
+
+<table>
+<tr><th></th><th>Thread dump (jstack)</th><th>Heap dump (jmap/MAT)</th><th>JFR / async-profiler</th></tr>
+<tr><td>What it captures</td><td>One instant: every thread's state + stack</td><td>One instant: every live object + references</td><td>A window over time: sampled stacks, allocations, locks, GC events</td></tr>
+<tr><td>Right question to ask with it</td><td>"What is stuck right now?"</td><td>"What's retaining memory right now?"</td><td>"What's actually consuming CPU/allocating/blocking over this interval?"</td></tr>
+<tr><td>Overhead</td><td>Negligible, momentary</td><td>A pause (GC + serialization); disruptive if taken live</td><td>Low (JFR: ~1-2%; async-profiler: similarly low) — safe to run continuously or on-demand in production</td></tr>
+<tr><td>Typical ShopSphere symptom it solves</td><td>Checkout hangs under load</td><td>order-service's heap climbs steadily until OOM</td><td>p99 checkout latency is elevated but nothing is obviously broken</td></tr>
+</table>
+
+<h2>4. Correlating GC Logs With a Latency Spike</h2>
+<p>GC pauses are stop-the-world (or, for the young/concurrent phases of modern collectors, partially concurrent but still pause-inducing) events, and every pause is real, measurable latency added to whatever request happened to be in flight when it occurred. Structured GC logging (<code>-Xlog:gc*</code>, per <a href="#/jvm-architecture">JVM tuning</a>) records every collection with a timestamp, duration, and the before/after heap occupancy — which means a GC log is, itself, a time series that can be directly overlaid against an application latency graph to answer a very specific question: <em>did a GC pause actually cause this particular latency spike, or was it something else?</em></p>
+<h3>4.1 What to line up</h3>
+<pre><code># A GC log line for a Young GC during a ShopSphere flash sale (G1, abbreviated)
+[2026-08-25T14:32:07.481+0000][gc] GC(842) Pause Young (Normal) (G1 Evacuation Pause)
+    Eden regions: 42-&gt;0 Survivor regions: 6-&gt;8 Old regions: 118-&gt;121
+    12582912K-&gt;9823744K(16777216K) 41.203ms
+
+# Roughly the same moment, in the request-latency dashboard
+14:32:07.470  POST /api/checkout  -> 41ms slower than the surrounding baseline p99</code></pre>
+<p>The workflow is mechanical: take the timestamp of a latency spike from the application's own metrics/tracing (a <code>checkout</code> request whose duration is a clear outlier against its neighbors), and check the GC log for a pause whose timestamp overlaps that request's actual execution window. A 41ms Young GC pause starting at <code>14:32:07.481</code> lining up almost exactly with a checkout request that was in flight at <code>14:32:07.470</code> and finished 41ms slower than its neighbors is strong, specific evidence that this particular request's latency was caused by GC — not application code, not a downstream dependency, not network — because the extra time matches the pause duration almost exactly.</p>
+<h3>4.2 Distinguishing "GC caused this one spike" from "GC is a systemic problem"</h3>
+<ul>
+<li><strong>One-off correlation</strong>: a single request happened to be executing exactly when a pause landed. This is expected background behavior for any collector — pauses happen, and a request unlucky enough to overlap one will show it. It's only actionable if pauses are frequent/long enough that a meaningful fraction of requests are affected, not just the unlucky few.</li>
+<li><strong>Systemic pattern</strong>: p99 (or worse, p50) latency is elevated across an entire time window, and the GC log for that same window shows either abnormally frequent Young GCs (allocation rate spiked, as in a flash sale — see <a href="#/jvm-architecture">the GC-theory page's allocation-pressure discussion</a>) or Old-gen occupancy climbing pause over pause (premature promotion or an active leak, section 2.5). This is the signature that GC tuning, heap sizing, or an allocation hotspot (found via the allocation profiling in section 3) is the actual root cause, not an unlucky coincidence for one request.</li>
+</ul>
+<div class="callout">
+<div class="callout-title">A GC pause showing up in the log doesn't automatically mean GC is the bug</div>
+<p>The correlation only has evidentiary value once you've confirmed the timestamps genuinely overlap the affected request's execution window, and — for a systemic claim — that the pattern repeats across many requests during the same window rather than being cherry-picked from one. A service can show plenty of ordinary Young GC activity throughout a healthy day with zero user-visible impact; the question is never "did any GC happen," it's "did a GC pause overlap specifically the request(s) whose latency you're trying to explain, and does that overlap actually account for the size of the observed spike."</p>
+</div>
+
+<h2>5. A Practical Incident-Response Checklist</h2>
+<p>The order below is deliberate: cheapest and least-disruptive checks first, most disruptive (heap dumps, restarts) last, so a fast recovery path is never blocked on a slow diagnostic step.</p>
+<ol>
+<li><strong>Confirm the symptom's shape first.</strong> Is the service completely unresponsive (hang — go to thread dumps), throwing <code>OutOfMemoryError</code> or steadily climbing in memory (leak — go to heap dumps), or just measurably slower under load with no hard failure (go to GC-log correlation and profiling)? Misidentifying which of these three shapes you're facing wastes the most time in an incident.</li>
+<li><strong>Check dashboards and existing metrics before attaching anything new.</strong> CPU, heap occupancy, GC pause frequency/duration, and thread-pool queue depth (all things <a href="#/observability-production">already instrumented via Micrometer/Actuator</a>) often already show the shape of the problem — a saturated thread pool, a climbing Old-gen floor, a spike in Young GC frequency — without needing to attach a new tool to the live process at all.</li>
+<li><strong>For a hang: take 2-3 thread dumps a few seconds apart</strong> (<code>jstack</code>/<code>jcmd Thread.print</code>). Look first for the JVM's own "Found one Java-level deadlock" block; if absent, look for many threads sharing an identical stack trace parked on the same downstream call (pool exhaustion, section 1.4) or <code>BLOCKED</code> on the same monitor (contention, not deadlock, but still a bottleneck).</li>
+<li><strong>For a leak: capture a heap dump</strong> — ideally one was already captured automatically via <code>HeapDumpOnOutOfMemoryError</code>; if not, and the process is still alive and climbing, take one now (accepting the pause it causes) before restarting anything, because a restart destroys the exact evidence needed to diagnose it. Load it into MAT, run Leak Suspects, and confirm with a dominator-tree walk which single object graph is disproportionately large.</li>
+<li><strong>For "slow but not broken": pull GC logs for the incident window and overlay against latency metrics</strong> (section 4) to rule GC in or out, and attach JFR or async-profiler for a short window (30-60 seconds is often enough) to get an evidence-backed CPU/allocation flame graph rather than guessing which method is hot.</li>
+<li><strong>Mitigate before you finish root-causing, if there's a safe lever.</strong> Scaling out (more pods/instances) buys time for a leak or a load spike without losing the diagnostic evidence already captured; restarting the specific stuck process clears a hang once dumps are already safely saved; a feature flag or circuit breaker can shed load from a known-expensive path (e.g. temporarily disabling a non-critical coupon-recalculation feature during a flash sale) while the real fix is developed.</li>
+<li><strong>Fix at the right layer, and write down what the evidence actually showed.</strong> A lock-ordering fix for a deadlock, a bounded cache for a leak, a circuit breaker for pool exhaustion, or a heap/GC tuning change for allocation pressure — each of section 1-4's failure modes has a distinct, specific fix, and the dump/log/profile you captured is the proof that you fixed the actual cause rather than a plausible-sounding guess.</li>
+</ol>
+<div class="callout tip">
+<div class="callout-title">Capture evidence before you restart</div>
+<p>The single most common way an incident becomes permanently undiagnosable is restarting the affected process before capturing a thread or heap dump. A restart clears the symptom instantly, which is exactly why it's tempting under pressure — but it also destroys the one artifact that could have proven what actually happened. Automatic capture flags (<code>-XX:+HeapDumpOnOutOfMemoryError</code>, continuous JFR recording) exist specifically so this evidence is saved without requiring anyone to remember to capture it manually in the middle of an incident.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does the JVM's built-in deadlock detector reliably find a Java-level deadlock in a thread dump, but not every kind of application "hang"?</summary>
+<div class="qa-body">The JVM tracks ownership of its own synchronized monitors (and, on modern JDKs, java.util.concurrent locks it can inspect) internally, so it can walk the graph of "thread X waits for a lock held by thread Y" edges and detect a cycle directly — that's a fully mechanical, guaranteed-correct check over a well-defined data structure the JVM itself maintains. A broader "hang," though, can arise from things that never touch a JVM monitor at all: two threads each waiting on a CompletableFuture the other side is supposed to complete, an exhausted thread pool with no threads left to make progress, or an external dependency that simply never responds. None of these produce a cycle in monitor ownership, so the deadlock detector has nothing to report — the dump will show every thread's exact stack and state regardless, but recognizing the problem in those cases requires a human to read the stacks and notice the pattern (e.g., many identical stacks parked on the same call), rather than the JVM handing you a pre-labeled diagnosis.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What is the practical difference between a thread's shallow state (BLOCKED vs WAITING vs TIMED_WAITING) and what actually matters when diagnosing a hang?</summary>
+<div class="qa-body">BLOCKED specifically means a thread is trying to enter a synchronized block/method and another thread currently holds that exact monitor — it is inherently about mutual exclusion contention. WAITING and TIMED_WAITING mean a thread has voluntarily parked itself (via Object.wait, Thread.join, LockSupport.park, or a bounded variant with a timeout) and is not competing for a lock at all; it's simply idle until something else wakes it. A single thread in any of these states proves nothing by itself — a thread pool having idle WAITING workers is completely healthy. What's diagnostic is the aggregate shape across the whole dump: many threads BLOCKED on the same monitor points at lock contention or a deadlock (check for a monitor-ownership cycle first); many threads TIMED_WAITING on the identical downstream call with zero threads left RUNNABLE to accept new work points at pool exhaustion caused by a slow dependency. The state name alone never tells you which one you're looking at — the pattern across all threads together does.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is "retained size" the number to look at in a heap dump rather than "shallow size," and what does the dominator tree actually compute?</summary>
+<div class="qa-body">Shallow size is just how many bytes an object's own fields occupy — for something like a HashMap instance, that's small and nearly constant no matter how many entries it holds, because the entries are separate Node objects the map merely references. It tells you almost nothing about where memory is actually going. Retained size is the total memory that would become garbage if that one object became unreachable — the object plus everything reachable only through it — which is the number that actually answers "how much memory is this thing responsible for." The dominator tree is the structure that makes computing this efficient and, more importantly, correctly attributable: object A dominates object B if every path from any GC root to B passes through A, meaning A is genuinely, not just incidentally, keeping B alive. Leak-detection tools rank objects by retained size computed over this tree specifically so a single, small-looking field (a static HashMap reference) can be correctly identified as responsible for gigabytes of retained memory, rather than that memory being invisibly spread across millions of individually small-looking Node and Product objects with no obvious common cause.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why can a static field turn an ordinary cache into a permanent memory leak, when the exact same HashMap used as a local/instance field would just get garbage collected normally?</summary>
+<div class="qa-body">Garbage collection reclaims any object that is not transitively reachable from a GC root — a set of starting points the collector treats as inherently alive, which includes static fields, live thread stacks, and JNI references, among others. A HashMap held in a local variable becomes unreachable, and therefore eligible for collection, the moment the method that created it returns and nothing else references it. A HashMap assigned to a static field, however, is reachable for as long as its owning class remains loaded, which for a class like a cache utility is effectively the entire lifetime of the process — there is no natural point at which that static reference itself becomes unreachable. Every entry ever inserted into it is therefore transitively reachable from a permanent GC root, and a garbage collector's correctness guarantee (never collect something still reachable) means it will never reclaim any of those entries no matter how many Full GCs run, regardless of how stale or unused any individual entry has become. The fix is never about GC tuning — it's giving the structure itself a bounded size or a time-based eviction policy so old entries actually get removed and become unreachable on their own.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What does async-profiler's signal-based sampling actually fix compared to naive safepoint-based sampling, concretely?</summary>
+<div class="qa-body">A naive sampling profiler that relies on JVM safepoints can only inspect a thread's stack at moments when that thread has voluntarily reached a safepoint — a JVM-defined point where all thread state is in a consistent, inspectable condition, typically inserted at method-return boundaries, loop back-edges, and similar points by the JIT compiler. Some code reaches safepoints far more frequently than other code (a method with many loop iterations or frequent calls versus a tight, heavily-inlined numeric loop that the JIT compiled without frequent safepoint checks), so naive sampling systematically over-samples the former and under-samples the latter regardless of how much actual CPU time each consumes — this distortion is safepoint bias, and it can make a genuinely hot tight loop look cold in a flame graph simply because it rarely presents a safe moment to sample. async-profiler instead uses OS-level signal delivery (perf_events on Linux) to interrupt a thread and capture its native call stack at essentially any point in its execution, independent of safepoints, which removes this specific source of systematic distortion and additionally lets it see into JIT-compiled native code and JNI calls that a purely JVM-internal mechanism has no visibility into at all.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Given a GC log timestamp that overlaps a slow request's timestamp, what additional evidence turns "correlation" into an actually-justified causal claim?</summary>
+<div class="qa-body">Timestamp overlap alone is weak on its own, because GC pauses happen continuously in any running JVM and some request will always be executing during some pause purely by chance. Three things strengthen the claim from coincidence to causation: first, the magnitude should roughly match — if a request is 41ms slower than its neighbors and a 41ms GC pause occurred during its execution window, that specific match (not just "some pause happened sometime nearby") is what ties the extra latency to that particular pause rather than to some other cause. Second, for a systemic (not one-off) claim, the pattern needs to repeat across many affected requests within the same time window, not just the one example you happened to look at — a single coincidence proves nothing about a broader trend. Third, ruling out alternative explanations matters: checking that the same slow request didn't also coincide with, say, a downstream dependency's own slowdown, a thread-pool queuing delay, or a CPU spike from an unrelated process on the same host. Only once the magnitude lines up and the pattern is broad and other causes are checked and absent does the correlation actually support "GC caused this," rather than merely "GC happened to be running at the same time."</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does the incident-response checklist insist on capturing evidence (dumps, JFR recordings) before restarting a stuck or leaking process, even under pressure to restore service quickly?</summary>
+<div class="qa-body">A thread dump and a heap dump are both snapshots of transient, in-memory state that exists only while the offending process is still running — the exact stack traces, lock-ownership graph, and live object graph that caused the incident. Restarting the process immediately and irreversibly discards all of that state; the new process starts clean, with no trace of whatever condition caused the original failure. This creates a specific, common failure mode: the symptom disappears (which feels like success), but the actual root cause is never identified, so nothing prevents the exact same failure from recurring under the same conditions later — often at the next traffic spike. Capturing a dump first costs a brief, bounded delay (and, for a heap dump, a real pause), but it preserves the only evidence that can turn "it happened again" into "we know precisely why, and we fixed the actual cause." This is precisely why automatic-capture flags like -XX:+HeapDumpOnOutOfMemoryError and continuous JFR recording exist — they remove the human decision entirely from the critical moment, so evidence is saved by default rather than depending on someone remembering to capture it while already under incident pressure.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/jvm-architecture'"><div class="rc-title">JVM Architecture, Memory Model &amp; Garbage Collection</div><div class="rc-sub">The GC algorithms, heap regions, and allocation-pressure theory this page's log correlation and leak diagnosis techniques are grounded in</div></div>
+<div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Concurrency &amp; Multithreading</div><div class="rc-sub">synchronized, locks, and thread pools are exactly the mechanisms whose failure modes a thread dump exposes</div></div>
+<div class="related-card" onclick="window.location.hash='/observability-production'"><div class="rc-title">Observability &amp; Production Readiness</div><div class="rc-sub">Metrics and dashboards are the first check in the incident checklist, before attaching any profiling tool to a live process</div></div>
+<div class="related-card" onclick="window.location.hash='/resilience-fault-tolerance'"><div class="rc-title">Resilience &amp; Fault Tolerance</div><div class="rc-sub">Timeouts, circuit breakers, and bulkheads are the actual fix for the thread-pool-exhaustion pattern this page diagnoses</div></div>
+<div class="related-card" onclick="window.location.hash='/collections-internals'"><div class="rc-title">Java Collections Framework Internals</div><div class="rc-sub">HashMap/LinkedHashMap mechanics underlie both the unbounded-cache leak and its LRU-based fix covered here</div></div>
+</div>

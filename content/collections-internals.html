@@ -16,7 +16,55 @@
 <p>Every backend service is, underneath its business logic, a machine for moving data between arrays, linked structures, hash tables, and trees. If you don't know that a <code>HashMap</code> resize rehashes every entry, you won't understand why a service that inserts a million entries into a freshly-constructed map without a sized constructor spends a visible chunk of its startup time in <code>resize()</code>. If you don't know that <code>HashMap</code> iteration order is a function of bucket index rather than insertion order, you'll write a test that passes today and fails after a JDK upgrade changes the hash spreading function. This page builds the mental model — array vs. pointer-chasing trade-offs, hashing, balanced trees, heaps — that explains why the framework's classes behave the way they do, not just what methods they expose.</p>
 </div>
 
-<h2>1. Arrays vs. Linked Structures: The Foundation of Every Trade-off</h2>
+<h2>1. The Interface Hierarchy: One Map of the Whole Framework</h2>
+<p>Every class covered on this page is a leaf hanging off one of a small number of interfaces. Almost all confusion about "which collection should I use" collapses once you see this shape: there are two independent root families — <code>Iterable</code>/<code>Collection</code> (sequences, sets, queues) and <code>Map</code> (key→value associations, which is deliberately <em>not</em> a <code>Collection</code> at all, because a map's fundamental operation is lookup-by-key, not element-by-element membership). ShopSphere examples are annotated next to the classes that back them throughout this page.</p>
+<pre><code>Iterable&lt;E&gt;
+  └── Collection&lt;E&gt;
+        ├── List&lt;E&gt;                 (ordered, index-addressable, duplicates allowed)
+        │     ├── ArrayList          — Cart.items, Order.items (List&lt;OrderItem&gt;)
+        │     ├── LinkedList         (also implements Deque)
+        │     ├── Vector             (legacy, synchronized — avoid)
+        │     └── CopyOnWriteArrayList
+        │
+        ├── Set&lt;E&gt;                  (no duplicates, equals()/hashCode() defines identity)
+        │     ├── HashSet            — set of productIds already added to a Cart this session
+        │     ├── LinkedHashSet      — recently-viewed productIds, insertion order preserved
+        │     ├── SortedSet&lt;E&gt;
+        │     │     └── NavigableSet&lt;E&gt;
+        │     │           ├── TreeSet        — sorted set of active couponCodes
+        │     │           └── ConcurrentSkipListSet
+        │     └── CopyOnWriteArraySet
+        │
+        └── Queue&lt;E&gt;                 (FIFO / priority processing)
+              ├── PriorityQueue       — pending Orders ranked by SLA deadline
+              ├── ArrayDeque          (also a Deque — stack or queue)
+              ├── ConcurrentLinkedQueue
+              ├── BlockingQueue&lt;E&gt;    (interface, java.util.concurrent)
+              │     ├── LinkedBlockingQueue    — bounded work queue between order-service and a worker pool
+              │     ├── ArrayBlockingQueue
+              │     └── PriorityBlockingQueue
+              └── Deque&lt;E&gt;            (double-ended queue: push/pop/offer/poll at both ends)
+                    ├── ArrayDeque    — undo stack for a Seller's catalog edits
+                    └── LinkedList
+
+Map&lt;K,V&gt;                             (NOT a Collection — key/value lookup, separate root)
+  ├── HashMap&lt;K,V&gt;                   — catalog cache: Map&lt;String productId, Product&gt;
+  ├── LinkedHashMap&lt;K,V&gt;             — LRU price cache (access-order + removeEldestEntry)
+  ├── SortedMap&lt;K,V&gt;
+  │     └── NavigableMap&lt;K,V&gt;
+  │           ├── TreeMap&lt;K,V&gt;       — events-by-timestamp for a given Order
+  │           └── ConcurrentSkipListMap
+  ├── ConcurrentMap&lt;K,V&gt;             (interface)
+  │     ├── ConcurrentHashMap&lt;K,V&gt;   — per-productId reserved-inventory counters
+  │     └── ConcurrentSkipListMap&lt;K,V&gt;
+  ├── Hashtable&lt;K,V&gt;                 (legacy, synchronized — avoid)
+  └── WeakHashMap&lt;K,V&gt;               (keys collected once no other strong reference exists)</code></pre>
+<div class="callout">
+<div class="callout-title">Why Map is not a Collection</div>
+<p><code>Collection&lt;E&gt;</code>'s contract is built around holding and iterating individual elements of type <code>E</code> — <code>add(E)</code>, <code>contains(E)</code>, <code>iterator()</code> yielding <code>E</code>s. A <code>Map&lt;K,V&gt;</code> doesn't hold "elements" in that sense; it holds an association between two types. Forcing <code>Map</code> to implement <code>Collection&lt;Map.Entry&lt;K,V&gt;&gt;</code> was considered and rejected by the JDK's original designers because so much of <code>Map</code>'s API (<code>get(key)</code>, <code>containsKey</code>, <code>keySet()</code>, <code>values()</code>) has no natural single-element analogue. Instead <code>Map</code> exposes three separate <code>Collection</code>/<code>Set</code> views — <code>keySet()</code>, <code>values()</code>, <code>entrySet()</code> — each backed live by the same underlying table, so mutating one of those views mutates the map itself.</p>
+</div>
+
+<h2>2. Arrays vs. Linked Structures: The Foundation of Every Trade-off</h2>
 <p>Almost every design decision in the collections framework traces back to one physical fact: an array is a single contiguous block of memory, and a linked structure is a set of separately-allocated nodes connected by references. Everything else — complexity numbers, cache behavior, resize costs — falls out of that.</p>
 
 <h3>ArrayList: contiguous, index-addressable storage</h3>
@@ -26,9 +74,17 @@
 <li><strong>add at the end:</strong> amortized O(1). The backing array grows by 50% (via <code>Arrays.copyOf</code>, <code>newCapacity = oldCapacity + (oldCapacity >> 1)</code>) when full, and that growth is <em>amortized</em> because most inserts don't trigger it — the cost of an occasional O(n) copy is spread across the n cheap inserts that preceded it.</li>
 <li><strong>insert/remove at an arbitrary index:</strong> O(n) — every element after the index has to be shifted one slot via <code>System.arraycopy</code>, because the array's contiguity requires that there be no gaps.</li>
 </ul>
+<h3>How ArrayList is iterated internally</h3>
+<p>Its <code>Iterator</code> is just an integer cursor: <code>next()</code> returns <code>elementData[cursor++]</code> after the fail-fast <code>modCount</code> check described in section 6. This is an <strong>index walk</strong> — no pointer chasing, straight sequential memory access, which is why iterating an <code>ArrayList</code> (e.g. rendering every <code>CartItem</code> on a checkout page) is close to as fast as a raw array loop.</p>
+<pre><code>List&lt;CartItem&gt; items = cart.getItems(); // backed by ArrayList
+for (CartItem item : items) {           // desugars to an Iterator: index cursor 0..size-1
+    render(item);
+}</code></pre>
 
 <h3>LinkedList: pointer-chasing storage</h3>
-<p><code>LinkedList</code> is a doubly-linked list of <code>Node</code> objects, each holding <code>item</code>, <code>prev</code>, and <code>next</code>. Insertion or removal at a <em>known</em> node is O(1) — you just relink three pointers. But that's the theoretical claim that misleads people: to remove element at index <code>k</code> you first have to <em>find</code> it, and finding it means walking the list from whichever end is closer, which is O(n). So both structures are O(n) for "delete the element at index k" — <code>ArrayList</code> pays with a shift, <code>LinkedList</code> pays with a walk.</p>
+<p><code>LinkedList</code> is a doubly-linked list of <code>Node</code> objects, each holding <code>item</code>, <code>prev</code>, and <code>next</code>. Insertion or removal at a <em>known</em> node is O(1) — you just relink three pointers. But that's the theoretical claim that misleads people: to remove element at index <code>k</code> you first have to <em>find</em> it, and finding it means walking the list from whichever end is closer, which is O(n). So both structures are O(n) for "delete the element at index k" — <code>ArrayList</code> pays with a shift, <code>LinkedList</code> pays with a walk.</p>
+<h3>How LinkedList is iterated internally</h3>
+<p>Its <code>Iterator</code>/<code>ListIterator</code> holds a reference to the "next" <code>Node</code> and simply follows <code>node.next</code> (or <code>node.prev</code> for backward traversal) on every step — a <strong>node walk</strong>, one pointer dereference per element, with no arithmetic index involved at all. This is why <code>LinkedList.get(i)</code> is O(n) (it has to walk from an end) but iterating the whole list front-to-back with an iterator is O(n) total, same asymptotic cost as <code>ArrayList</code> — the difference is entirely in cache locality, not big-O: each <code>Node</code> is a separately heap-allocated object, so consecutive iteration steps jump around memory rather than sweeping linearly through one block.</p>
 
 <div class="callout warn">
 <div class="callout-title">Why ArrayList wins in practice despite LinkedList's "O(1) insert"</div>
@@ -45,7 +101,20 @@
 <tr><td>cache locality</td><td>excellent</td><td>poor</td></tr>
 </table>
 
-<h2>2. HashMap Internals: The Core Mechanism</h2>
+<h3>Most useful List methods, day to day</h3>
+<table>
+<tr><th>Method</th><th>What it does</th><th>ShopSphere example</th></tr>
+<tr><td><code>add(e)</code> / <code>add(i, e)</code></td><td>Append, or insert at index <code>i</code> (shifting everything after it)</td><td><code>cart.getItems().add(new CartItem(productId, qty))</code></td></tr>
+<tr><td><code>get(i)</code> / <code>set(i, e)</code></td><td>Read/replace the element at index <code>i</code></td><td>Reading the first <code>OrderItem</code> in a shipment confirmation</td></tr>
+<tr><td><code>remove(i)</code> / <code>remove(Object)</code></td><td>Remove by index, or the first element <code>equals()</code> to the argument</td><td>Removing a <code>CartItem</code> when a customer clicks "remove from cart"</td></tr>
+<tr><td><code>contains(e)</code> / <code>indexOf(e)</code></td><td>O(n) linear scan using <code>equals()</code></td><td>Checking if a productId is already in the cart before adding again</td></tr>
+<tr><td><code>size()</code> / <code>isEmpty()</code></td><td>O(1) — a stored counter, not a walk</td><td>Blocking checkout if <code>cart.getItems().isEmpty()</code></td></tr>
+<tr><td><code>subList(from, to)</code></td><td>A live, index-range <em>view</em> — no copy; mutating it mutates the backing list</td><td>Paging the first 20 results of a catalog search</td></tr>
+<tr><td><code>removeIf(predicate)</code></td><td>Single-pass removal without the fail-fast trap of manual iteration</td><td>Purging out-of-stock <code>CartItem</code>s at checkout time</td></tr>
+<tr><td><code>Collections.sort(list, cmp)</code> / <code>list.sort(cmp)</code></td><td>In-place sort (Java uses a stable, adaptive merge sort called Timsort for objects)</td><td>Sorting <code>Order</code>s by <code>totalAmount</code> for an admin dashboard</td></tr>
+</table>
+
+<h2>3. HashMap Internals: The Core Mechanism</h2>
 <p><code>HashMap</code> is the single most load-bearing class in the framework, and its internals explain a large fraction of subtle production bugs. The structure is an array of buckets, <code>Node&lt;K,V&gt;[] table</code>, where each slot holds either nothing, a linked list of colliding entries, or (since Java 8) a red-black tree of colliding entries.</p>
 
 <h3>The hash() function and why it spreads bits</h3>
@@ -81,23 +150,57 @@
 <li><strong>get(key):</strong> compute <code>hash(key)</code>, compute bucket index, then scan the bucket's chain or tree comparing hash and <code>equals()</code> until found or exhausted.</li>
 </ol>
 
-<h2>3. Ordered and Sorted Variants: LinkedHashMap and TreeMap</h2>
+<h3>How HashMap is iterated internally</h3>
+<p>There is no separate ordering structure to walk. An iterator over a <code>HashMap</code> (via <code>entrySet()</code>, <code>keySet()</code>, or <code>values()</code>) does a <strong>bucket + chain/tree walk</strong>: it scans the backing <code>table</code> array from index 0 upward, and for every non-empty slot it hit, it walks that slot's linked chain (or, for a treeified bucket, does an in-order traversal of the red-black tree) before moving to the next array index. This is exactly why iteration order is <em>bucket order</em>, not insertion order — two keys inserted in one order can iterate in a completely different order because their hash codes place them in buckets in a different order, and that order can even change silently across a resize (because a resize redistributes entries into a bigger array). Never write code (or a test) that depends on <code>HashMap</code> iteration order.</p>
+<pre><code>// ShopSphere: an in-memory catalog cache keyed by productId
+Map&lt;String, Product&gt; catalogCache = new HashMap&lt;&gt;(expectedProductCount * 4 / 3);
+catalogCache.put(product.getId(), product);
+Product p = catalogCache.get("prod-8841"); // O(1): hash -> bucket -> chain/tree scan
+</code></pre>
+
+<h3>Most useful HashMap methods, day to day</h3>
+<table>
+<tr><th>Method</th><th>What it does</th><th>ShopSphere example</th></tr>
+<tr><td><code>put(k, v)</code> / <code>get(k)</code></td><td>Insert or overwrite; read by key</td><td><code>catalogCache.put(product.getId(), product)</code></td></tr>
+<tr><td><code>getOrDefault(k, def)</code></td><td>Read without a null-check branch when the key may be absent</td><td><code>inventory.getOrDefault(productId, 0)</code></td></tr>
+<tr><td><code>putIfAbsent(k, v)</code></td><td>Insert only if the key isn't already present; returns the existing value if it was</td><td>Seeding a default price only if none was set yet</td></tr>
+<tr><td><code>computeIfAbsent(k, fn)</code></td><td>Atomically-in-spirit "get, or compute and insert if missing" — the basis of <code>groupingBy</code> (section 10)</td><td><code>reviewsByProduct.computeIfAbsent(productId, id -&gt; new ArrayList&lt;&gt;()).add(review)</code></td></tr>
+<tr><td><code>merge(k, v, fn)</code></td><td>Insert if absent, otherwise combine old and new value with the given function</td><td><code>totalsByCustomer.merge(customerId, orderTotal, Double::sum)</code></td></tr>
+<tr><td><code>remove(k)</code> / <code>containsKey(k)</code></td><td>Remove by key; membership test — both O(1)</td><td>Evicting a delisted <code>productId</code> from the catalog cache</td></tr>
+<tr><td><code>keySet()</code> / <code>values()</code> / <code>entrySet()</code></td><td>Live views backing the same table — iterate, or remove through the view to remove from the map</td><td>Iterating all cached <code>Product</code>s to rebuild a search index</td></tr>
+<tr><td><code>forEach((k, v) -&gt; ...)</code></td><td>Iterate without an explicit <code>Iterator</code>, same bucket-walk mechanics underneath</td><td>Logging every entry in a per-productId inventory counter map</td></tr>
+</table>
+
+<h2>4. Ordered and Sorted Variants: LinkedHashMap and TreeMap</h2>
 
 <h3>LinkedHashMap: threading a list through the hash table</h3>
 <p><code>LinkedHashMap</code> extends <code>HashMap</code> and adds a second data structure on top: a doubly-linked list threading through all entries via <code>before</code>/<code>after</code> pointers on each node (its <code>Entry</code> subclasses <code>HashMap.Node</code>). This costs two extra references per entry but buys predictable iteration order. By default that order is <em>insertion</em> order; passing <code>accessOrder = true</code> to the constructor switches it to <em>access</em> order, where every <code>get()</code> moves the accessed entry to the end of the linked list.</p>
-<p>Access-order mode plus one override is exactly how you build an LRU cache from a general-purpose map:</p>
-<pre><code>class LruCache&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+<h3>How LinkedHashMap is iterated internally</h3>
+<p>Unlike plain <code>HashMap</code>, iteration here completely ignores the bucket array — it's a <strong>node walk</strong> that follows the <code>after</code> pointer from the head of the separate doubly-linked list straight through to the tail. This is exactly what makes iteration order predictable (insertion or access order) rather than bucket-index order: the hash table is still used for O(1) <code>get</code>/<code>put</code> lookups, but iteration bypasses it entirely and walks the parallel list instead.</p>
+<p>Access-order mode plus one override is exactly how you build an LRU cache from a general-purpose map. Here's an LRU cache for recently-computed product prices, so a flash-sale price recalculation doesn't have to be redone for the same hot productIds over and over:</p>
+<pre><code>class LruProductPriceCache extends LinkedHashMap&lt;String, BigDecimal&gt; {
     private final int capacity;
-    LruCache(int capacity) {
+    LruProductPriceCache(int capacity) {
         super(16, 0.75f, true); // accessOrder = true
         this.capacity = capacity;
     }
     @Override
-    protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) {
-        return size() &gt; capacity;
+    protected boolean removeEldestEntry(Map.Entry&lt;String, BigDecimal&gt; eldest) {
+        return size() &gt; capacity; // evict the least-recently-accessed productId's cached price
     }
-}</code></pre>
+}
+
+LruProductPriceCache priceCache = new LruProductPriceCache(10_000);
+priceCache.put(productId, computedPrice);
+BigDecimal cached = priceCache.get(productId); // this get() also moves productId to the tail</code></pre>
 <p><code>removeEldestEntry</code> is called by <code>put()</code>/<code>putAll()</code> right after insertion; returning <code>true</code> evicts the head of the linked list — the least-recently-used entry, because access-order mode keeps moving recently-touched entries to the tail. This is the textbook building block behind <a href="#/caching-strategies">bounded in-memory caches</a>, though production caches (Caffeine, Guava) use more sophisticated eviction (window-TinyLFU, segmented LRU) for better hit rates under skewed access patterns.</p>
+<h3>Most useful LinkedHashMap methods, day to day</h3>
+<table>
+<tr><th>Method</th><th>What it does</th><th>ShopSphere example</th></tr>
+<tr><td>All <code>HashMap</code> methods (<code>put</code>, <code>get</code>, <code>computeIfAbsent</code>, ...)</td><td>Inherited unchanged — <code>LinkedHashMap</code> <em>is</em> a <code>HashMap</code> plus ordering</td><td>Same O(1) lookup for the LRU price cache above</td></tr>
+<tr><td><code>removeEldestEntry(eldest)</code> (override)</td><td>Hook called after every insert; returning <code>true</code> evicts the current head</td><td>Bounding the price cache to 10,000 entries</td></tr>
+<tr><td>Constructor with <code>accessOrder=true</code></td><td>Switches iteration/eviction order from insertion order to access order</td><td>Required for any LRU-style cache built this way</td></tr>
+</table>
 
 <h3>TreeMap: red-black tree backing</h3>
 <p><code>TreeMap</code> is backed by a red-black tree — a self-balancing binary search tree that guarantees O(log n) for get/put/remove by maintaining an invariant (no root-to-leaf path is more than twice as long as any other) via node recoloring and rotations on insert/delete. Unlike <code>HashMap</code>, there is no hashing at all: ordering is determined entirely by the keys' natural ordering (they must implement <code>Comparable</code>) or by a <code>Comparator</code> supplied at construction. This ordering is what buys you the navigation methods <code>HashMap</code> cannot offer:</p>
@@ -108,9 +211,29 @@
 <li><code>higherKey(k)</code> — smallest key strictly &gt; k</li>
 <li><code>firstKey()</code>/<code>lastKey()</code>, and range views via <code>subMap</code>, <code>headMap</code>, <code>tailMap</code></li>
 </ul>
-<p>These make <code>TreeMap</code> the right tool whenever you need range queries or "nearest key" lookups — e.g., mapping timestamps to events and finding the event active at a given time — something a hash table structurally cannot do, because hashing intentionally destroys any relationship between key ordering and storage location.</p>
+<p>These make <code>TreeMap</code> the right tool whenever you need range queries or "nearest key" lookups — e.g., mapping a series of order-lifecycle timestamps to events and finding which event was active at a given instant — something a hash table structurally cannot do, because hashing intentionally destroys any relationship between key ordering and storage location.</p>
+<h3>How TreeMap is iterated internally</h3>
+<p><code>TreeMap</code>'s iterator does an <strong>in-order traversal</strong> of the underlying red-black tree: for each node, visit everything in its left subtree, then the node itself, then everything in its right subtree, recursively (implemented iteratively via a stack-free "successor" pointer walk in the JDK, but the effect is identical to a textbook recursive in-order walk). An in-order traversal of a binary search tree visits nodes in ascending key order by construction — that's precisely why <code>TreeMap</code> iterates in sorted order with no separate sort step, and why that guarantee costs nothing extra at iteration time (the ordering work was already paid for, incrementally, by every prior insert's rotations and recoloring).</p>
+<pre><code>// ShopSphere: order-lifecycle events for a single Order, keyed by timestamp
+TreeMap&lt;Instant, String&gt; eventsByTime = new TreeMap&lt;&gt;();
+eventsByTime.put(order.getCreatedAt(), "CREATED");
+eventsByTime.put(order.getPaidAt(), "PAID");
+eventsByTime.put(order.getShippedAt(), "SHIPPED");
 
-<h2>4. ConcurrentHashMap: Concurrency Without a Global Lock</h2>
+// "what was the order's status at 3pm yesterday?" - a HashMap cannot answer this
+String statusAt3pm = eventsByTime.floorEntry(threePmYesterday).getValue();
+</code></pre>
+<h3>Most useful TreeMap methods, day to day</h3>
+<table>
+<tr><th>Method</th><th>What it does</th><th>ShopSphere example</th></tr>
+<tr><td><code>put(k, v)</code> / <code>get(k)</code></td><td>O(log n) insert/lookup via tree search</td><td>Indexing order-lifecycle events by timestamp</td></tr>
+<tr><td><code>firstKey()</code> / <code>lastKey()</code></td><td>Smallest/largest key — the leftmost/rightmost node</td><td>Earliest and latest event for an order</td></tr>
+<tr><td><code>floorEntry(k)</code> / <code>ceilingEntry(k)</code></td><td>Nearest entry ≤ k / ≥ k</td><td>"What status was this order in at time T?"</td></tr>
+<tr><td><code>headMap(k)</code> / <code>tailMap(k)</code> / <code>subMap(from, to)</code></td><td>Live range views, no copying</td><td>All events before a given cutoff time</td></tr>
+<tr><td><code>pollFirstEntry()</code> / <code>pollLastEntry()</code></td><td>Remove and return the smallest/largest entry</td><td>Draining a time-ordered event queue oldest-first</td></tr>
+</table>
+
+<h2>5. ConcurrentHashMap: Concurrency Without a Global Lock</h2>
 <p>Pre-Java-8, <code>ConcurrentHashMap</code> partitioned the table into a fixed number of <em>segments</em>, each with its own lock — a writer only blocked other writers touching the same segment. Java 8 redesigned this entirely around per-bucket, per-node concurrency primitives, eliminating segments:</p>
 <ul>
 <li><strong>Inserting into an empty bucket</strong> uses a CAS (compare-and-swap) operation (<code>Unsafe.compareAndSwapObject</code> / <code>VarHandle</code> in later versions) to atomically set the bucket's head node — no lock at all if the bucket was empty.</li>
@@ -119,21 +242,55 @@
 <li><strong><code>size()</code></strong> doesn't lock anything — it sums a set of striped <code>LongAdder</code>-style counters (<code>CounterCell[]</code>) that are updated with low contention during puts/removes, then combined on demand. This trades perfect accuracy for the ability to never block.</li>
 <li><strong>Iteration</strong> walks the table directly without copying it and without blocking writers, meaning a structural change during iteration is possible and visible mid-traversal.</li>
 </ul>
+<h3>How ConcurrentHashMap is iterated internally</h3>
+<p>Mechanically it's the same <strong>bucket + chain/tree walk</strong> as plain <code>HashMap</code> — scan the table array, walk each bucket's chain or tree — but with no lock held during the scan at all. The iterator simply reads whatever <code>volatile</code> node references happen to be there at the moment it visits each slot. That's what "weakly consistent" (detailed further in section 6) means mechanically: the walk can observe a table that a concurrent writer is actively modifying, including a bucket that's mid-resize-migration (detected via the <code>ForwardingNode</code> marker, which tells the iterator to continue the walk in the new table for that bucket instead).</p>
+<pre><code>// ShopSphere: per-productId reserved-inventory counters, hammered by concurrent checkouts
+ConcurrentHashMap&lt;String, AtomicInteger&gt; reservedQtyByProduct = new ConcurrentHashMap&lt;&gt;();
+
+// Flash-sale checkout: many threads reserving stock for the same hot productId concurrently
+reservedQtyByProduct
+    .computeIfAbsent(productId, id -&gt; new AtomicInteger(0))
+    .addAndGet(quantity);
+</code></pre>
+<div class="callout warn">
+<div class="callout-title">computeIfAbsent's lambda must not itself touch the map</div>
+<p>Because the CAS/synchronized(node) mechanics above only guarantee atomicity for the specific bucket being touched, <code>ConcurrentHashMap.computeIfAbsent</code>/<code>compute</code>/<code>merge</code> hold that bucket's lock (or CAS loop) for the duration of the supplied function. If that function tries to <code>put</code>/<code>get</code>/<code>compute</code> on the <em>same map</em> — e.g., recursively updating a related key — it can deadlock or throw <code>IllegalStateException</code> for recursive update detection, depending on JDK version. The fix is straightforward: keep the lambda passed to these methods pure and self-contained, touching only its arguments, never the enclosing map.</p>
+</div>
+<h3>Most useful ConcurrentHashMap methods, day to day</h3>
+<table>
+<tr><th>Method</th><th>What it does</th><th>ShopSphere example</th></tr>
+<tr><td><code>computeIfAbsent(k, fn)</code></td><td>Thread-safe "get-or-create" for the value at a key</td><td>Lazily creating an <code>AtomicInteger</code> counter per productId</td></tr>
+<tr><td><code>compute(k, fn)</code> / <code>merge(k, v, fn)</code></td><td>Thread-safe read-modify-write on a single key, atomic per key</td><td>Atomically bumping a reserved-quantity counter</td></tr>
+<tr><td><code>putIfAbsent(k, v)</code></td><td>Thread-safe "insert only if missing" — the CAS-based building block for locks/registries</td><td>Registering a per-warehouse inventory lock exactly once</td></tr>
+<tr><td><code>get(k)</code></td><td>Never blocks, never throws for concurrent structural changes elsewhere</td><td>Reading current reserved quantity mid-flash-sale</td></tr>
+<tr><td><code>size()</code> / <code>mappingCount()</code></td><td>Approximate count from striped counters — no lock, may be slightly stale</td><td>Reporting an approximate count of actively-reserved productIds</td></tr>
+<tr><td><code>forEach(action)</code> / <code>reduce(...)</code></td><td>Parallelizable bulk operations, weakly consistent</td><td>Summing all reserved quantities across products for a dashboard</td></tr>
+</table>
 
 <div class="callout tip">
 <div class="callout-title">Weakly consistent, not "wrong"</div>
 <p>Because there is no global lock and no snapshot taken, <code>ConcurrentHashMap</code> iterators and bulk operations (<code>size()</code>, <code>isEmpty()</code>, <code>forEach</code>) are <em>weakly consistent</em>: they reflect the state of the map at some point during the operation, are guaranteed to traverse each element that was present for the entire duration at most once, but may or may not see elements inserted or removed concurrently, and never throw <code>ConcurrentModificationException</code>. This is a deliberate trade-off — you give up "exactly what did the map look like at instant T" in exchange for never blocking readers behind writers and never blocking writers behind readers. Contrast this with a synchronized <code>HashMap</code> wrapped by <code>Collections.synchronizedMap</code>, where you get a single consistent view at any instant but pay for it with a single lock serializing every access. See <a href="#/concurrency-multithreading">concurrency fundamentals</a> for how CAS and <code>synchronized</code> interact with the Java Memory Model to make this safe.</p>
 </div>
 
-<h2>5. Fail-Fast vs. Weakly Consistent Iterators</h2>
+<h2>6. Fail-Fast vs. Weakly Consistent Iterators</h2>
 <p>The non-concurrent collections (<code>ArrayList</code>, <code>HashMap</code>, <code>HashSet</code>, etc.) use a <strong>fail-fast</strong> iteration strategy built on a <code>modCount</code> field — an integer incremented every time the collection is structurally modified (add/remove; a plain <code>set()</code> doesn't count as structural). When you create an iterator, it captures the current <code>modCount</code> as <code>expectedModCount</code>. Every call to <code>next()</code> checks <code>modCount == expectedModCount</code>, and throws <code>ConcurrentModificationException</code> if they diverge.</p>
 <div class="callout warn">
 <div class="callout-title">Fail-fast is a bug detector, not a concurrency control</div>
-<p><code>ConcurrentModificationException</code> is not thrown to keep your data safe during concurrent access — it's a best-effort debugging aid that catches the common mistake of mutating a collection while iterating it, typically on a <em>single thread</em> (e.g., calling <code>list.remove(x)</code> inside a for-each loop over <code>list</code>). It offers no real guarantee: the JavaDoc explicitly states it should never be used for correctness, only to detect bugs, because a modification can, in rare cases, go undetected if timing happens to leave <code>modCount</code> unchanged in the way the check expects. The correct way to remove during iteration is <code>Iterator.remove()</code> (which updates <code>expectedModCount</code> to match) or <code>Collection.removeIf()</code>.</p>
+<p><code>ConcurrentModificationException</code> is not thrown to keep your data safe during concurrent access — it's a best-effort debugging aid that catches the common mistake of mutating a collection while iterating it, typically on a <em>single thread</em>. For example, removing out-of-stock items directly from a cart while iterating it in a for-each loop:</p>
+<pre><code>// THROWS ConcurrentModificationException
+for (CartItem item : cart.getItems()) {
+    if (item.getQuantity() == 0) {
+        cart.getItems().remove(item); // bumps modCount without the iterator knowing
+    }
+}
+
+// CORRECT: removeIf handles the removal internally, in one safe pass
+cart.getItems().removeIf(item -> item.getQuantity() == 0);</code></pre>
+<p>It offers no real guarantee: the JavaDoc explicitly states it should never be used for correctness, only to detect bugs, because a modification can, in rare cases, go undetected if timing happens to leave <code>modCount</code> unchanged in the way the check expects. The correct way to remove during iteration is <code>Iterator.remove()</code> (which updates <code>expectedModCount</code> to match) or <code>Collection.removeIf()</code> as shown above.</p>
 </div>
 <p>The concurrent collections (<code>ConcurrentHashMap</code>, <code>CopyOnWriteArrayList</code>, <code>ConcurrentSkipListMap</code>) instead use <strong>weakly consistent</strong> iteration, as described above — no exception is ever thrown, because the whole point of these classes is to support concurrent structural modification during traversal as a normal, expected use case, not a bug.</p>
 
-<h2>6. PriorityQueue: The Binary Heap</h2>
+<h2>7. PriorityQueue: The Binary Heap</h2>
 <p><code>PriorityQueue</code> is backed by a binary heap stored in a plain array (<code>Object[] queue</code>), not by actual tree nodes. The heap property (min-heap by default: every parent ≤ its children) is maintained implicitly through index arithmetic: for a node at index <code>i</code>, its children live at <code>2i + 1</code> and <code>2i + 2</code>, and its parent lives at <code>(i - 1) / 2</code>. This array-as-tree encoding avoids pointer overhead entirely.</p>
 <ul>
 <li><strong>offer(e)</strong> (insert): append the element at the end of the array, then <strong>sift up</strong> — repeatedly compare it to its parent and swap if it's smaller (for a min-heap), until the heap property holds or it reaches the root. O(log n).</li>
@@ -141,60 +298,148 @@
 <li><strong>peek()</strong>: return index 0 directly. O(1).</li>
 </ul>
 <p>Passing a <code>Comparator</code> to the constructor simply changes the comparison used during sift-up/sift-down — a <code>Comparator.reverseOrder()</code> turns it into a max-heap without changing any of the underlying mechanics. <code>PriorityQueue</code> is explicitly <strong>not synchronized</strong>; the concurrent equivalent is <code>PriorityBlockingQueue</code>, which wraps the same heap logic in a single lock plus a <code>Condition</code> for blocking consumers when the queue is empty.</p>
+<h3>How PriorityQueue is iterated internally</h3>
+<p>Calling <code>iterator()</code> on a <code>PriorityQueue</code> just walks the backing array index 0, 1, 2, ... in raw storage order — a <strong>heap array walk with no sorted-order guarantee</strong>. The heap invariant only guarantees the <em>root</em> (index 0) is the minimum; it says nothing about the relative order of any other two elements, so iterating a <code>PriorityQueue</code> does <em>not</em> produce sorted output. The only way to consume elements in priority order is repeated <code>poll()</code>, which pays the O(log n) sift-down cost each time to re-establish the heap invariant after removing the root.</p>
+<pre><code>// ShopSphere: an SLA-driven order fulfillment queue — process the order with the
+// nearest shipping deadline first, regardless of when it was placed
+PriorityQueue&lt;Order&gt; slaQueue = new PriorityQueue&lt;&gt;(
+    Comparator.comparing(Order::getSlaDeadline));
 
-<h2>7. Copy-on-Write and Wrapper Collections</h2>
+slaQueue.offer(order);          // O(log n) sift-up
+Order mostUrgent = slaQueue.poll(); // O(log n) sift-down; NOT the same as iterating in order
+
+// WRONG: does not visit orders in deadline order
+for (Order o : slaQueue) { process(o); }
+
+// RIGHT: drains in true priority order, one poll() at a time
+Order next;
+while ((next = slaQueue.poll()) != null) {
+    process(next);
+}</code></pre>
+<h3>Most useful PriorityQueue methods, day to day</h3>
+<table>
+<tr><th>Method</th><th>What it does</th><th>ShopSphere example</th></tr>
+<tr><td><code>offer(e)</code> / <code>add(e)</code></td><td>Insert, sift up — O(log n)</td><td>Enqueuing a newly-placed <code>Order</code> by SLA deadline</td></tr>
+<tr><td><code>poll()</code></td><td>Remove and return the minimum, sift down — O(log n)</td><td>Fetching the next order the fulfillment team should pack</td></tr>
+<tr><td><code>peek()</code></td><td>Read the minimum without removing it — O(1)</td><td>Checking the most urgent order's deadline for a dashboard alert</td></tr>
+<tr><td><code>size()</code> / <code>isEmpty()</code></td><td>O(1)</td><td>Deciding whether the fulfillment worker pool has more work</td></tr>
+<tr><td><code>remove(Object)</code></td><td>O(n) — must linearly find the element before removing and re-heapifying</td><td>Pulling a cancelled order out of the SLA queue before it's fulfilled</td></tr>
+</table>
+
+<h2>8. Copy-on-Write and Wrapper Collections</h2>
 
 <h3>CopyOnWriteArrayList</h3>
-<p>Every mutating operation (<code>add</code>, <code>set</code>, <code>remove</code>) allocates an entirely new backing array, copies the existing elements into it, applies the change, and then atomically swaps the volatile array reference. Readers always operate on whatever array reference they observed at the start of their operation (typically captured by the iterator at creation time), so reads never block and never see a torn or partially-updated array. This is only appropriate for <strong>read-heavy, write-rare</strong> workloads — e.g., a list of listeners that's iterated constantly but modified only at startup/shutdown — because every single write is O(n) in both time (full array copy) and space (a full duplicate array is allocated and the old one becomes garbage). Under frequent writes this produces significant allocation pressure and GC churn, potentially triggering more young-generation collections; see <a href="#/jvm-architecture">how the JVM heap and garbage collector handle allocation-heavy workloads</a>.</p>
+<p>Every mutating operation (<code>add</code>, <code>set</code>, <code>remove</code>) allocates an entirely new backing array, copies the existing elements into it, applies the change, and then atomically swaps the volatile array reference. Readers always operate on whatever array reference they observed at the start of their operation (typically captured by the iterator at creation time), so reads never block and never see a torn or partially-updated array. This is only appropriate for <strong>read-heavy, write-rare</strong> workloads — e.g., a list of <code>notification-service</code> listeners that's iterated constantly (fan-out on every <code>OrderPlaced</code> event) but modified only at startup/shutdown — because every single write is O(n) in both time (full array copy) and space (a full duplicate array is allocated and the old one becomes garbage). Under frequent writes this produces significant allocation pressure and GC churn, potentially triggering more young-generation collections; see <a href="#/jvm-architecture">how the JVM heap and garbage collector handle allocation-heavy workloads</a>.</p>
+<h3>How CopyOnWriteArrayList is iterated internally</h3>
+<p>Calling <code>iterator()</code> captures a reference to whatever backing array is current <em>at that instant</em> and then does the same simple <strong>index walk</strong> as <code>ArrayList</code> (index 0, 1, 2, ... to the end) over that captured array only. Because a write never mutates an array in place — it always builds a new array and swaps the reference — the array an in-flight iterator is walking can never change underneath it, even if other threads call <code>add</code>/<code>set</code>/<code>remove</code> concurrently. This is the "snapshot" iteration mentioned in Section 6: the iterator simply never observes any array published after it started, so it neither throws <code>ConcurrentModificationException</code> nor reflects concurrent edits, no matter how long the iteration takes.</p>
+<pre><code>// ShopSphere: notification-service fans out an OrderPlaced event to every
+// registered listener; listeners are added/removed only at startup/shutdown
+CopyOnWriteArrayList&lt;OrderListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+
+// Safe even if another thread calls listeners.add(...) mid-iteration:
+// this loop keeps walking the array snapshot it captured when the loop began.
+for (OrderListener listener : listeners) {
+    listener.onOrderPlaced(event);
+}</code></pre>
+<h3>Most useful CopyOnWriteArrayList methods, day to day</h3>
+<table>
+<tr><th>Method</th><th>What it does</th><th>ShopSphere example</th></tr>
+<tr><td><code>add(e)</code></td><td>Copy the array (O(n)), append, swap the reference</td><td>Registering a new listener during application startup</td></tr>
+<tr><td><code>remove(Object)</code></td><td>Copy the array minus the matched element (O(n))</td><td>Deregistering a listener during graceful shutdown</td></tr>
+<tr><td><code>get(index)</code></td><td>Direct array read on the current snapshot — O(1), never blocks</td><td>Reading a specific listener by position for diagnostics</td></tr>
+<tr><td><code>iterator()</code></td><td>Snapshot walk over the array captured at creation time — never throws <code>ConcurrentModificationException</code></td><td>Fanning out an <code>OrderPlaced</code> event to every registered listener</td></tr>
+<tr><td><code>addIfAbsent(e)</code></td><td>Copy-on-write equivalent of a set-like dedup check — O(n) scan plus O(n) copy</td><td>Registering a listener only if it isn't already present</td></tr>
+</table>
 
 <h3>HashSet, TreeSet, LinkedHashSet: thin wrappers</h3>
-<p>All three <code>Set</code> implementations are, internally, just a <code>Map</code> whose keys are your elements and whose values are all a shared dummy constant (<code>private static final Object PRESENT = new Object();</code>). <code>HashSet.add(e)</code> literally calls <code>map.put(e, PRESENT)</code> under the hood. <code>TreeSet</code> wraps a <code>TreeMap</code>, giving it the same sorted-order and navigation guarantees (red-black tree, O(log n)). <code>LinkedHashSet</code> wraps a <code>LinkedHashMap</code>, giving it predictable insertion-order iteration. Understanding this collapses "three data structures" into "one data structure applied three times with different backing maps."</p>
+<p>All three <code>Set</code> implementations are, internally, just a <code>Map</code> whose keys are your elements and whose values are all a shared dummy constant (<code>private static final Object PRESENT = new Object();</code>). <code>HashSet.add(e)</code> literally calls <code>map.put(e, PRESENT)</code> under the hood. <code>TreeSet</code> wraps a <code>TreeMap</code>, giving it the same sorted-order and navigation guarantees (red-black tree, O(log n)). <code>LinkedHashSet</code> wraps a <code>LinkedHashMap</code>, giving it predictable insertion-order iteration. Understanding this collapses "three data structures" into "one data structure applied three times with different backing maps" — and it means their iteration mechanics are exactly the iteration mechanics of their backing map, already covered above: <code>HashSet</code> does a bucket+chain/tree walk (arbitrary, hash-dependent order), <code>LinkedHashSet</code> does a node walk through the threaded list (insertion order), and <code>TreeSet</code> does an in-order tree traversal (sorted order).</p>
+<pre><code>// ShopSphere: active coupon codes, always iterated/reported in sorted order
+TreeSet&lt;String&gt; activeCouponCodes = new TreeSet&lt;&gt;();
+activeCouponCodes.add("SUMMER10");
+activeCouponCodes.add("FLASH25");
+// iteration order: FLASH25, SUMMER10 - alphabetical, via TreeMap's in-order traversal underneath
+
+// HashSet: fast membership check - has this productId already been added to the cart this session?
+Set&lt;String&gt; productIdsInCart = new HashSet&lt;&gt;();
+if (productIdsInCart.add(productId)) {
+    // true only if productId wasn't already present - O(1) via the backing HashMap
+}</code></pre>
+<h3>Most useful Set methods, day to day</h3>
+<table>
+<tr><th>Method</th><th>What it does</th><th>ShopSphere example</th></tr>
+<tr><td><code>add(e)</code></td><td>Insert; returns <code>false</code> if already present (via the backing map's <code>put</code> returning a non-null old value)</td><td>Deduplicating productIds added to a cart</td></tr>
+<tr><td><code>contains(e)</code></td><td>O(1) for Hash/LinkedHashSet, O(log n) for TreeSet</td><td>Checking if a couponCode is currently active</td></tr>
+<tr><td><code>remove(e)</code></td><td>Delete by value</td><td>Expiring a coupon code</td></tr>
+<tr><td><code>retainAll(other)</code> / <code>removeAll(other)</code></td><td>Set intersection / difference, in place</td><td>Finding productIds that are both in a customer's wishlist and currently on sale</td></tr>
+<tr><td><code>first()</code> / <code>last()</code> (TreeSet only)</td><td>Smallest/largest element — via <code>NavigableSet</code></td><td>The alphabetically-first active coupon code</td></tr>
+</table>
 
 <h3>ArrayDeque as the Stack/Queue replacement</h3>
 <p><code>ArrayDeque</code> is a resizable circular array (a ring buffer) with head and tail indices that wrap around using modulo arithmetic. It supports O(1) amortized insertion/removal at both ends, making it strictly better than the legacy <code>Stack</code> class (which extends the antiquated, needlessly-synchronized <code>Vector</code>) for stack usage, and generally faster than <code>LinkedList</code> for queue usage because, again, contiguous-array access beats pointer-chasing. The JDK documentation itself recommends <code>ArrayDeque</code> over both <code>Stack</code> and <code>LinkedList</code> for stack/queue use cases.</p>
+<h3>How ArrayDeque is iterated internally</h3>
+<p>Iteration is a <strong>circular-buffer walk</strong>: starting from the <code>head</code> index, step forward one slot at a time (wrapping back to index 0 via modulo once past the end of the backing array) until reaching <code>tail</code>. This is still fundamentally an index walk over contiguous memory like <code>ArrayList</code>'s — the only added wrinkle is the wraparound arithmetic, which is why <code>ArrayDeque</code> keeps <code>ArrayList</code>-like cache-friendly performance while supporting O(1) operations at both ends, something a straight (non-circular) array cannot do without shifting everything.</p>
+<pre><code>// ShopSphere: an undo stack for a seller's catalog edits (LIFO - push/pop from one end)
+Deque&lt;CatalogEdit&gt; undoStack = new ArrayDeque&lt;&gt;();
+undoStack.push(edit);            // O(1) amortized - inserts at the "head" end
+CatalogEdit lastEdit = undoStack.pop(); // O(1) - removes from the same end
 
-<h2>8. The equals()/hashCode() Contract</h2>
+// ShopSphere: a FIFO work queue of OrderPlaced events awaiting inventory reservation
+Deque&lt;Order&gt; pendingReservation = new ArrayDeque&lt;&gt;();
+pendingReservation.offerLast(order);  // enqueue at the tail
+Order next = pendingReservation.pollFirst(); // dequeue from the head</code></pre>
+<h3>Most useful Deque methods, day to day</h3>
+<table>
+<tr><th>Method</th><th>What it does</th><th>ShopSphere example</th></tr>
+<tr><td><code>push(e)</code> / <code>pop()</code></td><td>Stack semantics — LIFO, both at the head</td><td>Undo stack for a seller's catalog edits</td></tr>
+<tr><td><code>offerLast(e)</code> / <code>pollFirst()</code></td><td>Queue semantics — FIFO</td><td>A pending-reservation work queue between order-service and inventory-service</td></tr>
+<tr><td><code>peekFirst()</code> / <code>peekLast()</code></td><td>Read either end without removing</td><td>Checking the oldest pending reservation without dequeuing it</td></tr>
+<tr><td><code>addFirst(e)</code> / <code>addLast(e)</code></td><td>Explicit double-ended insert (throws if a capacity-bounded deque is full; <code>offer*</code> variants return <code>false</code> instead)</td><td>Re-queuing a failed reservation at the front for immediate retry</td></tr>
+</table>
+
+<h2>9. The equals()/hashCode() Contract</h2>
 <p>Every hash-based collection depends on a strict contract: if <code>a.equals(b)</code> is <code>true</code>, then <code>a.hashCode() == b.hashCode()</code> must also be true. The reverse is not required — different objects may share a hash code (that's just a collision, handled by chaining). The reason this contract exists is entirely mechanical: <code>HashMap.get(key)</code> first computes <code>hash(key)</code> to jump straight to a bucket, then uses <code>equals()</code> only to disambiguate among entries <em>within that bucket</em>. If two equal objects produced different hash codes, they could land in different buckets, and a lookup for one would never find an entry stored under the other — silently, with no exception, just a wrong answer.</p>
 <div class="callout warn">
 <div class="callout-title">A mutable key silently corrupts a HashMap</div>
-<p>A closely related, extremely common bug: using a mutable object as a <code>HashMap</code> key and then mutating a field that participates in <code>hashCode()</code> after insertion. The entry is stored in the bucket matching the <em>old</em> hash code. After mutation, <code>map.get(key)</code> recomputes the <em>new</code> hash code, looks in the wrong bucket, and reports the key as absent — even though <code>containsKey</code> and iteration will still show the entry sitting there if you walk the whole table. The fix is to only use immutable objects (or objects whose equality fields never change post-insertion) as map keys and set members.</p>
+<p>A closely related, extremely common bug: using a mutable object as a <code>HashMap</code> key and then mutating a field that participates in <code>hashCode()</code> after insertion. Concretely: if <code>Product</code> overrides <code>hashCode()</code> based on its mutable <code>stockQuantity</code> field, and you use a <code>Product</code> instance as a key in <code>Map&lt;Product, Seller&gt;</code>, then update that same product's <code>stockQuantity</code> after insertion, the entry is stuck in the bucket matching the <em>old</em> hash code. After mutation, <code>map.get(product)</code> recomputes the <em>new</em> hash code, looks in the wrong bucket, and reports the key as absent — even though <code>containsKey</code> and iteration will still show the entry sitting there if you walk the whole table. The fix is to only use immutable objects (or objects whose equality fields never change post-insertion) as map keys and set members — this is exactly why ShopSphere's <code>Product</code> and <code>Order</code> use their immutable <code>id</code> field as the map key (<code>Map&lt;String productId, Product&gt;</code>) rather than the mutable object itself.</p>
 </div>
-<p>Also worth internalizing: if you override <code>equals()</code> without overriding <code>hashCode()</code>, you inherit <code>Object</code>'s identity-based hash code, which breaks the contract immediately — two "equal" objects will almost certainly hash differently, and a <code>HashSet</code> will happily store duplicates that your <code>equals()</code> considers the same.</p>
+<p>Also worth internalizing: if you override <code>equals()</code> without overriding <code>hashCode()</code>, you inherit <code>Object</code>'s identity-based hash code, which breaks the contract immediately — two "equal" objects will almost certainly hash differently, and a <code>HashSet</code> will happily store duplicates that your <code>equals()</code> considers the same. For example, two <code>CartItem</code> instances that both represent <code>productId="prod-1"</code> should be <code>equals()</code> if you intend to deduplicate them in a <code>Set&lt;CartItem&gt;</code> — but without a matching <code>hashCode()</code> override based on <code>productId</code>, both would land in different buckets and the set would happily store both.</p>
 
-<h2>9. Collectors: Building Collections from Streams</h2>
+<h2>10. Collectors: Building Collections from Streams</h2>
 <p>The <code>Collectors</code> utility class (used with <a href="#/streams-functional">Stream.collect()</a>) is fundamentally a set of recipes for assembling the collections covered above out of a stream of elements. Understanding the collections underneath makes these far less mysterious.</p>
 
 <h3>groupingBy — building a Map&lt;K, List&lt;V&gt;&gt;</h3>
-<p>Single-level grouping produces a <code>HashMap</code> keyed by your classifier function, with each value being a <code>List</code> (by default, an <code>ArrayList</code>) of all elements that mapped to that key — internally, this is implemented as a repeated <code>computeIfAbsent(key, k -> new ArrayList&lt;&gt;()).add(element)</code>.</p>
-<pre><code>Map&lt;Department, List&lt;Employee&gt;&gt; byDept =
-    employees.stream().collect(Collectors.groupingBy(Employee::getDepartment));</code></pre>
+<p>Single-level grouping produces a <code>HashMap</code> keyed by your classifier function, with each value being a <code>List</code> (by default, an <code>ArrayList</code>) of all elements that mapped to that key — internally, this is implemented as a repeated <code>computeIfAbsent(key, k -> new ArrayList&lt;&gt;()).add(element)</code>, the exact <code>computeIfAbsent</code> pattern from the HashMap methods table in section 3.</p>
+<pre><code>Map&lt;String, List&lt;Order&gt;&gt; ordersByCustomerId =
+    orders.stream().collect(Collectors.groupingBy(Order::getCustomerId));</code></pre>
 <p>Multi-level grouping nests a downstream <code>groupingBy</code> inside the outer one, producing a <code>Map&lt;K1, Map&lt;K2, List&lt;V&gt;&gt;&gt;</code>:</p>
-<pre><code>Map&lt;Department, Map&lt;Boolean, List&lt;Employee&gt;&gt;&gt; byDeptThenRemote =
-    employees.stream().collect(
-        Collectors.groupingBy(Employee::getDepartment,
-            Collectors.groupingBy(Employee::isRemote)));</code></pre>
+<pre><code>Map&lt;String, Map&lt;OrderStatus, List&lt;Order&gt;&gt;&gt; byCustomerThenStatus =
+    orders.stream().collect(
+        Collectors.groupingBy(Order::getCustomerId,
+            Collectors.groupingBy(Order::getStatus)));</code></pre>
 <p>Any downstream collector can replace the implicit <code>toList()</code> — <code>counting()</code> to get group sizes, <code>summingInt()</code> to sum a field per group, or another <code>Collectors.mapping(...)</code> to transform elements before collecting them.</p>
 
 <h3>partitioningBy — a specialized binary groupingBy</h3>
 <p><code>partitioningBy(predicate)</code> always produces exactly two entries, keyed by <code>Boolean.TRUE</code>/<code>Boolean.FALSE</code>, backed internally by a dedicated lightweight map implementation rather than a general <code>HashMap</code> — because the key space is known to have exactly two values, there's no need for hashing at all.</p>
+<pre><code>Map&lt;Boolean, List&lt;Order&gt;&gt; deliveredVsInFlight =
+    orders.stream().collect(Collectors.partitioningBy(o -> o.getStatus() == OrderStatus.DELIVERED));</code></pre>
 
 <h3>mapping — transforming elements within a downstream collection</h3>
-<p><code>mapping(function, downstream)</code> applies a transformation to each element before it reaches a downstream collector — most useful nested inside <code>groupingBy</code> when you want, say, only employee names grouped by department rather than full <code>Employee</code> objects:</p>
-<pre><code>Map&lt;Department, List&lt;String&gt;&gt; namesByDept =
-    employees.stream().collect(Collectors.groupingBy(
-        Employee::getDepartment,
-        Collectors.mapping(Employee::getName, Collectors.toList())));</code></pre>
+<p><code>mapping(function, downstream)</code> applies a transformation to each element before it reaches a downstream collector — most useful nested inside <code>groupingBy</code> when you want, say, only productIds grouped by seller rather than full <code>Product</code> objects:</p>
+<pre><code>Map&lt;String, List&lt;String&gt;&gt; productIdsBySeller =
+    products.stream().collect(Collectors.groupingBy(
+        Product::getSellerId,
+        Collectors.mapping(Product::getId, Collectors.toList())));</code></pre>
 
 <h3>toMap — building a Map directly, and the merge-function trap</h3>
 <p><code>Collectors.toMap(keyFn, valueFn)</code> builds a <code>HashMap</code> by applying both functions to each element. If two elements produce the same key, this throws <code>IllegalStateException: Duplicate key</code> by default — because without a merge strategy, silently overwriting one value with another would hide a correctness bug. The three-argument overload takes a <code>BinaryOperator&lt;V&gt;</code> merge function to resolve collisions explicitly:</p>
-<pre><code>Map&lt;Department, Double&gt; totalSalaryByDept =
-    employees.stream().collect(Collectors.toMap(
-        Employee::getDepartment,
-        Employee::getSalary,
-        Double::sum));</code></pre>
+<pre><code>Map&lt;String, Double&gt; totalSpendByCustomerId =
+    orders.stream().collect(Collectors.toMap(
+        Order::getCustomerId,
+        Order::getTotalAmount,
+        Double::sum)); // merges duplicate customerId entries by summing totals</code></pre>
 
 <h3>joining — StringBuilder under the hood</h3>
-<p><code>Collectors.joining(delimiter, prefix, suffix)</code> is effectively a <code>StringBuilder</code> accumulator that appends each element (with the delimiter between elements) and wraps the result in the given prefix/suffix at the end — the collections-and-Big-O analogue here is trivial (O(n) total, same as manual string building), but it's worth knowing it avoids the O(n²) trap of repeated naive <code>String</code> concatenation (<code>+=</code> in a loop) precisely because it defers to a single mutable buffer, the same reason <code>ArrayList</code>'s amortized growth beats repeatedly reallocating a fixed array by hand.</p>
+<p><code>Collectors.joining(delimiter, prefix, suffix)</code> is effectively a <code>StringBuilder</code> accumulator that appends each element (with the delimiter between elements) and wraps the result in the given prefix/suffix at the end — e.g. building a comma-separated list of productIds for an order confirmation email. The collections-and-Big-O analogue here is trivial (O(n) total, same as manual string building), but it's worth knowing it avoids the O(n²) trap of repeated naive <code>String</code> concatenation (<code>+=</code> in a loop) precisely because it defers to a single mutable buffer, the same reason <code>ArrayList</code>'s amortized growth beats repeatedly reallocating a fixed array by hand.</p>
 
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
 
@@ -210,12 +455,12 @@
 
 <details class="concept-qa">
 <summary>Why does ConcurrentHashMap not need a single global lock the way early synchronized Maps did?</summary>
-<div class="qa-body">Because concurrent access to different buckets doesn't actually conflict — two threads writing to key A and key B only need to coordinate if A and B happen to hash into the same bucket. Java 8's ConcurrentHashMap exploits this by using CAS to place the first node in an empty bucket lock-free, and a `synchronized` block scoped to only that bucket's head node when appending to a non-empty bucket or during a resize migration of that bucket. This means the only threads that ever actually block each other are two threads simultaneously touching the exact same bucket — everything else proceeds in parallel. Reads never take any lock at all; they rely on the fields being `volatile` so a freshly-written node is guaranteed visible to a subsequent reader.</div>
+<div class="qa-body">Because concurrent access to different buckets doesn't actually conflict — two threads writing to key A and key B only need to coordinate if A and B happen to hash into the same bucket. Java 8's ConcurrentHashMap exploits this by using CAS to place the first node in an empty bucket lock-free, and a <code>synchronized</code> block scoped to only that bucket's head node when appending to a non-empty bucket or during a resize migration of that bucket. This means the only threads that ever actually block each other are two threads simultaneously touching the exact same bucket — everything else proceeds in parallel. Reads never take any lock at all; they rely on the fields being <code>volatile</code> so a freshly-written node is guaranteed visible to a subsequent reader.</div>
 </details>
 
 <details class="concept-qa">
 <summary>Why does removing an element from a List while iterating it with a for-each loop throw ConcurrentModificationException, and what's the correct way to do it?</summary>
-<div class="qa-body">A for-each loop desugars to using the list's Iterator. `ArrayList` maintains a `modCount` counter incremented on every structural change; the iterator snapshots that count when created and checks it on every `next()` call. Calling `list.remove(x)` directly (rather than through the iterator) bumps `modCount` without informing the iterator, so the next `next()` call sees a mismatch and throws — this is a deliberate fail-fast check meant to surface a likely bug rather than let the iterator silently skip an element or throw an IndexOutOfBoundsException later. The correct approaches are to call `Iterator.remove()` (which updates the iterator's own expected count), use `ListIterator` if you need to add during traversal, or use `Collection.removeIf(predicate)`, which handles the removal internally without exposing you to the hazard at all.</div>
+<div class="qa-body">A for-each loop desugars to using the list's Iterator. <code>ArrayList</code> maintains a <code>modCount</code> counter incremented on every structural change; the iterator snapshots that count when created and checks it on every <code>next()</code> call. Calling <code>list.remove(x)</code> directly (rather than through the iterator) bumps <code>modCount</code> without informing the iterator, so the next <code>next()</code> call sees a mismatch and throws — this is a deliberate fail-fast check meant to surface a likely bug rather than let the iterator silently skip an element or throw an IndexOutOfBoundsException later. The correct approaches are to call <code>Iterator.remove()</code> (which updates the iterator's own expected count), use <code>ListIterator</code> if you need to add during traversal, or use <code>Collection.removeIf(predicate)</code>, which handles the removal internally without exposing you to the hazard at all.</div>
 </details>
 
 <details class="concept-qa">
@@ -225,12 +470,22 @@
 
 <details class="concept-qa">
 <summary>How does LinkedHashMap's removeEldestEntry hook let you build an LRU cache with no custom eviction logic?</summary>
-<div class="qa-body">LinkedHashMap already maintains a doubly-linked list through all its entries; constructing it with `accessOrder = true` makes every `get()` (and `put()` on an existing key) move that entry to the tail of the list, so the head of the list is always the least-recently-used entry. `removeEldestEntry(eldest)` is invoked automatically by `put()`/`putAll()` right after a new entry is added, passed the current head (eldest) entry, and if it returns true, that head entry is removed immediately. Overriding it to return `size() > capacity` turns the map into a fixed-capacity cache that evicts the least-recently-used entry every time a new insertion would push it over capacity — no separate tracking structure required, because the linked list ordering already encodes recency.</div>
+<div class="qa-body">LinkedHashMap already maintains a doubly-linked list through all its entries; constructing it with <code>accessOrder = true</code> makes every <code>get()</code> (and <code>put()</code> on an existing key) move that entry to the tail of the list, so the head of the list is always the least-recently-used entry. <code>removeEldestEntry(eldest)</code> is invoked automatically by <code>put()</code>/<code>putAll()</code> right after a new entry is added, passed the current head (eldest) entry, and if it returns true, that head entry is removed immediately. Overriding it to return <code>size() > capacity</code> turns the map into a fixed-capacity cache that evicts the least-recently-used entry every time a new insertion would push it over capacity — no separate tracking structure required, because the linked list ordering already encodes recency.</div>
 </details>
 
 <details class="concept-qa">
 <summary>Why are HashSet, TreeSet, and LinkedHashSet described as "thin wrappers," and what does that actually buy you as a reader of the source?</summary>
-<div class="qa-body">Each of these Set implementations holds an internal Map instance (HashMap, TreeMap, and LinkedHashMap respectively) and stores your set elements as that map's keys, with every value pointing to the same shared dummy object. `add(e)` is literally `map.put(e, PRESENT) == null`. This means all the complexity, ordering behavior, and complexity guarantees you already understand for the Map side apply directly and unchanged to the Set side — TreeSet's O(log n) navigation methods and sorted iteration come purely from TreeMap's red-black tree, and LinkedHashSet's predictable iteration order comes purely from LinkedHashMap's threaded list. There isn't a second, separate implementation to learn.</div>
+<div class="qa-body">Each of these Set implementations holds an internal Map instance (HashMap, TreeMap, and LinkedHashMap respectively) and stores your set elements as that map's keys, with every value pointing to the same shared dummy object. <code>add(e)</code> is literally <code>map.put(e, PRESENT) == null</code>. This means all the complexity, ordering behavior, and complexity guarantees you already understand for the Map side apply directly and unchanged to the Set side — TreeSet's O(log n) navigation methods and sorted iteration come purely from TreeMap's red-black tree, and LinkedHashSet's predictable iteration order comes purely from LinkedHashMap's threaded list. There isn't a second, separate implementation to learn.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does iterating a PriorityQueue not visit elements in priority order, even though poll() always returns the minimum?</summary>
+<div class="qa-body">A PriorityQueue's heap invariant only guarantees a relationship between a parent and its own two children — every parent is less than or equal to both of its children — it says nothing about the relative order between, say, a left grandchild and the right child of a different subtree. The array only needs to satisfy this narrow, local invariant for offer/poll to work correctly in O(log n); it does not need to be, and is not, sorted overall. Iterating the backing array via iterator() just walks it index 0, 1, 2, ... in whatever raw storage order the heap happens to have, which reflects the history of sift-ups and sift-downs, not a global ordering. The only operation that guarantees priority order is repeated poll(), because each poll() re-establishes the heap invariant from scratch by moving the last element to the root and sifting it down — that repeated re-establishment is precisely what production code processing, say, an SLA-ordered queue of Orders must rely on instead of a for-each loop over the queue.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does Map sit outside the Collection hierarchy entirely, and what are its three view collections?</summary>
+<div class="qa-body">Collection's entire contract — add(E), contains(E), an iterator that yields E — is built around holding and traversing individual elements of one type. A Map fundamentally stores an association between two types (a key and a value), and most of its defining operations, like get(key) or containsKey(key), have no single-element analogue in the Collection interface; forcing Map to implement Collection&lt;Entry&lt;K,V&gt;&gt; would mean wrapping every lookup in entry objects for no real benefit. Instead, Map exposes three separate view collections that let you treat it as a Collection when you need to: keySet() (a Set&lt;K&gt;), values() (a Collection&lt;V&gt;, which permits duplicates since values need not be unique), and entrySet() (a Set&lt;Map.Entry&lt;K,V&gt;&gt;). Critically, these are live views backed by the same underlying table, not copies — removing an entry through entrySet().iterator().remove(), or calling keySet().remove(k), removes it from the map itself, and vice versa.</div>
 </details>
 
 <h2>Related Topics</h2>
@@ -239,4 +494,6 @@
 <div class="related-card" onclick="window.location.hash='/streams-functional'"><div class="rc-title">Streams &amp; Functional Style</div><div class="rc-sub">Days 06–10 · Collectors are stream-to-collection recipes built on the structures covered here</div></div>
 <div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Concurrency &amp; Multithreading</div><div class="rc-sub">Days 11–15 · CAS, synchronized, and the Java Memory Model underneath ConcurrentHashMap</div></div>
 <div class="related-card" onclick="window.location.hash='/caching-strategies'"><div class="rc-title">Caching Strategies</div><div class="rc-sub">Days 16–20 · LRU via LinkedHashMap is the entry point into real eviction policy design</div></div>
+<div class="related-card" onclick="window.location.hash='/jvm-profiling-troubleshooting'"><div class="rc-title">JVM Performance Profiling &amp; Production Troubleshooting</div><div class="rc-sub">Diagnosing HashMap resize storms, ConcurrentHashMap contention, and allocation churn from CopyOnWriteArrayList under real production load</div></div>
+<div class="related-card" onclick="window.location.hash='/batch-processing-scheduled-jobs'"><div class="rc-title">Batch Processing &amp; Scheduled Jobs</div><div class="rc-sub">SLA-ranked PriorityQueue processing and sized-bulk-load HashMap/List patterns are the data-structure backbone of batch job design</div></div>
 </div>

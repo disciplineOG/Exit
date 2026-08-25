@@ -48,8 +48,44 @@
 <tr><td><code>PaymentProcessor</code></td><td>Given an amount, executes payment through some channel</td><td>Payment integrations</td></tr>
 </table>
 <p>Notice the pattern: every class that could plausibly change for a <em>business</em> reason (allocation policy, pricing policy, payment channel) has been pulled out of <code>ParkingLot</code> into its own interface. That separation is not incidental — it's the direct consequence of applying SRP and is what makes the next section's SOLID discussion concrete rather than abstract.</p>
+<h3>The Vehicle and ParkingSpot type taxonomies</h3>
+<p>Both <code>Vehicle</code> and <code>ParkingSpot</code> have a real, natural type hierarchy — but, as the "Liskov Substitution" discussion later in this page explains, most of that hierarchy is deliberately shallow. <code>Vehicle</code> stays a single concrete class carrying a <code>VehicleType</code> enum field rather than growing subclasses per vehicle kind, precisely to avoid duplicating eligibility logic across sibling classes. <code>ParkingSpot</code> does get one real subclass, because a handicapped spot genuinely needs extra behavior (a permit check) that a plain spot doesn't — not just a different label:</p>
+<pre><code>Vehicle                                    (single concrete class — NOT subclassed per kind)
+  - licensePlate: String
+  - type: VehicleType                      (enum: MOTORCYCLE, CAR, BUS, TRUCK, ...)
+  - hasHandicapPermit: boolean             (only meaningful for handicapped-spot eligibility)
+
+VehicleType (enum)                          -- data, not a class hierarchy --
+  ├── MOTORCYCLE
+  ├── CAR
+  ├── BUS
+  └── TRUCK
+
+  compatibility is a lookup table, not inheritance:
+  Map&lt;VehicleType, Set&lt;SpotType&gt;&gt; ELIGIBLE_SPOTS = {
+    MOTORCYCLE -> {MOTORCYCLE, COMPACT, LARGE},   // a motorcycle can use anything sized up
+    CAR        -> {COMPACT, LARGE},
+    BUS        -> {LARGE},
+    TRUCK      -> {LARGE}
+  }
+
+ParkingSpot                                 (base class — real subclass exists below)
+  - id: String, floorNumber: int, type: SpotType, occupied/currentVehicle
+  + tryOccupy(Vehicle v): boolean           // default: occupied check only
+  |
+  └── HandicappedSpot extends ParkingSpot
+        + tryOccupy(Vehicle v): boolean     // overridden: occupied check AND v.hasHandicapPermit()
+
+SpotType (enum)                             -- also data, not a class hierarchy --
+  ├── MOTORCYCLE
+  ├── COMPACT
+  ├── LARGE
+  └── HANDICAPPED                          // maps 1:1 to the HandicappedSpot subclass via the factory
+</code></pre>
+<p>The asymmetry here is deliberate and worth naming explicitly: <code>Vehicle</code> has zero subclasses (kind is just enum data, and eligibility is a lookup table, both to satisfy Liskov Substitution — see the next section), while <code>ParkingSpot</code> has exactly one subclass, because <code>HandicappedSpot</code> needs to override actual <em>behavior</em> (<code>tryOccupy</code>'s acceptance logic), not just carry a different label — something an enum field alone can't express. This is the general rule for "should this be a subclass or an enum value": if the only difference between variants is a piece of data used elsewhere, it's an enum; if a variant needs to override how a method actually behaves, it's a subclass.</p>
 
 <h2>3. Applying SOLID to the Design</h2>
+<p><strong>SOLID</strong> is an acronym for five object-oriented design principles, each aimed at the same underlying goal — making a codebase tolerant of change without becoming fragile: <strong>S</strong>ingle Responsibility (a class should have one reason to change), <strong>O</strong>pen/Closed (extend behavior by adding new code, not by editing existing code), <strong>L</strong>iskov Substitution (a subtype must be usable anywhere its supertype is expected, without surprising callers), <strong>I</strong>nterface Segregation (don't force a class to depend on methods it doesn't use), and <strong>D</strong>ependency Inversion (depend on abstractions/interfaces, not concrete implementations). The parking lot is used here as a concrete, worked example of all five — the subsections below map each principle to a specific decision already made in Section 2's entity table, not to abstract theory. (See <a href="#/solid-design-patterns">SOLID &amp; Design Patterns</a> for the principles covered generally, independent of this specific design.)</p>
 <h3>Single Responsibility — why ParkingLot doesn't compute fares</h3>
 <p>If <code>ParkingLot</code> both tracked spots and computed pricing, a change to the pricing model (say, switching from flat-per-hour to a tiered rate) would require editing and re-testing the same class responsible for spot bookkeeping — two unrelated concerns coupled by accident. Splitting pricing into <code>PricingStrategy</code> means a pricing change touches exactly one class, and that class has no idea how spots are laid out.</p>
 <h3>Open/Closed — why allocation and pricing are Strategy objects</h3>
@@ -61,6 +97,7 @@
 class NearestFirstStrategy implements SpotAllocationStrategy { ... }
 class LargestFitStrategy implements SpotAllocationStrategy { ... }
 </code></pre>
+<p>The return type <code>Optional&lt;ParkingSpot&gt;</code> (rather than a plain <code>ParkingSpot</code> that might be <code>null</code>) is a deliberate signal in the method's own signature that "no spot found" is an expected, ordinary outcome — not an error — and forces every caller to explicitly handle the empty case (via <code>isPresent()</code>/<code>isEmpty()</code>, or <code>map</code>/<code>orElseThrow</code>) rather than risking an unchecked <code>NullPointerException</code> three call-frames away from where the absence actually originated.</p>
 <p><code>ParkingLot</code> holds a reference to a <code>SpotAllocationStrategy</code> (injected at construction, or swappable at runtime) and simply calls <code>strategy.findSpot(...)</code>. Adding "prefer floors closest to the elevator" as a new policy means writing one new class and wiring it in — <code>ParkingLot</code>'s source is never touched. That is precisely what Open/Closed means in practice: open for extension (new strategy classes), closed for modification (the class that uses the strategy doesn't change). The same reasoning applies to <code>PricingStrategy</code> — a "first hour free" promotion is a new class, not an <code>if</code> branch inserted into existing fare logic.</p>
 <h3>Liskov Substitution — why SpotType eligibility must be modeled as data, not type-checking code</h3>
 <p>A tempting but wrong design is to give <code>Vehicle</code> subclasses (<code>Car</code>, <code>Motorcycle</code>, <code>Bus</code>) an overridden method like <code>canParkIn(ParkingSpot spot)</code> with type-specific logic duplicated in each subclass. This risks Liskov violations the moment a new spot type is added, because every vehicle subclass now needs a matching branch, and it's easy for one subclass to enforce a stricter or laxer rule than its siblings in a way that breaks substitutability (code that works correctly for a generic <code>Vehicle</code> should keep working when handed any concrete vehicle). The more robust model is a single compatibility table — a <code>Map&lt;VehicleType, Set&lt;SpotType&gt;&gt;</code> — consulted uniformly regardless of concrete vehicle class, so behavior is data-driven and every vehicle type is checked through the same code path.</p>
@@ -95,7 +132,7 @@ if (spot != null) {
     issueTicket(vehicle, spot);  // BOTH gates issue a ticket for the SAME physical spot
 }
 </code></pre>
-<p>This is the canonical <strong>check-then-act</strong> race: "check availability" and "act on it" are two separate operations with a window between them, and nothing prevents a second thread from performing its own check before the first thread's act has taken effect. The visible symptom in production would be two vehicles physically directed to the same spot, or — just as bad — a spot that gets marked occupied by thread B's write clobbering thread A's ticket reference, leaving one ticket pointing at a spot with no reliable owner. This is exactly the same shape of bug covered generally in <a href="#/concurrency-multithreading">multithreading &amp; concurrency</a>: visibility and atomicity are two separate guarantees, and neither a plain boolean field nor even a `volatile` one gives you atomicity for a read-modify-write sequence.</p>
+<p>This is the canonical <strong>check-then-act</strong> race: "check availability" and "act on it" are two separate operations with a window between them, and nothing prevents a second thread from performing its own check before the first thread's act has taken effect. The visible symptom in production would be two vehicles physically directed to the same spot, or — just as bad — a spot that gets marked occupied by thread B's write clobbering thread A's ticket reference, leaving one ticket pointing at a spot with no reliable owner. This is exactly the same shape of bug covered generally in <a href="#/concurrency-multithreading">multithreading &amp; concurrency</a>: visibility and atomicity are two separate guarantees, and neither a plain boolean field nor even a <code>volatile</code> one gives you atomicity for a read-modify-write sequence.</p>
 <h3>Why "make the field volatile" does not fix this</h3>
 <p><code>volatile</code> only guarantees that a write becomes visible to subsequent reads — it says nothing about two threads performing a read-check-write sequence without interleaving. Both gate threads can each observe <code>occupied == false</code> (a perfectly valid, up-to-date read) before either has written <code>true</code>. The fix has to make the entire "check and claim" sequence a single indivisible operation.</p>
 <h3>Fix 1 — a lock per spot</h3>
@@ -248,4 +285,5 @@ PaymentProcessor (interface)
 <div class="related-card" onclick="window.location.hash='/concurrency-multithreading'"><div class="rc-title">Multithreading, Concurrency &amp; Virtual Threads</div><div class="rc-sub">Days 16–20 · the JMM and locking primitives behind the spot-allocation race fix</div></div>
 <div class="related-card" onclick="window.location.hash='/lld-elevator-bookmyshow'"><div class="rc-title">LLD: Elevator &amp; BookMyShow</div><div class="rc-sub">Phase 2 · same entity-modeling and state-machine discipline applied to booking and dispatch</div></div>
 <div class="related-card" onclick="window.location.hash='/lld-rate-limiter-cache'"><div class="rc-title">LLD: Rate Limiter &amp; Cache</div><div class="rc-sub">Phase 2 · another design where atomic check-and-act under concurrency is the central problem</div></div>
+<div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'"><div class="rc-title">Payment Systems &amp; Idempotent Transactions</div><div class="rc-sub">The ExitGate → PaymentProcessor.charge() step needs exactly the idempotency guarantees covered there — a retried charge on gate timeout must not double-bill</div></div>
 </div>

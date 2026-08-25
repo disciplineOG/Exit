@@ -3,6 +3,7 @@
 
 <div class="topic-tags">
   <span class="tag">Kafka Partitioning</span>
+  <span class="tag">Delivery Guarantees</span>
   <span class="tag">Idempotency</span>
   <span class="tag">Dead Letter Queues</span>
   <span class="tag">Provider Abstraction</span>
@@ -13,40 +14,42 @@
 
 <div class="callout tip">
   <div class="callout-title">Why this matters</div>
-  <p>A notification engine looks trivial — "send an SMS when something happens" — until you ask what happens when the SMS provider is down for four minutes, or when the same Kafka message gets redelivered and a user gets the same "your OTP is 4821" text twice, or when a payment-failed and payment-succeeded event for the same user arrive at the notification service out of order and the user sees success-then-failure. Every one of those is a design decision, not a bug you patch later, and getting them right is what separates a system that silently corrupts a user's perception of their own account state from one that doesn't. This page builds the reasoning for each decision from first principles so you can defend it, not just recite it.</p>
+  <p>A notification engine looks trivial — "text the customer when their order ships" — until you ask what happens when the SMS provider is down for four minutes during a flash sale, or when the same <code>OrderShipped</code> Kafka message gets redelivered and a customer gets the same "your order has shipped" text twice, or when a <code>PaymentFailed</code> and a <code>PaymentCaptured</code> event for the same order arrive at notification-service out of order and the customer sees a success push notification followed by a failure one. Every one of those is a design decision, not a bug you patch later, and getting them right is what separates a system that silently corrupts a customer's perception of their own order state from one that doesn't. This page builds the reasoning for each decision from first principles so you can defend it, not just recite it.</p>
 </div>
 
 <h2>1. Why a Separate Notification Service Exists</h2>
-<p>The naive design has every service that needs to notify a user — the order service, the payment service, the account service — call an SMS or email provider's API directly. This works for a demo and fails in production for reasons that have nothing to do with notifications specifically and everything to do with what happens when you duplicate cross-cutting concerns across N services.</p>
+<p>The naive design has every ShopSphere service that needs to notify a customer or seller — order-service, payment-service, inventory-service — call an SMS, email, or push provider's API directly whenever something happens: order-service calls Twilio directly when an order ships, payment-service calls SendGrid directly when a card is declined. This works for a demo and fails in production for reasons that have nothing to do with notifications specifically and everything to do with what happens when you duplicate a cross-cutting concern across N services.</p>
 <ul>
-  <li><strong>Rate limiting becomes impossible to enforce globally.</strong> If five services can each independently decide to text a user, no single service has visibility into how many messages that user has received in the last hour. A shared service is the only place a per-user, per-channel rate limit (say, max 3 SMS per hour, max 10 push notifications per day) can actually be enforced, because it is the only component that sees every notification for that user.</li>
-  <li><strong>Template and content management is duplicated.</strong> Marketing wants to change the wording of the "delivery delayed" email without a code deploy in the order service. If templates live inside every producing service, that requires N deploys. A shared service can expose templates as data (versioned, in a database or config store) so wording changes are operational, not code changes.</li>
+  <li><strong>Rate limiting becomes impossible to enforce globally.</strong> If order-service, payment-service, and inventory-service can each independently decide to text a customer, no single service has visibility into how many messages that customer has received in the last hour. A shared <strong>notification-service</strong> is the only place a per-customer, per-channel rate limit (say, max 3 SMS per hour, max 10 push notifications per day) can actually be enforced, because it is the only component that sees every notification for that customer, regardless of which upstream service triggered it.</li>
+  <li><strong>Template and content management is duplicated.</strong> Marketing wants to change the wording of the "your order is delayed" email without a code deploy in order-service. If templates live inside every producing service, that requires N deploys for one wording change. A shared service can expose templates as data (versioned, in a database or config store) so wording changes are operational, not code changes.</li>
   <li><strong>Provider abstraction and failover logic would otherwise live in every service.</strong> If Twilio is down, every service that calls Twilio directly needs its own fallback to a secondary SMS provider, its own circuit breaker, its own retry policy. Centralizing this means you write and operate that resilience logic exactly once.</li>
-  <li><strong>The business operation must not be coupled to notification delivery.</strong> If the order service calls the SMS provider synchronously and that call takes 8 seconds or times out, the customer's checkout request is now blocked on an SMS gateway that has nothing to do with whether the order succeeded. This is the most important reason of all, and it drives the entire architecture below.</li>
+  <li><strong>The business operation must not be coupled to notification delivery.</strong> If order-service calls the SMS provider synchronously during checkout and that call takes 8 seconds or times out, the customer's checkout request is now blocked on an SMS gateway that has nothing to do with whether the order itself succeeded. This is the most important reason of all, and it drives the entire architecture below.</li>
 </ul>
 
 <div class="callout">
   <div class="callout-title">The dependency direction matters</div>
-  <p>The core architectural principle is: business-critical operations must never have a hard runtime dependency on notification delivery succeeding. An order can complete even if the confirmation SMS never sends. The reverse — notification delivery depending on the order service still being up to retry — is fine, and is in fact how retry works here.</p>
+  <p>The core architectural principle is: business-critical operations must never have a hard runtime dependency on notification delivery succeeding. A ShopSphere order can complete, be paid, and ship even if the "your order has shipped" SMS never sends. The reverse — notification delivery depending on order-service still being up to retry — is fine, and is in fact how retry works here.</p>
 </div>
 
 <h2>2. Core Architecture: Events, Not Synchronous Calls</h2>
-<p>Given the constraint above, upstream services do not call the notification service's API and wait for a response. Instead, they publish a <strong>notification-intent event</strong> to a message broker — Kafka in this design — and move on immediately. This is the same event-driven decoupling covered in <a href="#/async-messaging">async messaging</a>, applied to a concrete domain.</p>
-<pre><code>OrderService                     Kafka topic: notification-events         NotificationService
-     |                                     |                                      |
-     | produce(NotificationIntent) ------> |                                      |
-     |   (fire-and-forget, async)          |  <---------------- poll/consume ---- |
-     | <-- ack (partition, offset) --------|                                      |
-     |                                     |                                      |
-  [checkout returns to user here,          |                          [dispatch to provider,
-   independent of notification outcome]    |                           retry, DLQ, etc.]
+<p>Given the constraint above, upstream ShopSphere services do not call notification-service's API and wait for a response. Instead, they publish a <strong>notification-intent event</strong> to a message broker — Kafka in this design — and move on immediately. This is the same event-driven decoupling covered in <a href="#/async-messaging">async messaging</a>, applied to a concrete domain. The three concrete events driving this page's examples are the ones every ShopSphere customer actually experiences: <code>OrderPlaced</code> (checkout succeeded, order is <code>CREATED</code>), <code>OrderShipped</code> (order-service/inventory-service confirmed dispatch), and <code>PaymentFailed</code> (payment-service's card charge was declined).</p>
+<pre><code>order-service / payment-service        Kafka topic: notification-events        notification-service
+     |                                          |                                       |
+     | produce(OrderPlaced / OrderShipped /     |                                       |
+     |         PaymentFailed) ----------------> |                                       |
+     |   (fire-and-forget, async)               |  <---------------- poll/consume ----- |
+     | <-- ack (partition, offset) -------------|                                       |
+     |                                          |                                       |
+  [checkout/shipping/payment flow returns       |                          [dispatch to email/SMS/push
+   to the customer here, independent of         |                           provider, retry, DLQ, etc.]
+   notification outcome]                        |
 </code></pre>
 
-<p>A notification-intent event carries everything the notification service needs to act without calling back into the originating service: a notification type (<code>ORDER_CONFIRMED</code>, <code>PAYMENT_FAILED</code>), the user ID, the channel preference hints, template variables, and a unique event ID.</p>
+<p>A notification-intent event carries everything notification-service needs to act without calling back into the originating service: a notification type (<code>ORDER_PLACED</code>, <code>ORDER_SHIPPED</code>, <code>PAYMENT_FAILED</code>), the customer ID, channel preference hints, template variables, and a unique event ID.</p>
 
 <pre><code>{
   "eventId": "evt_9f3a2b7c-...",       // used to build the idempotency key
-  "userId": "u_48213",
+  "customerId": "cust_48213",
   "type": "PAYMENT_FAILED",
   "occurredAt": "2026-08-24T09:15:03Z",
   "templateVars": { "orderId": "ORD-77213", "amount": "49.00" },
@@ -54,50 +57,90 @@
 }
 </code></pre>
 
-<p>This buys three things simultaneously: the producing service's latency is unaffected by notification-provider latency, a burst of events is absorbed by the broker instead of overwhelming the provider API, and the notification service can be scaled, deployed, and even taken down for maintenance independently of every service that triggers notifications.</p>
+<p>This buys three things simultaneously: the producing service's latency is unaffected by notification-provider latency, a burst of events (a flash-sale spike producing thousands of <code>OrderPlaced</code> events in seconds) is absorbed by the broker instead of overwhelming the provider API, and notification-service can be scaled, deployed, and even taken down for maintenance independently of every service that triggers notifications.</p>
 
 <div class="callout warn">
   <div class="callout-title">Fire-and-forget still needs a delivery guarantee from the producer</div>
-  <p>"Async" does not mean "best effort and forget." The producer should still wait for the broker's acknowledgment (Kafka <code>acks=all</code> for a durability-sensitive event like a payment notification) before considering its own write-then-publish sequence complete, typically via the transactional outbox pattern so the database write and the event publish are atomic. Otherwise a crash between committing the order and publishing the event silently drops the notification forever — decoupling doesn't remove the need for reliability, it just moves where you engineer it.</p>
+  <p>"Async" does not mean "best effort and forget." The producer should still wait for the broker's acknowledgment (Kafka <code>acks=all</code> for a durability-sensitive event like a <code>PaymentFailed</code> notification) before considering its own write-then-publish sequence complete, typically via the transactional outbox pattern so the database write (e.g. order-service persisting <code>Order.status = PAID</code>) and the event publish are atomic. Otherwise a crash between committing the order and publishing the event silently drops the notification forever — decoupling doesn't remove the need for reliability, it just moves where you engineer it.</p>
 </div>
 
-<h2>3. Partition-Key Design: Ordering Per User</h2>
-<p>Kafka guarantees ordering only within a partition, not across an entire topic. If you partition <code>notification-events</code> by, say, a round-robin or by event type, then a <code>PAYMENT_FAILED</code> event for user 48213 and a <code>PAYMENT_SUCCEEDED</code> event for the same user (perhaps a retried payment that succeeded seconds later) can land on different partitions, be consumed by different consumer-group members, and be processed in either order — including the wrong one, where the user sees "payment failed" arrive after they already saw "payment succeeded."</p>
-<p>The fix is to choose <strong>user ID as the partition key</strong>:</p>
+<h2>3. Partition-Key Design: Ordering Per Customer</h2>
+<p>Kafka guarantees ordering only within a partition, not across an entire topic. If you partition <code>notification-events</code> by, say, a round-robin or by event type, then a <code>PaymentFailed</code> event for customer 48213 and a <code>PaymentCaptured</code> event for the same customer (perhaps a retried card charge that succeeded seconds later) can land on different partitions, be consumed by different consumer-group members, and be processed in either order — including the wrong one, where the customer sees "your payment failed" arrive after they already saw "payment successful."</p>
+<p>The fix is to choose <strong>customer ID as the partition key</strong>:</p>
 <pre><code>producer.send(new ProducerRecord&lt;&gt;(
     "notification-events",
-    String.valueOf(userId),   // partition key
+    String.valueOf(customerId),   // partition key
     eventPayload
 ));
 </code></pre>
-<p>Kafka hashes the key to deterministically select a partition, so every event for a given user always lands on the same partition, and a single partition is only ever consumed by one consumer within a consumer group at a time. That combination — same partition, single consumer — is what actually delivers per-user ordering. It is not the partitioning alone; a partition being read by two threads out of order would break the guarantee just as badly, so the consumer-side processing for a given partition must also be strictly sequential (or if you parallelize downstream work, you must re-serialize by user ID before dispatch).</p>
+<p>Kafka hashes the key to deterministically select a partition, so every event for a given customer always lands on the same partition, and a single partition is only ever consumed by one consumer within a consumer group at a time. That combination — same partition, single consumer — is what actually delivers per-customer ordering. It is not the partitioning alone; a partition being read by two threads out of order would break the guarantee just as badly, so the consumer-side processing for a given partition must also be strictly sequential (or if you parallelize downstream work, you must re-serialize by customer ID before dispatch).</p>
 
 <table>
 <tr><th>Partition key choice</th><th>Ordering guarantee</th><th>Consequence for this domain</th></tr>
-<tr><td>Random / round-robin</td><td>None across events for the same user</td><td>Out-of-order delivery notifications; unacceptable for status-transition messages</td></tr>
-<tr><td>Event type</td><td>Ordered within a type, not across types</td><td>Doesn't fix the payment-failed/succeeded interleaving since both may be different types or even the same type from different producer instances</td></tr>
-<tr><td>User ID</td><td>All events for one user strictly ordered</td><td>Correct choice; trade-off is potential hot partitions for very high-volume users</td></tr>
+<tr><td>Random / round-robin</td><td>None across events for the same customer</td><td>Out-of-order delivery notifications; unacceptable for status-transition messages like <code>OrderPlaced</code> → <code>OrderShipped</code></td></tr>
+<tr><td>Event type</td><td>Ordered within a type, not across types</td><td>Doesn't fix the <code>PaymentFailed</code>/<code>PaymentCaptured</code> interleaving since both are different types published by different producer instances of payment-service</td></tr>
+<tr><td>Customer ID</td><td>All events for one customer strictly ordered</td><td>Correct choice; trade-off is potential hot partitions for very high-volume customers (e.g. a large B2B account placing bulk orders)</td></tr>
 </table>
 
 <div class="callout">
   <div class="callout-title">Hot partitions are the price of ordering</div>
-  <p>Keying by user ID means a small number of very active users (a bulk-notification account, a bot) can create a hot partition, since Kafka doesn't let you split a single key's traffic across partitions without breaking the ordering guarantee you just paid for. This is an accepted trade-off: you monitor per-partition consumer lag and, if genuinely necessary, apply a secondary bucketing key (e.g., <code>userId % N</code> combined into a composite key) only for identified high-volume accounts where perfect ordering matters less than throughput.</p>
+  <p>Keying by customer ID means a small number of very active customers (a bulk-ordering B2B account) can create a hot partition, since Kafka doesn't let you split a single key's traffic across partitions without breaking the ordering guarantee you just paid for. This is an accepted trade-off: you monitor per-partition consumer lag and, if genuinely necessary, apply a secondary bucketing key (e.g., <code>customerId % N</code> combined into a composite key) only for identified high-volume accounts where perfect ordering matters less than throughput.</p>
 </div>
 
 <h2>4. Idempotency: The Central Correctness Concern</h2>
+
+<h3>4.1 Delivery-guarantee taxonomy</h3>
+<p>Before talking about idempotency, it's worth being precise about what "delivery guarantee" even means, because the three options form a strict taxonomy and every messaging design (Kafka, SQS, RabbitMQ, a webhook retry system) sits at exactly one leaf of it for any given hop:</p>
+<pre><code>Message Delivery Guarantees
+  |
+  ├── At-most-once
+  |     Send/consume, then immediately commit (offset advances) BEFORE processing
+  |     completes. A crash after commit but before processing finishes means the
+  |     message is gone forever. No duplicates, but silent loss is possible.
+  |     -> Acceptable only for notifications where a missed one is truly harmless
+  |        (a "you might like this product" marketing nudge, not an OrderShipped SMS).
+  |
+  ├── At-least-once   <-- Kafka consumer's default, and this page's baseline
+  |     Process first, THEN commit the offset. A crash/rebalance between processing
+  |     and committing causes the same message to be redelivered and reprocessed.
+  |     No message is ever silently lost, but duplicates are a routine, expected event.
+  |     -> This is what notification-service actually gets from Kafka; idempotency
+  |        (section 4.2) is the mandatory countermeasure that makes duplicates safe.
+  |
+  └── Exactly-once
+        Every message is processed, and processed exactly one time, no duplicates,
+        no loss. Kafka provides this ONLY for Kafka-to-Kafka pipelines (consuming from
+        one topic and producing to another) via idempotent producers + transactions,
+        where both the consumed offset commit and the produced record are part of one
+        atomic transaction. It CANNOT extend this guarantee to an external side effect
+        like "call Twilio's API" or "call SendGrid's API," because that API call and the
+        Kafka offset commit are two separate systems with no shared atomic transaction.
+        -> This is why notification-service cannot simply "turn on exactly-once mode" —
+           the moment a non-Kafka side effect enters the picture, the best achievable
+           guarantee is at-least-once delivery plus application-level idempotency,
+           which is functionally equivalent to exactly-once from the customer's
+           point of view (they see one SMS) without requiring an impossible primitive.
+</code></pre>
+<div class="callout">
+  <div class="callout-title">"Exactly-once processing" is engineered, not provided</div>
+  <p>What notification-service actually achieves for the customer — one SMS, not zero, not two — is often loosely called "exactly-once," but it is not the same primitive as Kafka's internal exactly-once semantics. It's <strong>at-least-once delivery from Kafka, plus an idempotent consumer</strong>, which produces an outcome indistinguishable from true exactly-once as far as the external side effect (the SMS actually sent) is concerned. This distinction matters in an interview: claiming "we use exactly-once delivery" for a design that calls an external SMS provider is a red flag, because it's not achievable — the correct claim is "at-least-once delivery, made safe by an idempotent send."</p>
+</div>
+
+<h3>4.2 At-least-once plus idempotency: the mechanism</h3>
 <p>Kafka consumers offer <strong>at-least-once</strong> delivery by default: a consumer processes a message, and only after processing commits its offset. If the process crashes, or the commit fails, or a consumer-group rebalance happens between processing and committing, the same message is redelivered and processed again by whichever consumer picks up that partition next. This is not an edge case — rebalances during rolling deploys happen constantly in a live system — so "the same notification event will occasionally be processed twice" is a guaranteed occurrence, not a rare one.</p>
-<p>Without a countermeasure, this means a user occasionally gets the same SMS twice. For an OTP that's mildly annoying; for a "your card was charged" message it actively damages trust. The fix is to make the <em>send</em> step idempotent, not to try to make delivery exactly-once (Kafka does not offer exactly-once delivery to an external system like an SMS gateway — it only offers exactly-once processing within Kafka-to-Kafka pipelines using transactions).</p>
+<p>Without a countermeasure, this means a customer occasionally gets the same "your order has shipped" SMS twice. For that it's mildly annoying; for a "your card was charged $49.00" message it actively damages trust — it can look like a double charge even when payment-service only charged the card once. The fix is to make the <em>send</em> step idempotent, not to try to make delivery exactly-once (per the taxonomy above, Kafka does not offer exactly-once delivery to an external system like an SMS gateway — it only offers exactly-once processing within Kafka-to-Kafka pipelines using transactions).</p>
 
 <h3>The general procedure</h3>
 <ol>
-  <li>Derive a deterministic <strong>idempotency key</strong> from the event itself — not generated fresh on each processing attempt. A natural choice is the event ID from the producer (if the producer guarantees uniqueness per logical notification), or a composite like <code>hash(userId + notificationType + eventId)</code>.</li>
+  <li>Derive a deterministic <strong>idempotency key</strong> from the event itself — not generated fresh on each processing attempt. A natural choice is the event ID from the producer (if the producer guarantees uniqueness per logical notification), or a composite like <code>hash(customerId + notificationType + eventId)</code>.</li>
   <li>Before dispatching to the provider, check a durable store (a table or Redis with a long TTL) for that idempotency key.</li>
   <li>If the key is already present and marked "sent" or "in-flight," skip the dispatch — this is a duplicate delivery of a message you already handled.</li>
   <li>If the key is absent, atomically insert it (e.g., an <code>INSERT ... ON CONFLICT DO NOTHING</code> or a Redis <code>SETNX</code>) as a claim on doing the work, then dispatch to the provider, then update the record with the outcome.</li>
   <li>Commit the Kafka offset only after this whole sequence completes, so a crash mid-sequence causes redelivery — which is now safe, because the idempotency check will catch it.</li>
 </ol>
 
-<pre><code>String idempotencyKey = event.getEventId() + ":" + event.getType();
+<pre><code>// notification-service consuming an OrderShipped event for order ORD-77213
+String idempotencyKey = event.getEventId() + ":" + event.getType();
 
 boolean claimed = idempotencyStore.tryClaim(idempotencyKey, Duration.ofDays(7));
 if (!claimed) {
@@ -121,7 +164,7 @@ try {
 </div>
 
 <h2>5. Dead Letter Queues: Bounding Failure</h2>
-<p>Some notification events will fail to process no matter how many times you retry immediately — a malformed template variable causes a rendering exception every time, or a provider returns a permanent rejection (invalid phone number format). If the consumer simply throws and refuses to commit the offset, it will re-consume and re-fail the same message forever, which stalls that partition and blocks every subsequent event for every user hashed to it — a single bad message taking down notifications for potentially thousands of unrelated users.</p>
+<p>Some notification events will fail to process no matter how many times you retry immediately — a malformed <code>templateVars.orderId</code> causes a rendering exception every time, or a provider returns a permanent rejection (invalid phone number format on file for a customer). If the consumer simply throws and refuses to commit the offset, it will re-consume and re-fail the same message forever, which stalls that partition and blocks every subsequent event for every customer hashed to it — a single bad <code>OrderShipped</code> message taking down shipping notifications for potentially thousands of unrelated ShopSphere customers.</p>
 <p>The Dead Letter Queue pattern bounds this blast radius:</p>
 <ol>
   <li>Track a retry count for the message (either in a header the consumer increments and republishes with, or in an external store keyed by idempotency key).</li>
@@ -132,6 +175,7 @@ try {
 
 <pre><code>@KafkaListener(topics = "notification-events")
 public void onMessage(ConsumerRecord&lt;String, NotificationEvent&gt; record) {
+    // record.value() is e.g. an OrderShipped event for order ORD-77213
     try {
         processWithRetry(record.value());
     } catch (NonRetryableException e) {
@@ -149,11 +193,11 @@ public void onMessage(ConsumerRecord&lt;String, NotificationEvent&gt; record) {
 
 <div class="callout tip">
   <div class="callout-title">Retry topics vs. in-process retry loops</div>
-  <p>A common refinement is to implement the backoff using separate delayed retry topics (<code>notification-events-retry-1s</code>, <code>-5s</code>, <code>-30s</code>) rather than sleeping inside the consumer thread. Sleeping in the consumer blocks that thread from making progress on the rest of the partition and risks tripping <code>max.poll.interval.ms</code>, which triggers a rebalance. Routing failed messages through dedicated retry topics with their own consumers keeps the main topic's consumer loop fast and non-blocking.</p>
+  <p>A common refinement is to implement the backoff using separate delayed retry topics (<code>notification-events-retry-1s</code>, <code>-5s</code>, <code>-30s</code>) rather than sleeping inside the consumer thread. Sleeping in the consumer blocks that thread from making progress on the rest of the partition and risks tripping <code>max.poll.interval.ms</code> (the maximum time Kafka allows between successive <code>poll()</code> calls before assuming the consumer is dead), which triggers a rebalance. Routing failed messages through dedicated retry topics with their own consumers keeps the main topic's consumer loop fast and non-blocking.</p>
 </div>
 
 <h2>6. Delivery-Provider Abstraction and Fallback</h2>
-<p>Each channel needs a provider-agnostic interface so the rest of the system doesn't care whether SMS is currently going through Twilio or a backup vendor:</p>
+<p>Each channel needs a provider-agnostic interface so the rest of notification-service doesn't care whether SMS for a "your order has shipped" alert is currently going through Twilio or a backup vendor:</p>
 <pre><code>public interface NotificationProvider {
     DeliveryResult send(NotificationPayload payload);
     Channel channel(); // SMS, EMAIL, PUSH
@@ -177,22 +221,22 @@ public class SecondarySmsProvider implements NotificationProvider { /* Vonage */
     }
 }
 </code></pre>
-<p>Two details matter here that are easy to get wrong. First, failover on a single request failure should happen immediately for that request, independent of whether the breaker has tripped yet — the breaker's job is to stop <em>future</em> requests from hitting a provider that's known to be down, not to gate the current request's fallback. Second, cost and deliverability differ meaningfully between providers, so fallback should usually be logged and monitored distinctly, since silently routing all traffic to a more expensive secondary provider for hours because nobody noticed the primary was down is its own kind of incident.</p>
+<p>Two details matter here that are easy to get wrong. First, failover on a single request failure should happen immediately for that request, independent of whether the breaker has tripped yet — the breaker's job is to stop <em>future</em> requests from hitting a provider that's known to be down, not to gate the current request's fallback. Second, cost and deliverability differ meaningfully between providers, so fallback should usually be logged and monitored distinctly, since silently routing all of ShopSphere's SMS traffic to a more expensive secondary provider for hours during a flash sale because nobody noticed the primary was down is its own kind of incident.</p>
 
-<h2>7. User Preferences and Rate Limiting</h2>
-<p>Before a notification is dispatched, two checks happen that have nothing to do with delivery mechanics and everything to do with respecting the user:</p>
+<h2>7. Customer Preferences and Rate Limiting</h2>
+<p>Before a notification is dispatched, two checks happen that have nothing to do with delivery mechanics and everything to do with respecting the customer (or seller):</p>
 <ul>
-  <li><strong>Preference check.</strong> A user preference record (per user, per notification type, per channel) determines whether this notification should be sent at all, and on which channel. A user who disabled marketing emails but not transactional emails needs the notification type checked against their specific opt-out, not a blanket suppression.</li>
-  <li><strong>Rate limiting.</strong> Independent of preference, a per-user-per-channel rate limit caps volume — e.g., a token bucket with a capacity of 5 SMS per hour per user, refilling continuously. This protects the user from being flooded by a bug in an upstream service (an infinite retry loop in the order service that fires the same event a thousand times) and protects the business from provider costs spiraling from a misbehaving producer.</li>
+  <li><strong>Preference check.</strong> A preference record (per customer, per notification type, per channel) determines whether this notification should be sent at all, and on which channel. A customer who disabled marketing emails but not transactional emails needs the notification type checked against their specific opt-out — an <code>OrderShipped</code> email must still go out even if "promotional emails" is off, but a "flash sale starting soon" push must not.</li>
+  <li><strong>Rate limiting.</strong> Independent of preference, a per-customer-per-channel rate limit caps volume — e.g., a token bucket with a capacity of 5 SMS per hour per customer, refilling continuously. This protects the customer from being flooded by a bug in an upstream service (an infinite retry loop in order-service that fires the same <code>OrderPlaced</code> event a thousand times) and protects ShopSphere from provider costs spiraling from a misbehaving producer.</li>
 </ul>
-<pre><code>if (!preferenceService.isEnabled(userId, notification.getType(), channel)) {
-    return DeliveryResult.skipped("user preference");
+<pre><code>if (!preferenceService.isEnabled(customerId, notification.getType(), channel)) {
+    return DeliveryResult.skipped("customer preference");
 }
-if (!rateLimiter.tryAcquire(rateLimitKey(userId, channel))) {
+if (!rateLimiter.tryAcquire(rateLimitKey(customerId, channel))) {
     return DeliveryResult.skipped("rate limited");
 }
 </code></pre>
-<p>Rate limiting here is a good illustration of why this logic belongs in one shared place: it is only enforceable if every notification for a user passes through the same limiter state, which is only guaranteed if there's a single service on the send path.</p>
+<p>Rate limiting here is a good illustration of why this logic belongs in one shared place: it is only enforceable if every notification for a customer passes through the same limiter state, which is only guaranteed if there's a single service — notification-service — on the send path for order-service, payment-service, and every other producer alike.</p>
 
 <h2>8. Delivery-Status Tracking and Retry Scheduling</h2>
 <p>Each notification has a lifecycle that should be modeled explicitly as a state machine rather than as scattered boolean flags, because the transitions themselves carry the retry and monitoring logic:</p>
@@ -212,7 +256,7 @@ if (!rateLimiter.tryAcquire(rateLimitKey(userId, channel))) {
 <tr><td>FAILED (transient)</td><td>Provider timeout, 5xx, or rate-limited response</td><td>Scheduled retry with exponential backoff</td></tr>
 <tr><td>FAILED (permanent)</td><td>Invalid recipient, provider rejected the content</td><td>Routed to DLQ, no retry</td></tr>
 </table>
-<p>This state is persisted (a <code>notifications</code> table keyed by notification ID, or the idempotency store extended to carry state) so that a support engineer can answer "did this user actually receive their password-reset SMS" without guessing, and so the scheduled-retry job has something concrete to query: "find all notifications in FAILED(transient) state whose next-retry-at timestamp has passed."</p>
+<p>This state is persisted (a <code>notifications</code> table keyed by notification ID, or the idempotency store extended to carry state) so that a support engineer can answer "did this customer actually receive their order-shipped SMS" without guessing, and so the scheduled-retry job has something concrete to query: "find all notifications in FAILED(transient) state whose next-retry-at timestamp has passed."</p>
 <pre><code>nextRetryAt = now + baseDelay * (2 ^ attemptNumber) + jitter
 // attempt 1: ~2s, attempt 2: ~4s, attempt 3: ~8s, capped at e.g. 5 minutes
 </code></pre>
@@ -226,38 +270,43 @@ if (!rateLimiter.tryAcquire(rateLimitKey(userId, channel))) {
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
 
 <details class="concept-qa">
-<summary>Why does publishing to a queue instead of calling the notification service directly actually prevent notification failures from affecting the business operation?</summary>
-<div class="qa-body">Because the producing service's responsibility ends at a successful publish to the broker, which is a local, fast, and highly available operation compared to calling an external SMS/email/push provider. The order service's checkout flow only needs Kafka to accept the write (with <code>acks</code> tuned for the durability you need); it never waits on Twilio, APNs, or SendGrid, whose latency and availability are outside its control. The failure mode shifts from "checkout is slow because SMS is slow" to "checkout is fine, and the notification service deals with SMS being slow using its own retry and backoff machinery," which is exactly where that concern belongs.</div>
+<summary>What's the practical difference between at-most-once, at-least-once, and exactly-once delivery, and which one does ShopSphere's notification pipeline actually achieve end to end?</summary>
+<div class="qa-body">At-most-once commits the offset before (or without regard to) whether processing succeeded, so a crash between commit and completion silently drops the message — zero duplicates, but real loss is possible; this is only tolerable for notifications where losing one is harmless, like a "you might like this" recommendation nudge. At-least-once (Kafka's consumer default, and the baseline for this design) commits the offset only after processing completes, so a crash or rebalance between those two steps causes redelivery and reprocessing of the same message — no message is ever silently lost, but duplicates are routine. Exactly-once — every message processed exactly one time, no loss, no duplicates — is only achievable end to end within a pure Kafka-to-Kafka pipeline, using idempotent producers and transactions to atomically tie together a consumed offset and a produced record. The moment an external, non-transactional side effect enters the picture — calling Twilio, SendGrid, or APNs — there is no way to make that call and the Kafka offset commit part of one atomic operation, so true exactly-once delivery to an external system is not achievable. What ShopSphere's notification-service actually achieves is at-least-once delivery from Kafka plus an idempotent consumer (section 4), which produces an outcome — the customer sees exactly one "your order has shipped" SMS — that looks like exactly-once from the outside without requiring the impossible primitive.</div>
 </details>
 
 <details class="concept-qa">
-<summary>If Kafka only guarantees ordering within a partition, and you key by user ID, can a single user's notifications still ever be processed out of order?</summary>
-<div class="qa-body">Yes, if the consumer doesn't preserve that order downstream. Partitioning by user ID guarantees all of a user's events arrive at the same consumer in produced order, but if that consumer hands off processing to a thread pool for parallel dispatch, two events for the same user can finish (and dispatch) out of order even though they were read in order. To preserve ordering end to end, either process a partition's messages strictly sequentially, or if you parallelize, re-serialize per user ID downstream (e.g., route to a per-user in-memory queue or use a single-threaded executor keyed by user ID) before actually sending.</div>
+<summary>Why does publishing to a queue instead of calling notification-service directly actually prevent notification failures from affecting the business operation?</summary>
+<div class="qa-body">Because the producing service's responsibility ends at a successful publish to the broker, which is a local, fast, and highly available operation compared to calling an external SMS/email/push provider. Order-service's checkout flow only needs Kafka to accept the write (with <code>acks</code> tuned for the durability you need); it never waits on Twilio, APNs, or SendGrid, whose latency and availability are outside its control. The failure mode shifts from "checkout is slow because SMS is slow" to "checkout is fine, and notification-service deals with SMS being slow using its own retry and backoff machinery," which is exactly where that concern belongs.</div>
+</details>
+
+<details class="concept-qa">
+<summary>If Kafka only guarantees ordering within a partition, and you key by customer ID, can a single customer's notifications still ever be processed out of order?</summary>
+<div class="qa-body">Yes, if the consumer doesn't preserve that order downstream. Partitioning by customer ID guarantees all of a customer's events (say, their OrderPlaced followed by their PaymentFailed) arrive at the same consumer in produced order, but if that consumer hands off processing to a thread pool for parallel dispatch, two events for the same customer can finish (and dispatch) out of order even though they were read in order. To preserve ordering end to end, either process a partition's messages strictly sequentially, or if you parallelize, re-serialize per customer ID downstream (e.g., route to a per-customer in-memory queue or use a single-threaded executor keyed by customer ID) before actually sending.</div>
 </details>
 
 <details class="concept-qa">
 <summary>Why is idempotency the consumer's responsibility rather than something Kafka can guarantee for you?</summary>
-<div class="qa-body">Kafka's exactly-once semantics apply only to Kafka-to-Kafka pipelines (producing to one topic based on consuming from another, using transactions and idempotent producers) — it has no way to make an external, non-transactional side effect like "call the Twilio API" exactly-once, because that API call and the Kafka offset commit are two separate systems that can't be committed atomically. The only way to get correct behavior is to make the side effect itself safe to repeat: check-then-claim a deterministic key before dispatching, so a duplicate delivery of the same event is detected and skipped rather than resulting in a duplicate real-world action.</div>
+<div class="qa-body">Kafka's exactly-once semantics apply only to Kafka-to-Kafka pipelines (producing to one topic based on consuming from another, using transactions and idempotent producers) — it has no way to make an external, non-transactional side effect like "call the Twilio API" exactly-once, because that API call and the Kafka offset commit are two separate systems that can't be committed atomically. The only way to get correct behavior is to make the side effect itself safe to repeat: check-then-claim a deterministic key before dispatching, so a duplicate delivery of the same event (say, a redelivered OrderShipped message) is detected and skipped rather than resulting in a duplicate SMS to the customer.</div>
 </details>
 
 <details class="concept-qa">
 <summary>What specifically goes wrong if you retry a failing message inline, in a loop, instead of using a Dead Letter Queue?</summary>
-<div class="qa-body">A Kafka consumer only advances past a message by committing its offset, and it processes messages from a given partition in order. If a message keeps failing and the consumer refuses to commit until it succeeds, no later message in that partition can ever be processed — the consumer is stuck retrying the same poisoned message forever. Since a partition is keyed by user ID here, that one bad message (a malformed template variable, say) doesn't just fail for one user; it halts notification delivery for every user whose ID happens to hash to that partition, for as long as the bug persists. A DLQ, combined with committing the offset once the message is routed there, unblocks the partition immediately and confines the damage to the single bad message.</div>
+<div class="qa-body">A Kafka consumer only advances past a message by committing its offset, and it processes messages from a given partition in order. If a message keeps failing and the consumer refuses to commit until it succeeds, no later message in that partition can ever be processed — the consumer is stuck retrying the same poisoned message forever. Since a partition is keyed by customer ID here, that one bad message (a malformed <code>templateVars.orderId</code>, say) doesn't just fail for one customer; it halts notification delivery — order confirmations, shipping updates, payment failures — for every customer whose ID happens to hash to that partition, for as long as the bug persists. A DLQ, combined with committing the offset once the message is routed there, unblocks the partition immediately and confines the damage to the single bad message.</div>
 </details>
 
 <details class="concept-qa">
 <summary>Why does failover to a secondary provider happen on the failing request itself, rather than waiting for the circuit breaker to trip?</summary>
-<div class="qa-body">The circuit breaker's purpose is to stop sending future requests to a provider once it's established (via a threshold of recent failures) that the provider is unhealthy — it protects against wasting time and resources on requests likely to fail, and gives the provider room to recover by cutting off traffic. It says nothing about what to do with the request that just failed. If you only failed over once the breaker trips, every request during the ramp-up to that threshold would still fail outright with no notification sent. Failing over immediately on a per-request basis handles the individual failure; the breaker is a separate, longer-horizon mechanism for deciding when to stop trying the primary at all.</div>
+<div class="qa-body">The circuit breaker's purpose is to stop sending future requests to a provider once it's established (via a threshold of recent failures) that the provider is unhealthy — it protects against wasting time and resources on requests likely to fail, and gives the provider room to recover by cutting off traffic. It says nothing about what to do with the request that just failed. If you only failed over once the breaker trips, every request during the ramp-up to that threshold — including, say, a burst of PaymentFailed alerts during a flash sale — would still fail outright with no notification sent. Failing over immediately on a per-request basis handles the individual failure; the breaker is a separate, longer-horizon mechanism for deciding when to stop trying the primary at all.</div>
 </details>
 
 <details class="concept-qa">
 <summary>Why add random jitter to an exponential backoff schedule instead of just doubling the delay each time?</summary>
-<div class="qa-body">Exponential backoff alone solves the problem of hammering a struggling dependency with immediate retries, but it doesn't solve synchronization: if a provider outage causes a thousand notifications to fail at roughly the same moment, pure exponential backoff means all thousand compute the same delay and retry at the same moment again, and again, effectively turning into periodic synchronized traffic spikes against a system that's trying to recover. Adding a random jitter term to each computed delay spreads those retries out over a window instead of a point in time, so the aggregate retry traffic is smooth rather than spiky — which is often the difference between a provider recovering cleanly and being knocked back down by the retry wave itself.</div>
+<div class="qa-body">Exponential backoff alone solves the problem of hammering a struggling dependency with immediate retries, but it doesn't solve synchronization: if a provider outage causes a thousand ShopSphere order-shipped notifications to fail at roughly the same moment (say, during a flash-sale spike), pure exponential backoff means all thousand compute the same delay and retry at the same moment again, and again, effectively turning into periodic synchronized traffic spikes against a system that's trying to recover. Adding a random jitter term to each computed delay spreads those retries out over a window instead of a point in time, so the aggregate retry traffic is smooth rather than spiky — which is often the difference between a provider recovering cleanly and being knocked back down by the retry wave itself.</div>
 </details>
 
 <details class="concept-qa">
-<summary>Why does rate limiting have to live in the shared notification service rather than in each upstream producing service?</summary>
-<div class="qa-body">A per-user rate limit is only meaningful if it's checked against a single, shared count of everything sent to that user. If the order service and the marketing service each maintain their own independent rate-limit counters, a user can receive the full quota from each service simultaneously — the limits don't compose, they just multiply. The only way to enforce "this user gets at most 5 SMS per hour, period" is to have exactly one component sit on the send path for every notification to that user and check a single shared counter (a token bucket keyed by user and channel) before any dispatch happens, which is only achievable with a centralized service.</div>
+<summary>Why does rate limiting have to live in the shared notification-service rather than in each upstream producing service?</summary>
+<div class="qa-body">A per-customer rate limit is only meaningful if it's checked against a single, shared count of everything sent to that customer. If order-service and a marketing campaign service each maintain their own independent rate-limit counters, a customer can receive the full quota from each service simultaneously — the limits don't compose, they just multiply. The only way to enforce "this customer gets at most 5 SMS per hour, period" is to have exactly one component sit on the send path for every notification to that customer and check a single shared counter (a token bucket keyed by customer and channel) before any dispatch happens, which is only achievable with a centralized notification-service.</div>
 </details>
 
 <h2>Related Topics</h2>
@@ -273,6 +322,10 @@ if (!rateLimiter.tryAcquire(rateLimitKey(userId, channel))) {
   <div class="related-card" onclick="window.location.hash='/distributed-systems-core'">
     <div class="rc-title">Distributed Systems Core</div>
     <div class="rc-sub">Ordering, delivery guarantees, idempotency fundamentals · the theory this design's correctness rests on</div>
+  </div>
+  <div class="related-card" onclick="window.location.hash='/payment-systems-idempotency'">
+    <div class="rc-title">Payment Systems &amp; Idempotent Transactions</div>
+    <div class="rc-sub">The same idempotency-key mechanics from section 4, applied to payment-service charging a card exactly once despite retries</div>
   </div>
   <div class="related-card" onclick="window.location.hash='/observability-production'">
     <div class="rc-title">Observability in Production</div>
