@@ -1,0 +1,239 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Core Gaps · Bonus</p>
+<h1>Database Schema Migrations: Flyway, Liquibase &amp; Safe Production Rollouts</h1>
+<div class="topic-tags">
+<span class="tag">Flyway</span>
+<span class="tag">Liquibase</span>
+<span class="tag">Schema Versioning</span>
+<span class="tag">Zero-Downtime Migrations</span>
+<span class="tag">Expand-Contract</span>
+<span class="tag">Migration Safety</span>
+<span class="tag">Migration Locking</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Every ShopSphere service that owns a table — <code>order-service</code> owning <code>orders</code>, <code>inventory-service</code> owning <code>inventory_reservations</code>, <code>payment-service</code> owning <code>payments</code> — will eventually need to change its schema while the service is live, deployed as multiple pod replicas, and receiving real checkout traffic. Get this wrong and the failure modes are brutal: an <code>ALTER TABLE</code> that locks the <code>orders</code> table for ninety seconds during a Black Friday flash sale, three replicas each trying to run the same migration at deploy time and corrupting the schema history, or a column rename that makes half of a rolling deployment's pods crash-loop because they're still running code that queries a column that no longer exists. A migration tool doesn't automatically prevent any of this — it gives you a single, ordered, auditable source of truth for what the schema looked like at every point in history, and it's on top of that foundation that the actual safety techniques in this page (locking, expand-contract) get built. This is the layer of discipline that separates "we changed the database and it happened to work" from "we changed the database and we knew in advance exactly which requests would succeed at every second of the rollout."</p>
+</div>
+
+<h2>1. Why hand-run SQL doesn't scale, and what a migration tool actually solves</h2>
+<p>In the smallest possible setup — one developer, one database, no deploys to coordinate — schema changes can be whatever <code>ALTER TABLE</code> or <code>CREATE TABLE</code> statement that developer feels like typing into a SQL client. There's no real problem to solve yet, because there's only one copy of the truth: whatever is currently in that one database <em>is</em> the schema, and the one person who changed it remembers what they did. The moment a second developer, a CI pipeline, a staging environment, or a second production replica enters the picture, this stops being true, and a specific set of problems appears that hand-run SQL has no answer for.</p>
+<p>The first problem is drift: developer A runs a script against their local database to add a <code>discount_code</code> column to ShopSphere's <code>coupons</code> table, developer B never gets that memo and their local database doesn't have it, and three weeks later B's code — tested locally, passing all local tests — fails the moment it's deployed to staging, where the column silently doesn't exist. Nobody committed the SQL anywhere a reviewer could see it; it lived in a terminal history and then in developer A's head. The second problem is ordering: if two schema changes both get run manually against production at different times by different people, there's no guarantee they get applied in the order they were designed for, and a change that assumes an earlier change already happened (say, an index build that assumes a column already exists) can be run against a database where it doesn't.</p>
+<p>The third problem, and the one that becomes existential at any real scale, is environment parity. A production incident is dramatically harder to debug if you can't be sure production's schema is identical to staging's schema, which is identical to what CI tested against, which is identical to what every developer's local database looks like. If those four things have quietly diverged because each was updated by hand at different times by different people running slightly different SQL, "reproduce the bug in staging" stops being a reliable debugging technique.</p>
+<p>What a migration tool like Flyway or Liquibase actually solves is narrower than it might sound, but foundational: it turns the schema's history into a <strong>versioned, ordered, checked-in set of files</strong> that is applied identically, in the same order, by an automated process, in every environment — a developer's laptop, the CI pipeline that runs integration tests, staging, and production all run the exact same migration files in the exact same sequence, and the tool tracks exactly which ones have already been applied to a given database so it never re-runs one or skips one. This is the single source of truth: not "whatever's currently in the database," but "the ordered list of migration files in version control," with the database itself carrying a record of how far along that list it currently is. Everything else in this page — locking, checksums, expand-contract — is built on top of that one foundational guarantee.</p>
+
+<h2>2. How Flyway works mechanically</h2>
+<h3>Versioned migrations and the naming convention</h3>
+<p>Flyway's core unit is a versioned migration file, conventionally plain SQL, named following a strict pattern: <code>V{version}__{description}.sql</code> — for example <code>V1__create_orders_table.sql</code>, <code>V2__add_status_to_orders.sql</code>, <code>V3__create_inventory_reservations_table.sql</code>. The <code>V</code> prefix marks it as a versioned migration, the number before the double underscore is the version (Flyway sorts and applies these in ascending numeric order, not filesystem or alphabetical order, so <code>V10</code> correctly runs after <code>V9</code>), and the description after the double underscore is purely for humans — it shows up in logs and in Flyway's tracking table, but Flyway doesn't parse it for meaning. These files typically live in <code>src/main/resources/db/migration</code> in a Spring Boot project, and Flyway auto-configures itself to scan that classpath location on every application startup when the <code>flyway-core</code> dependency is on the classpath.</p>
+<pre><code>src/main/resources/db/migration/
+  V1__create_orders_table.sql
+  V2__add_status_to_orders.sql
+  V3__create_inventory_reservations_table.sql
+  V4__add_payment_reference_to_orders.sql</code></pre>
+<p>Each file contains plain, ordinary SQL for whatever database Flyway is pointed at — there's no abstraction layer, no XML, no Flyway-specific DSL for the actual schema change itself. <code>V2__add_status_to_orders.sql</code> for ShopSphere's <code>orders</code> table might simply be:</p>
+<pre><code>ALTER TABLE orders ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'CREATED';
+CREATE INDEX idx_orders_status ON orders (status);</code></pre>
+<p>This plain-SQL approach is Flyway's defining design choice: it does not try to be database-agnostic. A migration written for PostgreSQL uses PostgreSQL syntax, and if <code>order-service</code>'s database were ever swapped to MySQL, the migration files would need to be rewritten. In exchange for giving up that portability, Flyway gives you the full, unrestricted power of whatever database you're actually running — window functions, partial indexes, database-specific extensions, anything your actual production database supports — with zero translation layer that could get something subtly wrong.</p>
+
+<h3>The flyway_schema_history table</h3>
+<p>Flyway tracks what has already been applied using a table it creates and manages itself in the target database, by default named <code>flyway_schema_history</code>. Every time Flyway runs, it queries this table to see which versions have already been recorded as successfully applied, computes the set of pending migration files newer than the highest applied version, and applies only those, in order, each in its own transaction (where the underlying database supports transactional DDL). After each migration succeeds, Flyway inserts a new row recording the version, description, a checksum of the file's contents, who applied it, when, and how long it took.</p>
+<pre><code>SELECT installed_rank, version, description, type, checksum, installed_by, installed_on, success
+FROM flyway_schema_history
+ORDER BY installed_rank;
+
+-- installed_rank | version | description                        | checksum   | success
+-- 1              | 1       | create orders table                | 1847263921 | true
+-- 2              | 2       | add status to orders                | -934810234 | true
+-- 3              | 3       | create inventory reservations table | 293841029  | true</code></pre>
+<p>This table is what makes Flyway idempotent across repeated startups and across many replicas: an <code>order-service</code> pod that starts up and finds every migration file already recorded as applied does nothing at all — it just confirms the database is up to date and lets the application proceed. This is also precisely the table that gets consulted by the locking mechanism discussed in section 4, since knowing "what's already applied" and "is someone else applying something right now" are closely related concerns.</p>
+
+<h3>Checksum validation — why editing an already-applied file breaks the build</h3>
+<p>The checksum Flyway stores for each applied migration is not decorative. On every subsequent run, before applying anything new, Flyway recomputes the checksum of every migration file it can see on the classpath and compares it against what's recorded in <code>flyway_schema_history</code> for that version. If they don't match — because someone went back and edited <code>V2__add_status_to_orders.sql</code> after it had already been applied to a database — Flyway fails the startup with a validation error rather than silently proceeding.</p>
+<div class="callout warn">
+<div class="callout-title">This is a deliberate, load-bearing failure, not a bug</div>
+<p>It's tempting to see checksum validation as an annoyance the first time it blocks a deploy — "I just fixed a typo in a comment inside an old migration file, why is the build failing?" But the guarantee it protects is exactly the one this whole page depends on: that the ordered list of migration files in version control is a trustworthy historical record of what happened to the schema, in the order it happened. If migrations that already ran in production could be silently edited afterward, a fresh database built from the same migration files (a new developer's laptop, a rebuilt CI database, a disaster-recovery restore that replays migrations from scratch) would end up with a <em>different</em> schema history than a long-lived production database that applied the original, unedited version — the two databases would silently diverge on exactly the tables the edited migration touched, and nobody would know until something broke. The correct fix for a mistake in an already-applied migration is almost always a new migration file that corrects it (<code>V5__fix_status_default_typo.sql</code>), not an edit to history. Flyway does provide a <code>flyway repair</code> command that recalculates checksums to match the current files, but that command exists for legitimate edge cases (recovering from a failed migration, correcting a checksum mismatch you've manually verified is safe) — using it routinely to silence this validation defeats its purpose.</p>
+</div>
+
+<h3>Baselining an existing database</h3>
+<p>Flyway assumes it owns the schema's history from version 1 onward, which is a problem the moment you try to adopt it against a database that already has years of tables and hand-run <code>ALTER</code> statements behind it with no migration history at all — exactly the situation a team maintaining ShopSphere's original <code>orders</code> table would face if they built it before adopting Flyway. Running Flyway against that database from a cold start would try to execute <code>V1__create_orders_table.sql</code> against a database where the <code>orders</code> table already exists, and fail immediately on a duplicate-table error.</p>
+<p>The <code>baseline</code> operation solves this by telling Flyway "treat this database as already being at version <code>X</code>; don't try to apply anything at or before that version, just start tracking from here forward." Concretely, a team adopting Flyway against ShopSphere's existing production database would run <code>flyway baseline -baselineVersion=1</code> (or configure <code>baselineOnMigrate=true</code> with a target version), which inserts a synthetic "baseline" row into <code>flyway_schema_history</code> marking version 1 as already applied without ever running any SQL for it. From that point on, only migrations numbered higher than the baseline version are considered pending, and the team writes new migration files going forward exactly as if the database had been Flyway-managed since day one — the pre-Flyway history is acknowledged as unmanaged rather than reconstructed.</p>
+
+<h3>Repeatable migrations</h3>
+<p>Alongside versioned migrations, Flyway supports repeatable migrations, named <code>R__{description}.sql</code> (note the <code>R</code> instead of a version number). Unlike versioned migrations, which run exactly once, repeatable migrations are re-applied every time their checksum changes — Flyway re-runs an <code>R__</code> file whenever the file's contents differ from what's recorded for it in <code>flyway_schema_history</code>, and it does so after all pending versioned migrations for that run. This makes them a natural fit for database objects that are more naturally described as "the current definition" than as "a sequence of incremental changes" — most commonly views, stored procedures, and functions. A <code>R__create_order_summary_view.sql</code> defining a reporting view that joins <code>orders</code>, <code>order_items</code>, and <code>payments</code> for ShopSphere's admin dashboard can simply be edited in place whenever the view's definition needs to change, and Flyway detects the change and re-applies the whole <code>CREATE OR REPLACE VIEW</code> statement, rather than requiring a new versioned migration file for every tweak to a view definition.</p>
+
+<h2>3. Liquibase's changelog model, and when teams prefer it</h2>
+<p>Liquibase solves the same fundamental problem as Flyway — a single, ordered, tracked history of schema changes applied identically everywhere — but takes a structurally different approach to describing each change. Instead of a directory of plain-SQL files ordered by a version number in the filename, Liquibase organizes changes into <strong>changesets</strong> inside a <strong>changelog</strong>, and a changeset can be written in XML, YAML, JSON, or plain SQL with special comment annotations, giving Liquibase a more declarative, structured, and — for the non-SQL formats — database-agnostic way of expressing a change.</p>
+<h3>Changesets, unique id + author, and changelogs</h3>
+<p>Every changeset is uniquely identified by the combination of an <code>id</code> and an <code>author</code>, not a filename convention, and Liquibase tracks which (id, author, changelog file) combinations have already run in its own tracking table, <code>DATABASECHANGELOG</code>, analogous to Flyway's <code>flyway_schema_history</code>. Here is a YAML changelog adding a <code>status</code> column to ShopSphere's <code>orders</code> table, the direct Liquibase equivalent of the Flyway <code>V2</code> example above:</p>
+<pre><code>databaseChangeLog:
+  - changeSet:
+      id: add-status-to-orders
+      author: priya.shopsphere
+      changes:
+        - addColumn:
+            tableName: orders
+            columns:
+              - column:
+                  name: status
+                  type: VARCHAR(32)
+                  defaultValue: CREATED
+                  constraints:
+                    nullable: false
+        - createIndex:
+            indexName: idx_orders_status
+            tableName: orders
+            columns:
+              - column:
+                  name: status</code></pre>
+<p>Note what's different here structurally: <code>addColumn</code> and <code>createIndex</code> are Liquibase's own vocabulary, not raw SQL — Liquibase itself translates this declarative description into the correct dialect-specific DDL for whatever database it's connected to at runtime (PostgreSQL, MySQL, Oracle, SQL Server all get different generated SQL from the same changeset). This is the heart of Liquibase's "database-agnostic" pitch: the same changelog can, in principle, run correctly against multiple different database engines, which matters for a vendor shipping software to customers who each bring their own database, or for an organization genuinely running heterogeneous databases across environments. Liquibase also supports plain SQL changesets for cases where the declarative vocabulary can't express what you need, so the two tools aren't as far apart on raw capability as the default examples suggest — the difference is which style is the natural default.</p>
+<h3>Preconditions</h3>
+<p>Liquibase changesets can declare preconditions — assertions that must hold before the changeset is allowed to run, checked at execution time rather than assumed. A precondition guarding the migration above might assert that the <code>status</code> column doesn't already exist, which protects against the same changelog accidentally being pointed at a database that already has this column from some earlier, unmanaged change:</p>
+<pre><code>databaseChangeLog:
+  - changeSet:
+      id: add-status-to-orders
+      author: priya.shopsphere
+      preConditions:
+        - onFail: MARK_RAN
+        - not:
+            - columnExists:
+                tableName: orders
+                columnName: status
+      changes:
+        - addColumn:
+            tableName: orders
+            columns:
+              - column: { name: status, type: VARCHAR(32) }</code></pre>
+<p>The <code>onFail: MARK_RAN</code> policy tells Liquibase what to do if the precondition fails: rather than erroring out, treat the changeset as if it had already run and move on — useful for exactly the baselining-style scenario of reconciling a changelog against a database whose state doesn't perfectly match the changelog's assumed starting point.</p>
+<h3>Rollback blocks</h3>
+<p>The other structural difference from Flyway's default plain-SQL model is that a Liquibase changeset can carry an explicit <code>rollback</code> block, defining exactly how to undo that specific change:</p>
+<pre><code>databaseChangeLog:
+  - changeSet:
+      id: add-status-to-orders
+      author: priya.shopsphere
+      changes:
+        - addColumn:
+            tableName: orders
+            columns:
+              - column: { name: status, type: VARCHAR(32) }
+      rollback:
+        - dropColumn:
+            tableName: orders
+            columnName: status</code></pre>
+<p>Running <code>liquibase rollback-count 1</code> executes that changeset's declared rollback rather than requiring a hand-written "undo" migration to be authored separately and kept in sync by hand. Flyway's open-source edition has no equivalent built-in concept — the idiomatic Flyway answer to "I need to undo a change" is to write a new forward migration that reverses it (exactly the same philosophy as never editing an already-applied file, discussed above), and Flyway Teams (the paid tier) adds "undo migrations" as a distinct feature, but it isn't part of the free, plain-SQL-first model most teams start with.</p>
+<h3>When teams reach for Liquibase over Flyway</h3>
+<p>Teams tend to prefer Liquibase's model when they value the declarative, structured description of a change over raw SQL — because it's more naturally diffable and reviewable in a code review for reviewers who don't want to read dialect-specific DDL, because they run against genuinely multiple database engines and want one changelog to generate correct SQL for each, or because they want rollback logic to live right next to the forward change it undoes rather than as a separately-authored migration. Teams tend to stick with Flyway's model when they run a single database engine in production and see little value in an abstraction layer over SQL they already know how to write directly, when they want the migration file itself to be the literal, auditable record of exactly what ran (no generation step to reason about), or when they simply want less machinery: a directory of numbered <code>.sql</code> files is a smaller mental model than changelogs, changesets, and a vocabulary of declarative change types. Neither tool is "more correct" — they're two different bets about which property (raw SQL transparency vs. structured portability) matters more for a given team's actual constraints.</p>
+
+<h2>4. The concurrency hazard of multiple replicas migrating at once, and how locking solves it</h2>
+<p>A Spring Boot service configured with <code>flyway.enabled=true</code> (or the Liquibase equivalent) runs its pending migrations automatically on application startup, before the application context finishes initializing and starts accepting traffic. This is convenient — the schema is guaranteed correct before any request-handling code runs — but it creates a real hazard the moment a service runs as more than one replica, which every ShopSphere microservice does in production. When a new version of <code>order-service</code> is deployed as, say, six pods via a rolling update, Kubernetes doesn't start them one at a time and wait for each to fully initialize before starting the next; depending on the rollout configuration, several new pods can start essentially simultaneously, and every single one of them runs the exact same migration-on-startup logic against the exact same shared database at exactly the same moment.</p>
+<p>Without any coordination, this is a race: two pods both query <code>flyway_schema_history</code>, both see that <code>V5__add_payment_reference_to_orders.sql</code> is pending, and both begin executing it against the database concurrently. Depending on what the migration actually does, this can manifest as anything from a duplicate-column error (the second pod's <code>ALTER TABLE orders ADD COLUMN payment_reference ...</code> fails because the first pod already added it), to a genuinely corrupted <code>flyway_schema_history</code> table if both pods try to insert their own tracking row for the same version, to a deadlock if the two concurrent DDL statements happen to conflict on internal database locks.</p>
+<p>Both Flyway and Liquibase solve this with an explicit locking mechanism, implemented as a row (or table) in the database itself that acts as a mutual-exclusion lock, so that whichever pod's process gets there first is guaranteed exclusive rights to run pending migrations while every other pod's process blocks and waits.</p>
+<h3>How Flyway's lock works</h3>
+<p>Flyway acquires a lock at the start of a migrate operation, using a locking row inside (or alongside) <code>flyway_schema_history</code> itself, implemented via database-specific mechanisms — for PostgreSQL, Flyway uses advisory locks (<code>pg_advisory_lock</code>), a built-in Postgres primitive for exactly this kind of application-level mutual exclusion that doesn't require locking an actual table's rows. The first pod to call migrate acquires the lock, sees the pending migrations, applies them, records them in <code>flyway_schema_history</code>, and releases the lock. Every other pod that tries to acquire the lock while it's held simply blocks until it's released — and when it finally does acquire the lock and check <code>flyway_schema_history</code> again, it finds that the migrations it thought were pending have already been applied, so it does nothing and proceeds straight to serving traffic. The net effect for a six-pod rolling deploy: exactly one pod actually executes the DDL, and the other five briefly pause at startup waiting their turn before discovering there's nothing left for them to do.</p>
+<h3>How Liquibase's lock works</h3>
+<p>Liquibase's equivalent is an explicit table, <code>DATABASECHANGELOGLOCK</code>, containing effectively a single row with a boolean <code>locked</code> flag, the ID of who holds it, and when it was acquired. Before running any changesets, Liquibase attempts to set that flag; if another instance already holds it, Liquibase polls and waits (up to a configurable timeout) rather than proceeding. This is functionally the same guarantee as Flyway's advisory lock, implemented as an ordinary row-based lock table instead of a database-native advisory-lock primitive, which is part of why it works identically across every database engine Liquibase supports rather than needing a different mechanism per database.</p>
+<div class="callout warn">
+<div class="callout-title">A stuck lock is a real, if rare, operational hazard</div>
+<p>If a pod crashes, is OOM-killed, or is forcibly terminated mid-migration, it's possible — though both tools try hard to avoid it — for the lock to be left in a held state with no process left alive to release it. Every subsequent deploy then hangs at startup waiting for a lock nobody will ever release, and every pod fails its readiness probe simultaneously, which looks alarming precisely because it affects the whole fleet at once rather than one instance. Both tools provide an escape hatch — Flyway's <code>flyway repair</code> and manually deleting the stale <code>DATABASECHANGELOGLOCK</code> row for Liquibase — but the right response during an actual incident is to first confirm no migration is genuinely still in flight (check the database's own lock or process views, not just the tool's tracking table) before forcibly clearing it, since clearing a lock that's protecting a real in-progress <code>ALTER TABLE</code> reintroduces the exact race condition the lock exists to prevent.</p>
+</div>
+
+<h2>5. Expand-contract: the pattern for changing a live, high-traffic table safely</h2>
+<p>Locking solves the problem of multiple replicas stepping on each other while <em>applying</em> a migration. It says nothing about whether the migration itself, once applied, is safe for a table that is being read and written by live traffic the entire time the deploy is rolling out. That's a separate problem, and it's the one expand-contract (also called "parallel change") is designed to solve.</p>
+<p>The core insight is the same one that underlies safe rolling deployments generally: during a rolling update, old code and new code are both live and both hitting the same database simultaneously, for the entire duration of the rollout — which for a fleet of ShopSphere <code>order-service</code> pods could be several minutes. Any schema change that only one of "old code" or "new code" can tolerate is unsafe to deploy as a single step, no matter how quickly the migration itself executes, because the danger isn't the migration's runtime — it's the window where the schema has already changed but not every running instance has caught up to code that expects the change.</p>
+<p>Expand-contract breaks what looks like one conceptual schema change into three (or more) independently-safe phases, each shipped as its own deployment:</p>
+<h3>Expand</h3>
+<p>Add the new column, table, or index in a way that is purely additive and touches nothing the currently-running old code depends on. A nullable column that nothing reads yet, or a brand-new table, cannot break code that has no idea it exists. This phase can be deployed and left running indefinitely without any application code change at all — it's safe by construction because "old code ignores a column it's never heard of" requires no special handling on the old code's part.</p>
+<h3>Migrate: dual-write and backfill</h3>
+<p>Once the new shape exists, deploy application code that writes to <em>both</em> the old and new shape on every new write, while backfilling existing rows that predate this change via a background job (a scheduled batch job is the natural fit here — see <a href="#/batch-processing-scheduled-jobs">batch-processing-scheduled-jobs</a> for how ShopSphere structures exactly this kind of bounded, resumable background work). This is the phase that has to tolerate the messiest reality: during the rolling deployment of this dual-write code itself, some pods are dual-writing and some are still only single-writing the old shape, so any row could legitimately be missing the new shape's data at read time purely because of which pod happened to handle its write. Reads during this phase should still be served from the old, fully-populated shape, precisely because the new shape isn't guaranteed complete yet.</p>
+<h3>Cut over, then contract</h3>
+<p>Only after the backfill is confirmed complete and every live instance has been dual-writing for long enough that no row could plausibly be missing the new data, deploy code that reads from the new shape as authoritative — still dual-writing for a safety margin in case a rollback is needed. Only in a later, separate deployment, once you're certain no running instance and no plausible rollback target still expects the old shape, do you actually drop the old column or table and stop dual-writing. This final step is the "contract" — and it is deliberately the very last thing that happens, long after the risky part of the change is already done and proven safe.</p>
+<div class="callout">
+<div class="callout-title">Why "just do it in one ALTER TABLE" feels appealing and is exactly the trap</div>
+<p>A single <code>ALTER TABLE orders RENAME COLUMN shipping_address TO shipping_address_v2</code> is one line, executes in milliseconds on a small table, and looks obviously simpler than four separate deployments. The problem isn't the migration's execution time — it's that the instant it runs, every pod still serving traffic with the old code, which queries <code>SELECT shipping_address FROM orders</code>, starts throwing errors on every single request that touches that column, for however long it takes the rolling deployment to finish replacing every old pod. On a large, high-traffic table, there's a second, independent danger even without a rename: a naive <code>ALTER TABLE</code> that requires rewriting every existing row (adding a column with a non-null default on some database engines/versions, for instance) can hold a table-level lock for the duration of that rewrite, and on a table with tens of millions of <code>Order</code> rows, that rewrite can take minutes — during which every query against <code>orders</code>, from every pod, old or new code alike, blocks waiting for the lock. Expand-contract avoids both failure modes by construction: no single step is ever both "instant to write" and "safe for every version of code that could be running at that moment."</p>
+</div>
+
+<h2>6. Concrete unsafe-vs-safe patterns</h2>
+<h3>Adding a required column</h3>
+<p>The unsafe version adds a <code>NOT NULL</code> column with no default directly to a populated table:</p>
+<pre><code>-- UNSAFE: fails immediately against existing rows, and even if it
+-- somehow ran, old code doing INSERT INTO orders (...) with the old
+-- column list would violate the NOT NULL constraint on every insert.
+ALTER TABLE orders ADD COLUMN loyalty_tier VARCHAR(16) NOT NULL;</code></pre>
+<p>This fails two different ways depending on when it bites. If the table already has rows, most databases reject the statement outright because existing rows have no value to put in the new required column. If you dodge that by only running it against an empty table, it still breaks the very next moment any currently-running old-code pod executes an <code>INSERT</code> without knowing this column exists — the old code's insert statement doesn't mention <code>loyalty_tier</code> at all, and a <code>NOT NULL</code> column with no default has nothing to fall back to.</p>
+<p>The safe, expand-contract version splits this into the phases from section 5:</p>
+<pre><code>-- Step 1 (expand): nullable, no default requirement forced on anyone
+ALTER TABLE orders ADD COLUMN loyalty_tier VARCHAR(16) NULL;
+
+-- Step 2 (migrate): deploy code that always sets loyalty_tier on new
+-- writes, and backfill existing rows in batches, e.g.:
+UPDATE orders SET loyalty_tier = 'STANDARD'
+WHERE loyalty_tier IS NULL AND id BETWEEN ? AND ?;   -- chunked, not one giant UPDATE
+
+-- Step 3 (contract): only once every row is confirmed populated
+ALTER TABLE orders ALTER COLUMN loyalty_tier SET NOT NULL;</code></pre>
+<p>Notice the backfill itself is chunked by an id range rather than a single unbounded <code>UPDATE orders SET loyalty_tier = 'STANDARD' WHERE loyalty_tier IS NULL</code> — an unbounded update against a large table has the same table-lock and long-transaction hazard as a naive <code>ALTER TABLE</code>, for the same underlying reason: touching every row of a huge table in one statement holds locks and generates a huge amount of write-ahead-log/undo activity for as long as it runs. Chunking the backfill into batches with brief pauses between them keeps each individual transaction short, so it competes fairly with live checkout traffic instead of blocking it for the backfill's entire duration.</p>
+<h3>Renaming a column</h3>
+<p>The unsafe version is the direct rename shown in the callout above: it's atomic from the database's point of view but instantaneously incompatible with any code still using the old name, which during a rolling deployment is guaranteed to be true for at least part of the rollout.</p>
+<p>The safe version treats a rename as "add new, dual-write, drop old" — structurally identical to the expand-contract sequence, because a rename really is just a special case of changing shape:</p>
+<pre><code>-- Step 1 (expand): add the new column alongside the old one
+ALTER TABLE orders ADD COLUMN shipping_address_v2 VARCHAR(500) NULL;
+
+-- Step 2 (migrate): deploy code that writes both columns on every
+-- write, reads from the OLD column (still authoritative), and
+-- backfill existing rows from old -> new in chunks
+
+-- Step 3: deploy code that reads from shipping_address_v2 instead,
+-- still writing both for one more deploy cycle as a safety margin
+
+-- Step 4 (contract): once confident, stop writing the old column
+-- and drop it in its own, later migration
+ALTER TABLE orders DROP COLUMN shipping_address;</code></pre>
+<p>The number of deployments is the honest cost of this safety: four separate deploys to accomplish what a single <code>RENAME COLUMN</code> does in one. But each of those four deploys is individually safe for every version of code that could plausibly be running against the database at that moment, which a single-step rename simply is not, regardless of how fast the statement itself executes.</p>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>What single guarantee does a migration tool provide that hand-run SQL scripts cannot, no matter how disciplined the team is?</summary>
+<div class="qa-body">A migration tool guarantees that every environment — a developer's laptop, CI, staging, production — applies the exact same ordered sequence of schema changes, tracked in a table the tool itself maintains, so that "what schema does this environment have" is always answerable by "however far along the checked-in migration file list it's gotten," not by asking whoever last touched it what they remember doing. Hand-run SQL can be just as correct in any single instance, but it has no built-in mechanism for ensuring every environment converges on the same history, which is what actually causes the drift and ordering bugs migration tools eliminate — the discipline required to avoid drift by hand doesn't scale past the point where more than one person or more than one environment is involved.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does Flyway fail the build if you edit an already-applied migration file, rather than just re-applying the edited version?</summary>
+<div class="qa-body">If Flyway silently re-applied an edited migration, or even just ignored the edit and moved on, the migration file in version control would no longer be a trustworthy record of what actually happened to any given database's history — a database that applied the original version and a fresh database that applies the edited version would diverge, invisibly, on exactly the part that got edited. The checksum check exists specifically to catch this before it causes a silent divergence: if you genuinely need to fix a mistake in a migration that's already run somewhere, the correct move is a new migration that corrects it, which preserves the property that the ordered file list is an accurate, append-only history rather than a mutable "current best guess."</div>
+</details>
+
+<details class="concept-qa">
+<summary>Concretely, what goes wrong if two order-service pods both start up at the same moment during a deploy and both try to run the same pending Flyway migration?</summary>
+<div class="qa-body">Both pods query flyway_schema_history, both see the same migration as pending, and both begin executing its DDL against the shared database concurrently — which can manifest as a duplicate-object error if the migration creates something (a column, an index) that only one of them can succeed at creating, a corrupted tracking table if both try to insert their own history row for the same version, or a database-level deadlock if the two concurrent DDL statements happen to need conflicting internal locks. This is exactly why Flyway and Liquibase both implement an explicit locking mechanism — a Postgres advisory lock for Flyway, a DATABASECHANGELOGLOCK row for Liquibase — so that only the first pod to reach the lock actually executes the migration, while the rest block, then find nothing left to do once they get their turn.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is expand-contract necessary even when the migration itself executes in milliseconds?</summary>
+<div class="qa-body">The danger expand-contract protects against isn't the migration's execution time, it's the coexistence window created by a rolling deployment — for however long the rollout takes to replace every old pod with the new version, both old and new code are simultaneously live and hitting the same database. If the schema change makes the database incompatible with whichever version of code isn't expecting it (a renamed column the old code still queries by its old name, a NOT NULL column the old code's INSERT doesn't populate), every request routed to a pod running the "wrong" version fails, regardless of how fast the ALTER statement itself ran. Expand-contract's entire purpose is ensuring that at every single deployment boundary, both the code that's about to be running and the code that's about to be replaced can both tolerate the schema exactly as it exists at that moment.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does the dual-write phase of expand-contract need to keep reading from the old column as authoritative, rather than switching reads to the new column right away?</summary>
+<div class="qa-body">During the dual-write rollout itself, the fleet is a mix of pods that have and haven't yet been updated to dual-write, and a background backfill job for existing rows is running concurrently and hasn't necessarily finished — so at any given moment, a nontrivial number of rows can legitimately have an empty or stale value in the new column purely because of which pod happened to handle that row's most recent write, or because the backfill hasn't reached that row yet. Reading from the new column as authoritative during this window would return wrong or missing data for those rows. Only after the backfill is confirmed complete and every live pod has been dual-writing long enough that no row could plausibly be missing the new data is it safe to flip reads over — and even then, the pattern keeps dual-writing for one more deploy cycle as a rollback safety margin before finally dropping the old column.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What's the actual difference between how Flyway and Liquibase describe a schema change, and why would a team choose one over the other?</summary>
+<div class="qa-body">Flyway's default and idiomatic unit of change is a plain SQL file executed directly against whatever database it's connected to — no abstraction layer, full access to database-specific syntax, but tied to that database's dialect. Liquibase's changeset model describes a change in a structured, often database-agnostic vocabulary (addColumn, createIndex, and so on) that Liquibase itself translates into the correct dialect-specific SQL at runtime, plus first-class support for preconditions (assertions checked before a changeset runs) and per-changeset rollback blocks. Teams running a single database engine who want the migration file to be the literal, transparent record of exactly what SQL ran tend to prefer Flyway's directness; teams that need one changelog to work correctly against genuinely different database engines, or who want declarative rollback logic living next to the forward change, tend to prefer Liquibase's more structured model. Neither is more "correct" — they're different bets about whether raw SQL transparency or structured portability matters more.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What is baselining, and why can't a team just start running V1 migrations against a database that predates Flyway adoption?</summary>
+<div class="qa-body">Flyway assumes, by default, that it owns the schema's entire history starting from version 1, so pointing it at a database that already has years of hand-built tables and no flyway_schema_history entries would make it try to run a V1__create_orders_table.sql migration against a database where that table already exists, failing immediately on a duplicate-object error. Baselining tells Flyway to treat the existing database as already being at some specified version without ever executing any SQL for it — it inserts a synthetic baseline row into flyway_schema_history marking that version as done, and from that point forward only migrations numbered higher than the baseline are considered pending. The pre-adoption history is acknowledged as unmanaged rather than retroactively reconstructed, and the team writes all new changes as ordinary migrations going forward.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is it dangerous to manually clear a stuck migration lock during an incident without first checking whether a migration is actually still running?</summary>
+<div class="qa-body">The lock exists specifically to prevent two processes from concurrently running DDL against the same schema, and forcibly clearing it while a migration genuinely is still in progress (as opposed to a lock left behind by a crashed process) reintroduces exactly that race condition — a second pod, freed to proceed, could start executing the same or a different migration concurrently with the one that's actually still running, risking the same duplicate-object errors, corrupted tracking-table state, or database-level deadlocks that the lock was designed to prevent in the first place. The safe response during an incident is to first confirm, using the database's own process or lock views (not just the migration tool's own state), that nothing is actually still executing before clearing the lock — the stuck-lock scenario is real but should be treated as the less likely explanation until actively ruled out.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/ci-cd-deployment'"><div class="rc-title">CI/CD &amp; Deployment Strategies</div><div class="rc-sub">This page is the mechanics underneath that page's deployment-sequencing treatment of DB migrations</div></div>
+<div class="related-card" onclick="window.location.hash='/jpa-hibernate'"><div class="rc-title">JPA &amp; Hibernate</div><div class="rc-sub">hibernate.hbm2ddl.auto should never be relied on in production — migrations are the real mechanism for schema changes</div></div>
+<div class="related-card" onclick="window.location.hash='/database-architecture'"><div class="rc-title">Database Architecture</div><div class="rc-sub">Sharding and replication both multiply the operational complexity of running a migration correctly</div></div>
+<div class="related-card" onclick="window.location.hash='/observability-production'"><div class="rc-title">Observability in Production</div><div class="rc-sub">Migration locks and long-running ALTER statements are exactly the kind of thing you need alerting on during a deploy</div></div>
+</div>

@@ -28,7 +28,7 @@
 ├── Networking — "how do requests get from A to B, and what can reach what?"
 │     ├── VPC / Subnets   — isolated network, public vs. private     (section 3)
 │     ├── Security Groups / NACLs — firewall layers                  (section 3)
-│     ├── ELB (ALB/NLB)   — traffic distribution across healthy hosts (section 7)
+│     ├── ELB (ALB/NLB)   — traffic distribution across healthy hosts (section 8)
 │     └── CloudFront      — CDN: edge caching in front of the storefront (section 5)
 │
 ├── Storage — "where do bytes at rest live, and how are they addressed?"
@@ -37,8 +37,8 @@
 │     └── S3              — object storage (product images, backups)  (section 4)
 │
 ├── Database — "where does structured, queryable data live?"
-│     ├── RDS             — managed relational (ShopSphere's orders DB) (section 4)
-│     ├── DynamoDB        — managed NoSQL, partition-key sharded        (section 4)
+│     ├── RDS             — managed relational (ShopSphere's orders DB) (section 6)
+│     ├── DynamoDB        — managed NoSQL, partition-key sharded        (section 6)
 │     └── ElastiCache     — managed in-memory cache (Redis/Memcached)   (section 5)
 │
 ├── Messaging / Eventing — "how do services hand off work without a direct call?"
@@ -46,7 +46,7 @@
 │     └── SNS             — pub/sub fan-out (pairs with SQS)            (section 5)
 │
 └── Identity — "who or what is making this request, and what can it do?"
-      └── IAM             — users, roles, policies                     (section 6)</code></pre>
+      └── IAM             — users, roles, policies                     (section 7)</code></pre>
 <p>Notice that this taxonomy is not AWS-specific vocabulary bolted onto familiar ideas — it's the same five questions every distributed system answers regardless of provider, which is why <a href="#/docker-kubernetes">docker-kubernetes</a>, <a href="#/database-architecture">database-architecture</a>, and <a href="#/hld-basics-scaling">hld-basics-scaling</a> keep resurfacing throughout this page: AWS is one concrete, opinionated implementation of concepts that exist independent of it.</p>
 
 <h2>2. The Compute Spectrum: EC2, Containers, and Lambda</h2>
@@ -207,6 +207,106 @@ sqsClient.deleteMessage(inventoryQueueUrl, msg.getReceiptHandle()); // ack: only
 <p>A theme runs through every service covered above: a meaningful fraction of what would otherwise be custom-built resilience and observability tooling comes bundled into the managed service by default. RDS Multi-AZ gives ShopSphere's orders database cross-availability-zone failover without writing failover orchestration yourself. An ALB's health checks give you the failure-detection half of a circuit breaker pattern at the infrastructure layer, before a single line of application-level resilience code runs. CloudWatch automatically collects CPU, memory (with the agent installed), request counts, and latency metrics for most of these services without instrumenting your own code — including SQS queue depth, which is precisely the signal that would tell ShopSphere's on-call engineer that <code>inventory-service</code> is falling behind during a flash sale before customers notice delayed order confirmations. ASGs replacing unhealthy instances is a form of automatic self-healing that, self-hosted, you'd have to build with your own supervisor process and health-check loop.</p>
 <p>This doesn't eliminate the need for the practices in <a href="#/observability-production">observability-production</a> — you still need application-level tracing, structured logs, and business-level metrics that no infrastructure service can infer on your behalf — but it does mean part of the resilience and observability burden is already handled at the platform layer, and recognizing which part is the difference between duplicating effort and correctly layering your own instrumentation on top of what the platform already gives you for free.</p>
 
+<h2>10. File Uploads and Object Storage in a Real Spring Boot Application</h2>
+<p>Section 4 covered S3 as a storage service in the abstract — a bucket, a key, a consistency model. What that treatment left out is the part every backend engineer actually has to build: the request path that gets a Seller's file from their browser into S3 without falling over under load, without letting a malicious or oversized upload take down the application server, and without leaving the Seller in the dark when part of a bulk upload fails. ShopSphere has two concrete upload surfaces — a Seller uploading a single product image when listing a <code>Product</code>, and a Seller uploading a CSV file of hundreds or thousands of <code>Product</code> rows at once to list an entire catalog in bulk — and each surfaces a different set of problems worth understanding from first principles rather than copying a code sample.</p>
+
+<h3>Accepting a MultipartFile, and why limits are not optional</h3>
+<p>Spring Boot's model for a file included in an HTTP request is <code>MultipartFile</code>: the framework parses a <code>multipart/form-data</code> request body and hands your controller method an object wrapping the uploaded bytes, the original filename, the declared content type, and the size, without you hand-parsing MIME boundaries yourself.</p>
+<pre><code>@PostMapping("/products/{productId}/image")
+public ResponseEntity&lt;Void&gt; uploadProductImage(
+        @PathVariable String productId,
+        @RequestParam("file") MultipartFile file) {
+
+    if (file.isEmpty()) {
+        throw new BadRequestException("Uploaded file is empty");
+    }
+    if (file.getSize() > MAX_IMAGE_BYTES) {
+        throw new PayloadTooLargeException("Image exceeds 5MB limit");
+    }
+    String contentType = file.getContentType();
+    if (!ALLOWED_IMAGE_TYPES.contains(contentType)) {
+        throw new UnsupportedMediaTypeException("Only JPEG/PNG/WebP images are accepted");
+    }
+
+    productImageService.store(productId, file);
+    return ResponseEntity.accepted().build();
+}</code></pre>
+<p>The <code>isEmpty</code>, size, and content-type checks in that handler are not defensive boilerplate you could skip in a trusted environment — they are the entire reason a public upload endpoint doesn't become an outage waiting to happen. Without an explicit size limit, nothing stops a Seller (accidentally, or a malicious actor deliberately) from uploading a multi-gigabyte file to an endpoint intended for a product photo, and Spring Boot's own <code>spring.servlet.multipart.max-file-size</code> and <code>max-request-size</code> properties exist precisely so the framework rejects an oversized request before it ever reaches your handler code, rather than relying on every controller to remember to check <code>file.getSize()</code> itself.</p>
+<pre><code># application.yml
+spring:
+  servlet:
+    multipart:
+      max-file-size: 5MB
+      max-request-size: 5MB
+      file-size-threshold: 2MB   # requests larger than this get written to disk while parsing, not held fully in memory</code></pre>
+<p>The content-type check matters for a subtler reason than "reject the wrong file extension": <code>MultipartFile.getContentType()</code> reflects the <code>Content-Type</code> header the client declared for that part of the request, which a client fully controls and can set to anything — a file with a <code>.exe</code> payload can arrive declaring itself <code>image/jpeg</code>. A content-type allowlist checked against the declared header is a reasonable first filter to reject obviously-wrong uploads cheaply, but it is not a security boundary by itself; the same category of "never trust what the client claims about its own payload" reasoning that shows up in input validation generally applies here, and a production system layers a second check — sniffing the actual file's magic bytes, or running the object through a virus/malware scan after it lands in S3 — behind the cheap header check rather than trusting it alone.</p>
+
+<h3>Streaming large uploads instead of buffering them in memory</h3>
+<p>The naive version of a file upload handler reads the entire <code>MultipartFile</code> into a byte array (<code>file.getBytes()</code>) and then writes that array wherever it needs to go. For a 200KB product thumbnail, that's harmless. For ShopSphere's bulk CSV import — a Seller uploading a catalog file that could plausibly be tens or hundreds of megabytes — that pattern means every concurrent upload holds its entire file in JVM heap simultaneously, and a handful of concurrent large uploads is enough to exhaust the heap and trigger <code>OutOfMemoryError</code>s that have nothing to do with how much traffic the rest of the application is serving. This is the same class of problem covered in <a href="#/api-design-versioning">api-design-versioning</a> whenever a request body's size is unbounded relative to available memory: the fix is to never materialize the whole payload at once, and instead process it as a stream.</p>
+<p><code>MultipartFile</code> exposes <code>getInputStream()</code> for exactly this reason, and both the write path (into S3) and the read path (parsing a CSV) have streaming equivalents that never hold the full file in memory:</p>
+<pre><code>// Streaming an upload straight through to S3 instead of buffering it in a byte array
+public void store(String productId, MultipartFile file) throws IOException {
+    PutObjectRequest request = PutObjectRequest.builder()
+        .bucket("shopsphere-product-images")
+        .key("products/" + productId + "/main.jpg")
+        .contentType(file.getContentType())
+        .contentLength(file.getSize())   // known up front from the multipart part, enables the SDK to stream
+        .build();
+
+    try (InputStream in = file.getInputStream()) {
+        s3Client.putObject(request, RequestBody.fromInputStream(in, file.getSize()));
+    }
+}</code></pre>
+<p>The mechanical difference is that <code>getInputStream()</code> gives you a handle the SDK reads from in fixed-size chunks as it writes to S3, so at any instant only a small buffer's worth of the file is resident in memory — the same principle behind streaming a large HTTP response body instead of building the whole response string first, and the same reason a database driver streams a large result set via a cursor rather than materializing every row into a <code>List</code> at once. A bulk CSV import benefits even more directly: parsing a CSV line-by-line off the stream (most CSV libraries support this natively) means ShopSphere can validate and process the 50,000th row of a Seller's product feed without ever having held rows 1 through 49,999 in memory at the same time.</p>
+
+<h3>Offloading upload traffic with presigned URLs</h3>
+<p>Even a perfectly streamed upload still costs something structural: every byte of the file passes through the application server's network interface and CPU on its way to S3, which means upload traffic competes for exactly the same compute capacity that's serving the rest of ShopSphere's API — checkout requests, catalog reads, everything else <code>catalog-service</code>'s ECS tasks are doing. During a period when many Sellers are uploading product images or bulk catalog files simultaneously, that upload traffic can degrade latency for unrelated requests hitting the same fleet, purely because the app server is acting as a relay for bytes it has no reason to touch.</p>
+<p>The fix is to remove the application server from the data path entirely and have the browser upload directly to S3. A presigned URL is how: <code>catalog-service</code> asks the S3 SDK to generate a URL that embeds a short-lived, cryptographically signed authorization to perform one specific action (a <code>PUT</code> to one specific key) without the caller needing any AWS credentials of their own — the signature itself, computed using <code>catalog-service</code>'s own IAM permissions, is the credential, and it's scoped to expire after a few minutes.</p>
+<pre><code>// catalog-service: issue a short-lived, single-use upload URL instead of accepting the file itself
+@PostMapping("/products/{productId}/image-upload-url")
+public UploadUrlResponse getUploadUrl(@PathVariable String productId) {
+    PutObjectRequest objectRequest = PutObjectRequest.builder()
+        .bucket("shopsphere-product-images")
+        .key("products/" + productId + "/main.jpg")
+        .contentType("image/jpeg")
+        .build();
+
+    PresignedPutObjectRequest presigned = s3Presigner.presignPutObject(r -> r
+        .signatureDuration(Duration.ofMinutes(5))
+        .putObjectRequest(objectRequest));
+
+    return new UploadUrlResponse(presigned.url().toString(), Instant.now().plus(Duration.ofMinutes(5)));
+}</code></pre>
+<p>The browser then <code>PUT</code>s the file bytes directly to that URL — S3 sees the request, not <code>catalog-service</code> — and the application server's only involvement is the small, cheap request to mint the URL beforehand and, typically, a follow-up notification (either the browser calling back to say "upload finished," or an S3 <code>ObjectCreated</code> event triggering a Lambda, as section 2 describes) to record that the image exists once it's actually there. This is the same "keep the expensive/high-volume path off the machines that also serve latency-sensitive requests" reasoning behind pushing static assets to CloudFront in section 5 — the app server's job becomes issuing authorization, not moving bytes.</p>
+
+<h3>Bulk import: a Seller uploading a CSV of Product listings</h3>
+<p>A bulk catalog import combines every concern above with one additional problem specific to processing many records from one file: the file as a whole can be well-formed while individual rows inside it are not, and the Seller needs to find out exactly which rows failed and why — not just "the import failed," and not silently dropping bad rows without telling anyone. A CSV import that either accepts the entire file or rejects it wholesale on the first bad row is unusable at any real scale, since one typo in a price column on row 4,000 of a 5,000-row file shouldn't cost the Seller the other 3,999 valid listings.</p>
+<p>The pattern that handles this well processes the file as a stream (for the memory reasons above), validates each row independently, and accumulates per-row results rather than throwing on the first failure:</p>
+<pre><code>public ImportSummary importProductCsv(String sellerId, InputStream csvStream) {
+    List&lt;RowError&gt; errors = new ArrayList&lt;&gt;();
+    int successCount = 0;
+    int rowNumber = 0;
+
+    try (CSVParser parser = CSVParser.parse(csvStream, StandardCharsets.UTF_8, CSVFormat.DEFAULT.withFirstRecordAsHeader())) {
+        for (CSVRecord record : parser) {
+            rowNumber++;
+            try {
+                ProductDraft draft = parseAndValidate(record);   // throws ValidationException with a specific field/reason
+                productService.createFromDraft(sellerId, draft);
+                successCount++;
+            } catch (ValidationException e) {
+                errors.add(new RowError(rowNumber, record.get("sku"), e.getMessage()));
+                // deliberately continue to the next row instead of aborting the whole import
+            }
+        }
+    }
+
+    return new ImportSummary(rowNumber, successCount, errors);
+    // e.g. { totalRows: 5000, succeeded: 4986, failed: 14,
+    //        errors: [{ row: 4001, sku: "SKU-8841", reason: "price must be positive" }, ...] }
+}</code></pre>
+<p>Reporting that <code>ImportSummary</code> back to the Seller — as a downloadable "here are the 14 rows that failed and why" file, or inline in the UI — is what makes partial failure actionable instead of a black box; the alternative, an all-or-nothing transaction wrapping the entire import, would mean a single bad row among five thousand good ones costs the Seller their whole catalog listing attempt, which is a worse failure mode than accepting the 4,986 valid rows and clearly reporting the 14 that need fixing. For an import large enough that processing it synchronously within one HTTP request would itself risk a timeout, the same pattern from section 5 applies: the upload endpoint accepts the file (ideally via a presigned URL straight to S3, as above), publishes a message to process it, and a worker consumes that message asynchronously — the same "accept the trigger fast, do the actual work as a decoupled consumer" shape as <code>OrderPlaced</code>, just applied to a bulk operation instead of a single order.</p>
+
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
 
 <details class="concept-qa">
@@ -252,6 +352,26 @@ sqsClient.deleteMessage(inventoryQueueUrl, msg.getReceiptHandle()); // ack: only
 <details class="concept-qa">
 <summary>ShopSphere puts CloudFront in front of its S3 product-image bucket. A Seller replaces a product's main photo, but shoppers in a different region still see the old image for several minutes. Is this a bug?</summary>
 <div class="qa-body">No — it's the direct, expected consequence of what a CDN is for. CloudFront's entire value proposition is serving content from an edge location physically close to the requester instead of round-tripping to the origin (S3) on every request, and it can only do that by caching a copy of the object at each edge location for some Time-To-Live window. When the Seller overwrites the S3 object, S3 itself reflects the new image immediately (strong read-after-write consistency, as covered elsewhere on this page) — but any CloudFront edge location that already cached the old image under that URL will keep serving its cached copy until that TTL expires, because CloudFront has no way to know the origin changed unless it's told. The fix is to explicitly invalidate the CloudFront cache for that specific path when a Seller updates a product image (an API call ShopSphere's catalog-service would make right after the S3 write completes), or to design around it entirely by versioning image URLs (e.g., appending the image's own content hash or an updated-at timestamp to the key), so a changed image is automatically a new URL/cache entry rather than a stale cache hit on the old one. This is the exact same cache-invalidation problem that appears in any cache-aside design, just instantiated at the CDN layer instead of the application layer.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is checking MultipartFile.getContentType() against an allowlist not sufficient as a security control by itself?</summary>
+<div class="qa-body">Because <code>getContentType()</code> simply returns whatever <code>Content-Type</code> value the client declared for that part of the multipart request — it's metadata the caller supplies about their own payload, not something the server independently verifies. A client can attach any file and label it <code>image/jpeg</code> regardless of what the bytes actually are, in the same way a caller can send any value in any other request header. An allowlist check against that declared value is still worth doing, because it cheaply rejects obviously-wrong or accidental uploads before any real processing happens, but it's a convenience filter, not a trust boundary. A production system that actually needs to guarantee "this is really an image" has to verify the content itself — sniffing the file's magic bytes/signature after receiving it, or routing it through a dedicated scanning step — because the one property you can never assume is that a client-supplied label describes the client-supplied bytes honestly.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does calling MultipartFile.getBytes() on every upload risk an OutOfMemoryError that has nothing to do with overall traffic volume, and how does streaming avoid it?</summary>
+<div class="qa-body"><code>getBytes()</code> reads the entire uploaded file into a single byte array held in JVM heap for the duration of processing, so the memory cost of one upload is proportional to that file's size, not to request rate. A handful of concurrent large uploads — ShopSphere's bulk CSV catalog imports are the realistic case, not a small product thumbnail — can each hold tens of megabytes in heap simultaneously, and it takes surprisingly few of them at once to exhaust available memory, independent of how lightly loaded the rest of the application otherwise is. Streaming via <code>getInputStream()</code> avoids this because the consumer (the S3 SDK writing the object, or a CSV parser reading records) pulls the data through in small, fixed-size chunks: at any instant only a small buffer's worth of the file is resident in memory, so the memory footprint of processing a 5MB file and a 500MB file is nearly identical. This is the same reason a database driver streams a large result set through a cursor instead of materializing every row into a list before returning.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What problem do presigned S3 URLs actually solve, and why isn't "just stream the upload through the app server efficiently" enough?</summary>
+<div class="qa-body">Streaming avoids the memory-exhaustion problem, but it doesn't remove the app server from the data path — every byte of the file still passes through the application server's network interface and CPU on its way to S3, because the server is acting as a relay. That relay traffic competes for the same compute capacity handling every other request on that fleet, so a burst of concurrent uploads (many Sellers uploading product images, or several large bulk-import CSVs, around the same time) can degrade latency for completely unrelated requests, like checkout or catalog reads, hitting the same instances. A presigned URL solves a structurally different problem: it lets the app server issue a short-lived, cryptographically signed authorization for one specific S3 operation without ever handling the file's bytes itself, so the browser uploads directly to S3 and the app server's only cost is the cheap request to mint that URL. This is the same "keep the expensive path off the machines serving latency-sensitive requests" principle behind CloudFront in front of the storefront — different mechanism, same underlying goal of not letting bulk data movement contend with request-serving capacity.</div>
+</details>
+
+<details class="concept-qa">
+<summary>A Seller's 5,000-row product CSV import fails on row 4,001 due to a bad price value. Why is aborting the entire import on that single row the wrong design, and what should happen instead?</summary>
+<div class="qa-body">Wrapping the whole import in a single all-or-nothing operation means one malformed row costs the Seller all 4,999 otherwise-valid rows, which is a disproportionate failure mode for what is, in effect, one bad data point out of thousands — the Seller has to find and fix that one row and then re-upload and reprocess everything, including the rows that were already fine. The better pattern treats each row as an independent unit of validation and processing: iterate the file as a stream, attempt each row, and on failure record which row failed and why instead of throwing and unwinding the whole import, then continue to the next row. The result reported back to the Seller is a summary — how many rows succeeded, how many failed, and the specific row number/identifier and reason for each failure — which turns a bulk operation's partial failure into something actionable rather than an opaque "import failed" message. This generalizes beyond CSV imports: any batch operation over independent units of work should isolate failures per unit and report them individually, rather than letting one failure erase the results of everything else in the batch.</div>
 </details>
 
 <h2>Related Topics</h2>

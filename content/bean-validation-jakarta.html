@@ -1,0 +1,282 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Core Gaps · Spring / Bonus</p>
+<h1>Bean Validation Deep-Dive: Custom Validators &amp; Validation Groups</h1>
+<div class="topic-tags">
+<span class="tag">Jakarta Validation</span>
+<span class="tag">@Valid vs @Validated</span>
+<span class="tag">Custom Constraints</span>
+<span class="tag">Validation Groups</span>
+<span class="tag">Cascading Validation</span>
+<span class="tag">Error Responses</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Almost every ShopSphere endpoint that accepts a request body — a Seller creating a <code>Product</code>, a Customer submitting an <code>Order</code>, an Admin editing a <code>Coupon</code> — has to answer the same question before any business logic runs: is this input even shaped correctly? Bean Validation is the standard, declarative answer to that question, and it's deceptively easy to use shallowly (slap <code>@NotNull</code> on everything) while missing the parts that actually come up in real systems and in interviews: the difference between <code>@Valid</code> and <code>@Validated</code>, how to reuse one DTO across flows with different required fields, how to validate nested collections, and how to turn a pile of constraint violations into an error response a frontend can actually render field-by-field. Getting this layer right means a <code>ProductDto</code> with a blank <code>name</code> or a negative <code>price</code> never reaches <code>ProductService</code> at all — it dies at the controller boundary, before a single line of business logic executes.</p>
+</div>
+
+<h2>1. The Jakarta Bean Validation Model and Where It Runs</h2>
+<p>Jakarta Bean Validation (the specification formerly known as JSR 380, and before that Bean Validation 2.0/1.1 under the javax namespace) defines a standard way to declare constraints on a Java object's fields as annotations, and a standard engine — a <code>Validator</code> — that walks an object graph, evaluates every constraint it finds, and reports the ones that fail as a set of <code>ConstraintViolation</code> objects. Spring does not implement this specification itself; <code>spring-boot-starter-validation</code> pulls in Hibernate Validator, which is the reference implementation almost everyone actually runs in production. Spring's contribution is the integration layer that wires this engine into the places where validation is actually useful: method arguments, request bodies, and JPA entities before persistence.</p>
+<p>The mechanism that matters most for a REST API is what happens when a controller method parameter is annotated <code>@Valid</code>:</p>
+<pre><code>@PostMapping("/sellers/{sellerId}/products")
+public ResponseEntity&lt;ProductDto&gt; createProduct(
+        @PathVariable Long sellerId,
+        @Valid @RequestBody ProductDto productDto) {
+    Product saved = productService.create(sellerId, productDto);
+    return ResponseEntity.status(HttpStatus.CREATED).body(toDto(saved));
+}</code></pre>
+<p>This looks like a small annotation on a parameter, but it changes when validation actually happens. Spring MVC resolves controller method arguments through a chain of <code>HandlerMethodArgumentResolver</code> implementations — one resolver per kind of parameter (<code>@PathVariable</code>, <code>@RequestParam</code>, <code>@RequestBody</code>, and so on). For a <code>@RequestBody</code> parameter, the resolver is <code>RequestResponseBodyMethodProcessor</code>: it reads the raw HTTP body, deserializes it into a <code>ProductDto</code> using Jackson, and — critically — before returning that object to the framework to be passed into your controller method, it checks whether the parameter is annotated <code>@Valid</code> (or any annotation meta-annotated with Spring's <code>@Validated</code> stereotype). If it is, the resolver invokes the Bean Validation <code>Validator</code> against the freshly deserialized object right there, inside argument resolution.</p>
+<p>This ordering is the single most important fact in this entire topic: validation happens as part of turning the HTTP request into a Java method call, strictly before the controller method body starts executing. If any constraint fails, the argument resolver never returns control to your controller method at all — it throws <code>MethodArgumentNotValidException</code> immediately, which propagates up and is handled (by default, or by your own <code>@ControllerAdvice</code>, covered in section 6) before <code>createProduct</code>'s first line ever runs. A common misconception is that validation is "middleware" running in a filter or interceptor ahead of the DispatcherServlet; it isn't — it's woven directly into the argument-resolution step of the MVC handler pipeline, which is why it only fires for arguments actually annotated for validation, and why the validated object your controller method receives is guaranteed to already satisfy every declared constraint by the time you touch it.</p>
+<div class="callout">
+<div class="callout-title">Deserialization happens before validation, not instead of it</div>
+<p>Jackson and Bean Validation solve different problems and run in sequence. If the JSON body has <code>"price": "not-a-number"</code> against a <code>BigDecimal price</code> field, that fails during Jackson deserialization itself — you get an <code>HttpMessageNotReadableException</code>, not a constraint violation, because the object never successfully comes into existence for the validator to inspect. Bean Validation only ever runs against an object that already deserialized successfully; it checks values that exist, not whether the JSON was syntactically or type-compatible with the target class.</p>
+</div>
+
+<h2>2. Built-In Constraints and the @NotNull / @NotEmpty / @NotBlank Distinction</h2>
+<p>Jakarta Validation ships a standard library of constraint annotations covering the overwhelming majority of everyday field validation, and Hibernate Validator adds several more on top. The ones you'll reach for constantly on a ShopSphere <code>ProductDto</code>, <code>OrderRequest</code>, or <code>CustomerRegistrationDto</code>:</p>
+<pre><code>public class ProductDto {
+
+    @NotBlank(message = "Product name is required")
+    @Size(min = 2, max = 120)
+    private String name;
+
+    @NotNull(message = "Price is required")
+    @Min(value = 0, message = "Price cannot be negative")
+    private BigDecimal price;
+
+    @Email
+    private String supportContactEmail;
+
+    @Pattern(regexp = "^[A-Z0-9]{6,12}$", message = "SKU must be 6-12 uppercase alphanumeric characters")
+    private String sku;
+
+    @Min(0)
+    @Max(100000)
+    private Integer stockQuantity;
+}</code></pre>
+<p><code>@NotNull</code> only rejects a literal Java <code>null</code>. An empty string <code>""</code> or a string of pure whitespace <code>"   "</code> both pass <code>@NotNull</code> just fine, because neither is <code>null</code> — they're perfectly valid, non-null <code>String</code> references that happen to carry no useful content. This is exactly the gap that trips people up when they reach for <code>@NotNull</code> on a <code>String</code> field expecting it to reject blank input.</p>
+<p><code>@NotEmpty</code> is stricter: in addition to rejecting <code>null</code>, it also rejects a value whose <em>size</em> is zero — for a <code>String</code>, that means rejecting <code>""</code>, and for a <code>Collection</code>, <code>Map</code>, or array, it means rejecting an empty one (e.g. an <code>Order</code> DTO's <code>List&lt;OrderLineItemDto&gt; items</code> being an empty list). But <code>@NotEmpty</code> still doesn't look at whitespace-only content — a <code>String</code> of <code>"   "</code> has a nonzero length, so it passes <code>@NotEmpty</code> even though there's nothing meaningful in it.</p>
+<p><code>@NotBlank</code> is the strictest of the three, and it only applies to <code>CharSequence</code> types (<code>String</code> and friends), not collections. It rejects <code>null</code>, rejects the empty string, and additionally trims the value and rejects it if what's left is empty — so <code>"   "</code> fails <code>@NotBlank</code> where it would pass both <code>@NotNull</code> and <code>@NotEmpty</code>. For any human-entered text field where whitespace-only input is meaningless — a Seller's <code>Product</code> name, a Customer's shipping <code>addressLine1</code>, a Coupon's <code>code</code> — <code>@NotBlank</code> is almost always the constraint you actually want, and reaching for <code>@NotNull</code> out of habit on a <code>String</code> field is a common, subtle bug: it silently accepts <code>"   "</code> as a valid product name.</p>
+<table>
+<tr><th>Constraint</th><th>Rejects <code>null</code>?</th><th>Rejects empty (<code>""</code> / empty collection)?</th><th>Rejects whitespace-only?</th><th>Applies to</th></tr>
+<tr><td><code>@NotNull</code></td><td>Yes</td><td>No</td><td>No</td><td>Any type</td></tr>
+<tr><td><code>@NotEmpty</code></td><td>Yes</td><td>Yes</td><td>No</td><td><code>CharSequence</code>, <code>Collection</code>, <code>Map</code>, array</td></tr>
+<tr><td><code>@NotBlank</code></td><td>Yes</td><td>Yes</td><td>Yes</td><td><code>CharSequence</code> only</td></tr>
+</table>
+<p>A few other built-ins worth knowing precisely rather than by vibe: <code>@Size(min, max)</code> constrains the length of a <code>String</code> or the size of a collection/array/map (not the numeric value — a common confusion with <code>@Min</code>/<code>@Max</code>, which constrain the numeric value of a number-typed field, not its string length). <code>@Email</code> checks a reasonably permissive email-shaped pattern — it is deliberately not a full RFC 5322 validator, so treat it as a sanity filter, not a guarantee of deliverability. <code>@Pattern(regexp = ...)</code> is the escape hatch for anything with a specific textual shape, such as a ShopSphere coupon code format or a SKU convention. All of these are <em>field-shape</em> checks — they know nothing about your database or any other field's value, which is precisely the limitation the next section exists to lift.</p>
+
+<h2>3. Writing a Custom Constraint End to End</h2>
+<p>Built-in constraints validate a single field in isolation using information available on the spot. Real business rules are frequently not like that — "this coupon code must exist and currently be active" or "the requested quantity must not exceed available inventory" both require querying something outside the object itself. Bean Validation supports this cleanly through custom constraints: an annotation plus a <code>ConstraintValidator</code> implementation that Spring manages as a bean, meaning it can autowire a repository or service exactly like any other Spring-managed component.</p>
+<h3>3.1 The annotation: <code>@ValidCouponCode</code></h3>
+<p>A custom constraint is defined as a Java annotation with three mandatory elements — <code>message</code>, <code>groups</code>, and <code>payload</code> — plus a <code>@Constraint</code> meta-annotation pointing at the validator class that will implement the logic:</p>
+<pre><code>@Target({ ElementType.FIELD, ElementType.PARAMETER })
+@Retention(RetentionPolicy.RUNTIME)
+@Constraint(validatedBy = CouponCodeValidator.class)
+public @interface ValidCouponCode {
+
+    String message() default "Coupon code is invalid or no longer active";
+
+    Class&lt;?&gt;[] groups() default {};
+
+    Class&lt;? extends Payload&gt;[] payload() default {};
+}</code></pre>
+<p>The three elements aren't optional boilerplate — Bean Validation's engine reflectively inspects every constraint annotation for exactly these members and will fail to even start up if they're missing. <code>message()</code> supplies the default error text (overridable per usage, and resolvable against a message bundle for i18n). <code>groups()</code> is what makes this constraint participate in the validation-groups mechanism covered in section 4 — by default an empty array, meaning "the default group." <code>payload()</code> exists to attach arbitrary metadata classes to a violation (commonly used to carry a severity level) — most applications never populate it but must still declare it for the annotation to be spec-compliant.</p>
+<h3>3.2 The validator: querying a service safely</h3>
+<pre><code>@Component
+public class CouponCodeValidator implements ConstraintValidator&lt;ValidCouponCode, String&gt; {
+
+    private final CouponRepository couponRepository;
+
+    public CouponCodeValidator(CouponRepository couponRepository) {
+        this.couponRepository = couponRepository;
+    }
+
+    @Override
+    public boolean isValid(String code, ConstraintValidatorContext context) {
+        if (code == null) {
+            return true; // let @NotBlank/@NotNull own the null/blank case; this validator only checks existence+status
+        }
+        return couponRepository.findByCode(code)
+                .map(Coupon::isActive)
+                .orElse(false);
+    }
+}</code></pre>
+<p><code>ConstraintValidator&lt;A, T&gt;</code> takes two type parameters: the annotation it implements (<code>ValidCouponCode</code>) and the Java type it can validate (<code>String</code>, here). Because <code>@Component</code> makes this class a Spring bean, <code>@Autowired</code>/constructor injection of <code>CouponRepository</code> works exactly as it would in any other Spring bean — Spring's own <code>LocalValidatorFactoryBean</code> is configured (automatically, by Spring Boot's auto-configuration) to use a <code>SpringConstraintValidatorFactory</code> that resolves validator instances through the application context instead of via a bare no-arg reflective instantiation. Without that integration, a <code>ConstraintValidator</code> would only ever be able to run pure, self-contained logic; with it, a validator can consult a database, a cache, or another service.</p>
+<p>Notice the null-handling convention: a <code>ConstraintValidator</code> should almost always treat <code>null</code> as valid and delegate the "is this required at all" question to <code>@NotNull</code>/<code>@NotBlank</code> stacked alongside it. This keeps each constraint doing exactly one job and composes cleanly — you can make the coupon code optional in one context and required in another just by adding or removing <code>@NotBlank</code>, without touching <code>CouponCodeValidator</code> at all.</p>
+<h3>3.3 A second example with a real side-effect trap: <code>@SufficientInventory</code></h3>
+<p>A more ShopSphere-specific case: validating that a requested order quantity does not exceed what <code>inventory-service</code> currently has on hand for a SKU. This looks like the same pattern as above, but it has a sharper trade-off worth calling out explicitly.</p>
+<pre><code>@Component
+public class SufficientInventoryValidator
+        implements ConstraintValidator&lt;SufficientInventory, OrderLineItemDto&gt; {
+
+    private final InventoryClient inventoryClient;
+
+    public SufficientInventoryValidator(InventoryClient inventoryClient) {
+        this.inventoryClient = inventoryClient;
+    }
+
+    @Override
+    public boolean isValid(OrderLineItemDto item, ConstraintValidatorContext context) {
+        if (item == null || item.getSku() == null || item.getQuantity() == null) {
+            return true; // other constraints own null/required checks
+        }
+        int available = inventoryClient.getAvailableQuantity(item.getSku()); // remote call
+        return item.getQuantity() &lt;= available;
+    }
+}</code></pre>
+<div class="callout warn">
+<div class="callout-title">A ConstraintValidator that calls out to another service is a read, not a reservation</div>
+<p>This validator makes a network call to <code>inventory-service</code> on every validation pass, which has two consequences worth being deliberate about. First, performance: if this constraint is applied to every <code>OrderLineItemDto</code> inside a cascaded <code>List&lt;OrderLineItemDto&gt;</code> (section 5), an order with twenty line items triggers twenty remote calls purely for request validation, before checkout logic has even started — this needs to be a fast, well-isolated lookup (ideally backed by a cache), not a call that itself does business work. Second, and more subtle: because request validation and the actual checkout can be separated in time by network latency, a quantity that was available at validation time can be sold to a different Customer microseconds later — bean validation can only ever check inventory was sufficient at the moment it looked, not guarantee it stays sufficient. The two problems compose into one rule: keep <code>ConstraintValidator</code> logic to reads with no side effects, and never treat "validation passed" as a substitute for an atomic, transactional inventory reservation inside <code>OrderService</code> itself. A validator that decremented stock as a side effect of validating would be actively dangerous — a request that fails validation for an unrelated reason (say, a missing shipping address) could still have silently consumed inventory.</p>
+</div>
+
+<h2>4. Validation Groups: Reusing One DTO Across Different Flows</h2>
+<p>A recurring, very real design pressure: the same <code>ProductDto</code> shape is used both when a Seller first creates a <code>Product</code> (where <code>sku</code> must be present, because the catalog needs it immediately) and when an Admin later edits pricing or description on an existing product (where <code>sku</code> is already fixed and shouldn't be required in the request body at all). Slapping <code>@NotBlank</code> on <code>sku</code> unconditionally makes the Admin-update endpoint reject perfectly valid requests that omit it; leaving it off entirely means the Seller-creation endpoint silently accepts products with no SKU.</p>
+<p>Validation groups solve this by attaching each constraint to one or more named "groups" and then telling a given validation call which group(s) it cares about. Groups are just marker interfaces — empty, with no methods, existing purely as distinct types to tag constraints and validation calls with:</p>
+<pre><code>public interface SellerCreate {}
+public interface AdminUpdate {}</code></pre>
+<pre><code>public class ProductDto {
+
+    @NotBlank(message = "Product name is required", groups = { SellerCreate.class, AdminUpdate.class })
+    private String name;
+
+    @NotBlank(message = "SKU is required at creation", groups = SellerCreate.class)
+    @Pattern(regexp = "^[A-Z0-9]{6,12}$", groups = { SellerCreate.class, AdminUpdate.class })
+    private String sku;
+
+    @NotNull(groups = { SellerCreate.class, AdminUpdate.class })
+    @Min(value = 0, groups = { SellerCreate.class, AdminUpdate.class })
+    private BigDecimal price;
+}</code></pre>
+<p>Here, <code>sku</code>'s <code>@NotBlank</code> only belongs to the <code>SellerCreate</code> group, while its <code>@Pattern</code> (if a SKU is present at all, it must still be well-formed) belongs to both groups. <code>name</code> and <code>price</code> are required in both flows. A constraint with no explicit <code>groups</code> attribute implicitly belongs to the built-in <code>Default</code> group — worth remembering, because it means ungrouped constraints and constraints explicitly grouped are easy to accidentally mix in ways that don't validate what you think.</p>
+<p>The controller side is where <code>@Valid</code> and Spring's own <code>@Validated</code> diverge in a way that trips people up in interviews: <strong>plain <code>@Valid</code>, from the Jakarta specification, only ever validates against the <code>Default</code> group — it has no mechanism for specifying a different one.</strong> To validate against a specific group, you need Spring's own <code>@Validated</code> annotation (from <code>org.springframework.validation.annotation.Validated</code>, not to be confused with Jakarta's <code>@Valid</code>), which accepts a <code>value()</code> of one or more group classes:</p>
+<pre><code>@PostMapping("/sellers/{sellerId}/products")
+public ResponseEntity&lt;ProductDto&gt; createProduct(
+        @PathVariable Long sellerId,
+        @Validated(SellerCreate.class) @RequestBody ProductDto productDto) {
+    // sku is required here
+}
+
+@PutMapping("/admin/products/{productId}")
+public ResponseEntity&lt;ProductDto&gt; updateProduct(
+        @PathVariable Long productId,
+        @Validated(AdminUpdate.class) @RequestBody ProductDto productDto) {
+    // sku is not required here, but if present, must still match the pattern
+}</code></pre>
+<p>Mechanically this works because the exact same <code>RequestResponseBodyMethodProcessor</code> argument-resolution step from section 1 looks for either <code>@Valid</code> or any annotation meta-annotated with Spring's <code>@Validated</code>, and — if it's <code>@Validated</code> — reads the group classes off it and passes them through to the underlying <code>Validator.validate(object, groups...)</code> call. <code>@Valid</code> simply has no attribute to carry that information, because it's defined by the Jakarta spec, which doesn't mandate any Spring-specific integration; Spring's own annotation is a superset built specifically to plug that gap for MVC use.</p>
+<div class="callout tip">
+<div class="callout-title">Groups don't have to be single-purpose markers</div>
+<p>A group interface can extend other group interfaces to compose ("<code>OnCreate extends Default, SellerCreate</code>"), and a single <code>@Validated</code> call can list multiple groups (<code>@Validated({SellerCreate.class, Default.class})</code>) when you want both the grouped and the ungrouped constraints checked together. The main discipline worth keeping is to not let group interfaces multiply uncontrolled — if a DTO needs more than two or three flows, it's often a signal that flow-specific request DTOs (a distinct <code>ProductCreateRequest</code> versus <code>ProductUpdateRequest</code>) would be a clearer design than groups pushed further and further.</p>
+</div>
+
+<h2>5. Cascading Validation into Nested Objects and Collections</h2>
+<p>Constraints declared directly on a DTO's own fields only ever look at that DTO's immediate, top-level fields. An <code>OrderRequestDto</code> that contains a <code>ShippingAddressDto</code> field, or a <code>List&lt;OrderLineItemDto&gt;</code>, needs an explicit signal to tell the validator to descend into those nested objects — otherwise a completely empty or malformed <code>ShippingAddressDto</code> passes validation cleanly, because the validator never looked inside it.</p>
+<p>That signal is <code>@Valid</code> placed directly on the nested field (not to be confused with <code>@Valid</code> on a controller parameter from section 1 — same annotation, different position, related but distinct effect):</p>
+<pre><code>public class OrderRequestDto {
+
+    @NotNull
+    @Valid
+    private ShippingAddressDto shippingAddress;
+
+    @NotEmpty(message = "Order must contain at least one line item")
+    @Valid
+    private List&lt;OrderLineItemDto&gt; items;
+}
+
+public class ShippingAddressDto {
+    @NotBlank private String addressLine1;
+    @NotBlank private String city;
+    @Pattern(regexp = "^[0-9]{5,6}$") private String postalCode;
+}
+
+public class OrderLineItemDto {
+    @NotBlank private String sku;
+    @Min(1) private Integer quantity;
+}</code></pre>
+<p>With <code>@Valid</code> on the <code>shippingAddress</code> field, once the top-level <code>OrderRequestDto</code> validates its own fields, the engine recurses into <code>shippingAddress</code> and validates <code>ShippingAddressDto</code>'s own constraints too, contributing its own <code>ConstraintViolation</code>s (with a nested property path like <code>shippingAddress.postalCode</code>) into the same overall violation set. The same is true for <code>@Valid</code> on the <code>List&lt;OrderLineItemDto&gt; items</code> field: Bean Validation understands collection cascading, meaning it validates <em>every element</em> of the list individually, not just whether the list itself is non-null or non-empty. An <code>Order</code> with five line items where the third one has <code>quantity: -1</code> produces a violation whose property path looks like <code>items[2].quantity</code>, correctly identifying exactly which element in the collection failed — this is what makes it practical to build a precise, per-item error response rather than a vague "something in your order is wrong."</p>
+<p>It's worth being precise about what <code>@NotEmpty</code> and <code>@Valid</code> are each doing on the <code>items</code> field, because they're independent and easy to conflate: <code>@NotEmpty</code> checks that the list itself isn't null or zero-length; <code>@Valid</code> separately triggers cascading into whatever elements do exist. Removing <code>@Valid</code> while keeping <code>@NotEmpty</code> would still correctly reject a missing or empty order, but would silently stop catching a line item with an invalid SKU or a negative quantity — the list-level check and the element-level check are two different, composable guarantees, and dropping the cascade annotation is a quiet, easy-to-miss way to regress coverage on nested data.</p>
+
+<h2>6. From ConstraintViolations to a Structured API Error Response</h2>
+<p>When <code>@Valid</code>/<code>@Validated</code> validation on a <code>@RequestBody</code> parameter fails, Spring MVC does not hand you a raw set of <code>ConstraintViolation</code> objects to sort out yourself — it packages them into a specific exception, <code>MethodArgumentNotValidException</code>, which carries a Spring <code>BindingResult</code> (or, more precisely, the <code>Errors</code>/<code>BindingResult</code> that <code>WebDataBinder</code> produced during validation) containing one <code>FieldError</code> per failed field-level constraint and one <code>ObjectError</code> per failed class-level constraint. Left unhandled, Spring Boot's default error handling turns this into a generic <code>400 Bad Request</code> with a fairly unhelpful, uniform JSON body — technically correct, but useless for a frontend that wants to show "Price cannot be negative" directly under the price input rather than a single opaque message.</p>
+<p>The fix is a <code>@ControllerAdvice</code> (or <code>@RestControllerAdvice</code>, which combines <code>@ControllerAdvice</code> with <code>@ResponseBody</code>) with an <code>@ExceptionHandler</code> specifically for <code>MethodArgumentNotValidException</code>, translating it into whatever structured error contract the rest of the API already uses:</p>
+<pre><code>@RestControllerAdvice
+public class ApiExceptionHandler {
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ApiErrorResponse handleValidation(MethodArgumentNotValidException ex) {
+        List&lt;FieldErrorDetail&gt; fieldErrors = ex.getBindingResult().getFieldErrors().stream()
+                .map(fe -&gt; new FieldErrorDetail(
+                        fe.getField(),          // e.g. "items[2].quantity"
+                        fe.getDefaultMessage(), // e.g. "must be greater than or equal to 1"
+                        fe.getRejectedValue()))
+                .toList();
+
+        return new ApiErrorResponse(
+                "VALIDATION_FAILED",
+                "One or more fields are invalid",
+                fieldErrors,
+                Instant.now());
+    }
+}
+
+record FieldErrorDetail(String field, String message, Object rejectedValue) {}
+
+record ApiErrorResponse(
+        String errorCode,
+        String message,
+        List&lt;FieldErrorDetail&gt; fieldErrors,
+        Instant timestamp) {}</code></pre>
+<p><code>fe.getField()</code> is what carries the nested/indexed property path built during cascading validation (section 5) — <code>"items[2].quantity"</code> rather than a bare <code>"quantity"</code> — which is exactly what lets a frontend map a single violation back to a specific row in a dynamically rendered order form. This handler is one instance of a broader, general pattern: an API should have <em>one</em> coherent error-response shape (an error code, a human-readable message, optionally a list of field-level details, a timestamp, maybe a trace ID) used consistently across every kind of failure — validation errors, not-found errors, conflict errors — not a different ad hoc JSON shape per exception type. Bean Validation's <code>MethodArgumentNotValidException</code> is just one specific, very common source feeding into that same general contract; a well-designed <code>@ControllerAdvice</code> will have sibling <code>@ExceptionHandler</code> methods for things like <code>ProductNotFoundException</code> or <code>InsufficientInventoryException</code> that populate the same <code>ApiErrorResponse</code> shape with different <code>errorCode</code> values, so a client only ever has to learn one envelope.</p>
+<div class="callout warn">
+<div class="callout-title">Method-level validation on non-controller beans throws a different exception</div>
+<p>Everything above concerns <code>@RequestBody</code> arguments validated at MVC's argument-resolution layer, which is Spring-specific and throws <code>MethodArgumentNotValidException</code>. If instead you put <code>@Validated</code> at the class level on a plain <code>@Service</code> bean and annotate its method parameters directly with constraints (e.g. <code>@NotNull</code> on a service method argument, enforced via AOP the same way <code>@Transactional</code> is — see the proxy mechanics in Spring's core container model), a violation instead throws <code>ConstraintViolationException</code>, the plain Jakarta exception, not the Spring MVC one. A <code>@ControllerAdvice</code> that only handles <code>MethodArgumentNotValidException</code> will not catch this — it needs its own separate <code>@ExceptionHandler(ConstraintViolationException.class)</code> if service-layer method validation is in play anywhere in the call path, which is an easy gap to leave unhandled in a codebase that also does field-level request validation.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>At exactly what point in a Spring MVC request does @Valid on a @RequestBody parameter trigger, and why does that timing matter?</summary>
+<div class="qa-body">It triggers inside <code>RequestResponseBodyMethodProcessor</code>, the <code>HandlerMethodArgumentResolver</code> responsible for <code>@RequestBody</code> parameters, immediately after Jackson deserializes the JSON into a Java object and before that object is handed to the controller method as an argument. This means validation happens during argument resolution, not inside the controller body, and a failure short-circuits the whole call — <code>MethodArgumentNotValidException</code> is thrown from within argument resolution itself, so the controller method's first line never executes. Anyone reading a controller method that takes a <code>@Valid @RequestBody ProductDto</code> can therefore assume, correctly, that every declared constraint has already passed by the time execution reaches that method.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why doesn't @NotNull catch a blank string, and when would you actually want @NotEmpty over @NotBlank?</summary>
+<div class="qa-body"><code>@NotNull</code> only checks Java reference identity against <code>null</code> — an empty string or a whitespace-only string is a perfectly valid non-null object reference, so both pass. <code>@NotBlank</code> additionally trims the string and rejects what's left if it's empty, making it the right choice for almost any human-entered text field. <code>@NotEmpty</code> sits in between and is most useful on collections rather than strings — for example, requiring a ShopSphere <code>Order</code>'s <code>items</code> list to contain at least one element, where "blank after trimming" doesn't even apply, but "zero elements" clearly should be rejected.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why should a custom ConstraintValidator that queries a service (like checking inventory) avoid having side effects?</summary>
+<div class="qa-body">A <code>ConstraintValidator</code> can run multiple times, in contexts you don't fully control — once per cascaded collection element, potentially re-run if validation is triggered again, and always strictly before the business logic that would actually act on the result. If the validator itself mutated state (for example, decrementing inventory as a side effect of checking it), a request that ultimately fails for an unrelated reason — a missing shipping address, say — could still have caused that mutation, leaving the system in a corrupted state despite the overall request being rejected. Validators should be treated as pure reads: check a condition and report true or false, and leave any actual state change (like an atomic inventory reservation) to the transactional business logic that runs only after validation has already succeeded.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What's the concrete difference between @Valid and Spring's @Validated, and why does it matter for validation groups?</summary>
+<div class="qa-body"><code>@Valid</code> is defined by the Jakarta Bean Validation specification and carries no ability to specify which validation group to check against — it always validates against the implicit <code>Default</code> group. Spring's own <code>@Validated</code> annotation is a superset built specifically to plug that gap for Spring-managed code: it accepts a <code>value()</code> of one or more group marker interfaces, and Spring's MVC argument-resolution layer reads those groups off the annotation and passes them into the underlying <code>Validator.validate(object, groups...)</code> call. This is why reusing one DTO like <code>ProductDto</code> across a Seller-creation flow (where SKU is required) and an Admin-update flow (where it isn't) requires <code>@Validated(SellerCreate.class)</code> and <code>@Validated(AdminUpdate.class)</code> on the respective controller parameters — plain <code>@Valid</code> has no attribute to express that distinction at all.</div>
+</details>
+
+<details class="concept-qa">
+<summary>How does @Valid on a nested field or a List field actually trigger cascading, and what happens if you forget it on a collection?</summary>
+<div class="qa-body">Bean Validation only inspects the fields it's told to inspect. Placing <code>@Valid</code> directly on a nested object field (like <code>ShippingAddressDto shippingAddress</code>) or a collection field (like <code>List&lt;OrderLineItemDto&gt; items</code>) tells the validator to recurse into that value and validate its own declared constraints, contributing additional violations under a nested or indexed property path such as <code>items[2].quantity</code>. If you annotate the collection field with <code>@NotEmpty</code> but omit <code>@Valid</code>, the validator will correctly reject a null or empty list, but it will never look inside the elements that do exist — a line item with a negative quantity or a blank SKU would pass validation completely undetected, because the two annotations check genuinely independent things: list-level shape versus element-level content.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What does a @ControllerAdvice handler for MethodArgumentNotValidException actually need to extract to build a useful field-level error response?</summary>
+<div class="qa-body">The exception carries a <code>BindingResult</code> with a list of <code>FieldError</code> objects, one per failed field-level constraint (plus <code>ObjectError</code>s for any class-level constraints). Each <code>FieldError</code> exposes the property path via <code>getField()</code> — which correctly reflects nested and indexed paths like <code>shippingAddress.postalCode</code> or <code>items[2].quantity</code> when cascading validation was involved — along with <code>getDefaultMessage()</code> for the human-readable reason and <code>getRejectedValue()</code> for what was actually submitted. Mapping this list into a project-wide error-response DTO (an error code, a message, and this list of field details) is what turns a generic 400 into something a frontend can bind directly to individual form fields.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why can't a single @ControllerAdvice that only handles MethodArgumentNotValidException catch every validation failure in an application?</summary>
+<div class="qa-body">MethodArgumentNotValidException is specific to Spring MVC's handling of <code>@Valid</code>/<code>@Validated</code> on <code>@RequestBody</code> (and similar) controller arguments. If method-level validation is applied elsewhere — for instance, a <code>@Validated</code> class-level annotation on a plain <code>@Service</code> bean with constrained method parameters, enforced via an AOP proxy in the same style as <code>@Transactional</code> — a violation there throws the plain Jakarta <code>ConstraintViolationException</code> instead, because that code path never goes through Spring MVC's argument resolution at all. A complete error-handling setup needs a separate <code>@ExceptionHandler(ConstraintViolationException.class)</code> alongside the one for <code>MethodArgumentNotValidException</code> if service-layer method validation is used anywhere in the call graph.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is a custom ConstraintValidator able to autowire a Spring bean like a repository, when a plain Bean Validation implementation couldn't?</summary>
+<div class="qa-body">Bean Validation's specification only requires that a <code>ConstraintValidator</code> be instantiable, typically via a no-argument constructor through reflection, which gives it no way to receive external dependencies. Spring Boot's auto-configuration replaces the default validator-instantiation strategy with a <code>SpringConstraintValidatorFactory</code>, which resolves each <code>ConstraintValidator</code> through the application context rather than via bare reflection — meaning a validator annotated <code>@Component</code> is a genuine Spring-managed bean, eligible for constructor injection of a <code>CouponRepository</code>, an <code>InventoryClient</code>, or any other collaborator exactly as it would be for a controller or service bean.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/spring-core-mechanics'"><div class="rc-title">Spring Core Mechanics: IoC, DI, AOP, Auto-Config</div><div class="rc-sub">Custom ConstraintValidators are Spring-managed beans and can autowire dependencies just like any other component</div></div>
+<div class="related-card" onclick="window.location.hash='/api-design-versioning'"><div class="rc-title">API Design: REST Maturity, OpenAPI, Versioning, Idempotency</div><div class="rc-sub">A validation error response is one specific, common case of the general error-response contract discussed there</div></div>
+<div class="related-card" onclick="window.location.hash='/security-hardening-owasp'"><div class="rc-title">Security Hardening: Input Validation, Secrets Management &amp; OWASP Top 10</div><div class="rc-sub">Bean Validation is the mechanism, not the whole story — it enforces shape/format, while injection defenses require additional layers</div></div>
+<div class="related-card" onclick="window.location.hash='/spring-security'"><div class="rc-title">Spring Security: Authentication &amp; Authorization</div><div class="rc-sub">Method-level validation can be combined with method-level security checks on the same service methods</div></div>
+</div>

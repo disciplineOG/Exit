@@ -225,6 +225,73 @@ public void onOrderEvent(OrderShippedEvent event) {
   <p>A subtle failure mode: even with <code>enable.idempotence=true</code> and a transactional producer, if your consumer processes a message, produces a side effect (say, calls a third-party API to charge a card), and then crashes before committing its Kafka offset, the message will be redelivered and the side effect repeated — the card gets charged twice. Kafka's exactly-once machinery protects Kafka-to-Kafka pipelines; it does nothing for a consumer's external side effects unless that consumer independently makes those side effects idempotent.</p>
 </div>
 
+<h2>8. Schema Evolution: Avro, Protobuf, and the Schema Registry</h2>
+<p>Every example so far has glossed over one detail: <code>OrderPlaced</code> events are payloads with a shape, and that shape is not static. Over the life of a real system, <code>order-service</code> will need to add a <code>discountCode</code> field, rename something, or drop a field nobody uses — while <code>notification-service</code> and <code>inventory-service</code> are running old code that has never heard of the new field, and while a redeploy of one consumer cannot be coordinated with a redeploy of the producer or every other consumer. Getting this wrong produces one of the worst production symptoms in an event-driven system: a consumer that has been running fine for months suddenly throws a deserialization exception on a perfectly valid message, because the payload's shape changed underneath it with no warning.</p>
+
+<h3>Why JSON's convenience becomes a liability at scale</h3>
+<p>The <code>OrderPlaced</code> payloads shown earlier in this page were implicitly JSON, and JSON has a real advantage: it's self-describing and human-readable, so nothing needs to agree on a schema in advance. But that same looseness is exactly the problem in a large system — nothing stops <code>order-service</code> from renaming <code>customerId</code> to <code>customer_id</code>, or changing an amount field from a number to a string, and nothing will catch that mistake until a consumer throws a <code>NullPointerException</code> or a parsing error in production, potentially hours after the bad deploy went out. JSON also has no compact binary encoding, which matters once you're pushing tens of thousands of events per second through a topic. Real Kafka deployments at this scale almost universally replace raw JSON with a binary format that has an explicit, machine-checkable schema: <strong>Avro</strong> (Kafka's traditional default, originating from the Hadoop ecosystem) or <strong>Protobuf</strong> (Google's format, increasingly common because many organizations already use it for gRPC). Both encode a message as compact binary bytes plus a reference to a schema that describes the field names, types, and structure — the schema itself is not repeated in every message, which is both a size win and, as covered below, the reason a central registry has to exist at all.</p>
+
+<h3>The Schema Registry: a shared source of truth for "what shape is this topic's data"</h3>
+<p>If the schema isn't embedded in every message, both the producer and the consumer need to agree on where to find it. A <strong>Schema Registry</strong> (Confluent's is the most widely deployed, but the idea is generic) is a separate service that stores every version of every schema ever registered for a topic, and assigns each version a numeric schema ID. When a producer serializes a message, its Avro/Protobuf serializer first registers (or looks up, if unchanged) the current schema with the registry, gets back a schema ID, and writes that small ID — not the whole schema — as a prefix on the binary payload before publishing to Kafka. When a consumer deserializes a message, its deserializer reads that ID prefix, fetches the matching schema from the registry (caching it locally after the first lookup), and uses it to correctly decode the bytes into a typed object.</p>
+<pre><code>Producer side (order-service):
+  1. Build OrderPlaced object (with new discountCode field)
+  2. Avro serializer checks Schema Registry: "is this exact schema
+     already registered for subject 'order.events-value'?"
+  3. Registry returns schema ID 7 (new version) or registers it if new
+  4. Message written to Kafka as: [magic byte][schema ID: 7][binary payload]
+
+Consumer side (notification-service, not yet redeployed):
+  1. Reads message, extracts schema ID 7 from the prefix
+  2. Fetches schema ID 7 from Schema Registry (or uses cached copy)
+  3. Deserializes using schema ID 7, but maps fields into ITS OWN
+     compiled-in schema (an older version, e.g. ID 5) via compatibility
+     rules -- this is the "reader schema vs writer schema" resolution
+     that makes independent evolution possible</code></pre>
+<p>This is the mechanism that makes it possible for a producer to be on schema version 7 while a consumer is still compiled against version 5: Avro's deserialization model was designed from the start around having a distinct "writer schema" (whatever the producer used) and "reader schema" (whatever the consumer expects), and resolving the two against each other field-by-field, rather than requiring them to be identical.</p>
+
+<h3>Compatibility modes: the contract that makes independent evolution safe</h3>
+<p>A Schema Registry doesn't just store schemas passively — for each topic (technically, each "subject") it enforces a <strong>compatibility mode</strong> that determines which kinds of schema changes are allowed to be registered at all. Attempting to register a schema that violates the configured mode is rejected outright, at registration time, before a single bad message can ever reach Kafka. This turns "did I just break every downstream consumer" from a runtime incident into a compile-time-adjacent, pre-publish check.</p>
+<table>
+  <tr><th>Mode</th><th>What it guarantees</th><th>What it allows</th></tr>
+  <tr><td>BACKWARD</td><td>A new schema can be read using the <em>previous</em> schema version — i.e., consumers upgraded to expect the new schema can still read data written by producers still on the old schema. More practically for this page's examples, it also means new producer schemas stay readable by old consumer code, which is why it's the default and most commonly used mode.</td><td>Deleting a field, or adding a field <strong>that has a default value</strong> (so old-schema readers, which don't know the field exists, and new-schema readers processing old data, which is missing the field, both have a well-defined value to fall back on)</td></tr>
+  <tr><td>FORWARD</td><td>Data written with the new schema can still be read by consumers using the <em>previous</em> schema — i.e., old consumers can tolerate new producer data.</td><td>Adding a field (old readers simply ignore the unrecognized field), or deleting a field that had a default (old readers already knew how to fall back on the default when the field is later reintroduced/removed)</td></tr>
+  <tr><td>FULL</td><td>Both BACKWARD and FORWARD simultaneously — the strictest and safest mode, but also the most restrictive about what changes are permitted.</td><td>Only changes that satisfy both directions at once, typically: adding or removing fields that have defaults, and nothing else</td></tr>
+</table>
+<p>The rule of thumb that makes these concrete: <strong>never remove or rename a field without a transition period, and always give new fields a default value.</strong> A default value is what lets an old consumer, which has no idea the new field exists, still produce a valid in-memory object (the field is simply absent/null on its side), and lets a new consumer reading an old message fill in the default rather than crash on a missing field.</p>
+
+<h3>Worked example: adding <code>discountCode</code> to OrderPlaced without breaking anyone</h3>
+<p>Say <code>order-service</code> needs to add a new <code>discountCode</code> field to <code>OrderPlaced</code> so that a new promotions feature can be built, but <code>notification-service</code> and <code>inventory-service</code> both consume this topic and neither has been redeployed yet — they're still running code compiled against the old schema, and there's no way to force a coordinated simultaneous deploy of three services in a real production system.</p>
+<pre><code>// Schema v1 (currently in production, all three services compiled against this)
+{
+  "type": "record",
+  "name": "OrderPlaced",
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    { "name": "totalCents", "type": "long" }
+  ]
+}
+
+// Schema v2 (order-service wants to deploy this)
+{
+  "type": "record",
+  "name": "OrderPlaced",
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    { "name": "totalCents", "type": "long" },
+    { "name": "discountCode", "type": ["null", "string"], "default": null }
+  ]
+}</code></pre>
+<p>Because the topic's subject is configured with <code>BACKWARD</code> compatibility (the typical default), the registry checks: "can a reader using schema v1 still make sense of data written with schema v2?" Yes — v1's reader simply doesn't know about <code>discountCode</code> and ignores the extra field on the wire, exactly as if it weren't there. The registry accepts v2 and assigns it a new schema ID. <code>order-service</code> redeploys and starts publishing v2 messages. <code>notification-service</code> and <code>inventory-service</code>, still running old code with schema v1 compiled in, keep consuming those same messages without any code change, without redeploying, and without a single deserialization error — they simply never see <code>discountCode</code>, because their reader schema doesn't ask for it. Weeks later, once both services have been redeployed against v2 (on their own schedule, not synchronized with anyone else), they can start reading and acting on <code>discountCode</code> if they choose to.</p>
+<p>Now contrast this with what would happen if <code>order-service</code> instead renamed <code>totalCents</code> to <code>totalAmountCents</code> with no default and no transition: from the registry's point of view, a v1 reader looking for a field called <code>totalCents</code> in v2 data would find it simply missing (v2 doesn't have that name), and Avro has no way to know these two names refer to "the same" logical field — this change would either be rejected outright as a BACKWARD-incompatible schema (the safe outcome, caught at registration time), or, in a poorly configured registry with compatibility checking disabled, would ship straight into production and produce missing-field errors or nulls in every consumer still on the old schema. This is precisely why the Schema Registry's enforcement matters more than the wire format itself: Avro and Protobuf make the payload compact and typed, but it's the registry's compatibility check that actually prevents a producer's routine field change from silently breaking every consumer that hasn't redeployed yet.</p>
+<div class="callout warn">
+  <p>A field addition is only safe under BACKWARD compatibility if it has a default value. A required field with no default, added to v2, would make v2 unreadable by anyone still expecting v1's shape to be the whole story in the other direction (FORWARD), and some Avro/Protobuf tooling will simply refuse to register such a schema change under a mode that doesn't permit it. The discipline is not "Avro/Protobuf prevents breaking changes" — it's "the Schema Registry's compatibility mode rejects the specific category of breaking change you configured it to reject," which is why choosing BACKWARD, FORWARD, or FULL deliberately, per topic, based on which side (producers or consumers) you expect to lag during a rollout, is itself part of the design.</p>
+</div>
+<div class="callout tip">
+  <p>Protobuf's evolution rules follow the same spirit via numbered fields rather than named ones — every field has a permanent integer tag, new fields get new tags, old tags are never reused, and unrecognized tags are ignored by old readers — but the underlying reasoning is identical to Avro's: give the deserializer enough structure to safely ignore what it doesn't recognize and fall back to a sane default for what it expects but doesn't find. Whichever binary format a team picks, the Schema Registry's compatibility-mode enforcement is the part actually doing the work of letting producers and consumers redeploy independently, which is the entire point of loose coupling that section 4 argued async messaging exists to provide in the first place.</p>
+</div>
+
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
 
 <details class="concept-qa">
@@ -260,6 +327,26 @@ public void onOrderEvent(OrderShippedEvent event) {
 <details class="concept-qa">
   <summary>Why does adding more consumers than partitions not increase throughput for a Kafka consumer group?</summary>
   <div class="qa-body">Kafka's core invariant for a consumer group is that any single partition is assigned to at most one consumer instance in that group at a time — this is what prevents two consumers from processing the same partition's messages concurrently and racing each other. Partition count is therefore a hard ceiling on how many consumer instances can be simultaneously doing useful work for that group; if you have 6 partitions and start an 8th consumer, two of those consumers will simply sit idle with no partitions assigned, and any expectation that adding compute would improve throughput fails until you increase the partition count (which itself has consequences for ordering guarantees on any key whose hash bucket changes).</div>
+</details>
+
+<details class="concept-qa">
+  <summary>If a message's schema isn't included in every payload, how does a consumer know how to decode it?</summary>
+  <div class="qa-body">The producer's Avro/Protobuf serializer writes only a small numeric schema ID as a prefix on the binary payload, not the schema itself — repeating a full schema definition on every message would defeat the point of a compact binary format. The Schema Registry is the separate service that actually stores every version of every schema, keyed by that ID. A consumer reads the ID prefix off the message, fetches (and caches) the matching schema from the registry, and uses it to correctly interpret the following bytes. This is also what makes independent producer/consumer evolution possible: the consumer resolves the producer's "writer schema" against its own compiled-in "reader schema" field by field, rather than requiring the two to be byte-for-byte identical.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>What's actually different between BACKWARD, FORWARD, and FULL compatibility, and why would you pick one over another?</summary>
+  <div class="qa-body">BACKWARD compatibility guarantees a new schema's data can still be read by something using the previous schema — practically, this is what lets a producer roll out a new field before every consumer has redeployed, since old consumers keep working against new data. FORWARD compatibility guarantees the reverse: a consumer already upgraded to the new schema can still read data written by a producer still on the old schema, which matters when you expect consumers to redeploy before producers do. FULL compatibility requires both directions to hold at once, which is the safest choice when you can't predict or control which side (producer or consumer) will lag during a rollout, at the cost of restricting you to changes that satisfy both constraints simultaneously — in practice, mostly adding or removing fields that carry a default value.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Why does adding a field with a default value not break consumers that haven't redeployed, but a required field with no default can?</summary>
+  <div class="qa-body">A consumer still running the old schema has no idea the new field exists at all — it was compiled before the field was added. If that field has a default value, the old consumer simply never encounters it (it's absent from the reader schema's expectations), and if a newer consumer ever reads an older message that predates the field, it falls back to the default instead of finding nothing where it expected a value. A required field with no default breaks this symmetry: there's no well-defined value to substitute when one side's schema doesn't line up with the other's, which is exactly the category of change a BACKWARD or FORWARD compatibility check is designed to catch and reject at registration time, before the schema is ever allowed onto the topic.</div>
+</details>
+
+<details class="concept-qa">
+  <summary>Why not just keep using JSON for Kafka payloads and skip Avro/Protobuf and the Schema Registry entirely?</summary>
+  <div class="qa-body">JSON works fine at small scale precisely because it doesn't require any of this infrastructure — it's self-describing and any consumer can parse it without agreeing on a schema in advance. The cost shows up as the system grows: nothing stops a field from being silently renamed or retyped, and the first anyone finds out is a consumer throwing a deserialization or null-pointer error in production, potentially long after the breaking change shipped. JSON is also considerably less compact on the wire than a binary format, which matters once a topic is carrying tens of thousands of messages per second. Avro/Protobuf plus a Schema Registry moves the failure mode from "a consumer crashes at runtime, sometime after a bad deploy" to "the registry rejects the incompatible schema at registration time, before a single message using it is ever published" — trading a bit of upfront infrastructure for catching an entire class of production incident before it can happen.</div>
 </details>
 
 <h2>Related Topics</h2>

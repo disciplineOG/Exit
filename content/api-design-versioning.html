@@ -97,9 +97,9 @@ GET    /api/v1/orders/999999      → 404 Not Found</code></pre>
 <h3>Query parameters vs. path segments</h3>
 <p>The path identifies <em>which resource</em>; the query string modifies <em>how you want to view or filter a collection</em>. A useful test: if the value is part of what makes the resource unique and addressable, it's a path segment; if it's a lens applied to a collection (filtering, sorting, pagination, field selection), it's a query parameter.</p>
 <pre><code>GET /api/v1/orders/17                       — a single, uniquely identified resource → path
-GET /api/v1/orders?status=SHIPPED&sort=-createdAt&limit=50   — a filtered, ordered view of a collection → query params
+GET /api/v1/orders?status=SHIPPED&amp;sort=-createdAt&amp;limit=50   — a filtered, ordered view of a collection → query params
 GET /api/v1/orders/17/items                 — a sub-collection identified by its parent → path
-GET /api/v1/products?category=electronics&inStock=true       — the catalog, filtered → query params</code></pre>
+GET /api/v1/products?category=electronics&amp;inStock=true       — the catalog, filtered → query params</code></pre>
 
 <h2>3. HTTP status codes: precise semantics in the 4xx range</h2>
 <p>Returning the wrong status code isn't a cosmetic issue — clients (including retry middleware, circuit breakers, and monitoring) branch on the status code, not on the response body's prose. A 500 for a validation error tells a resilience layer "the server is unhealthy, back off and retry"; a 422 for the same error correctly tells it "this specific request is unfixable by retrying, surface it to the user."</p>
@@ -145,7 +145,7 @@ GET /api/v1/products?category=electronics&inStock=true       — the catalog, fi
   <tr><td>422 Unprocessable Entity</td><td>Semantically invalid</td><td>Syntactically valid (parses fine, right types) but fails business validation — a Coupon's <code>percentOff</code> over 100, a Review's <code>rating</code> outside 1–5. The distinction from 400 is subtle but matters: 400 means "I couldn't understand this," 422 means "I understood it perfectly and it's still wrong."</td></tr>
 </table>
 <div class="callout warn">
-  <p>A common and costly mistake is collapsing every failure into 400 or, worse, always returning 200 with an <code>"error"</code> field in the body. This defeats every piece of HTTP-aware infrastructure sitting in front of your service — API gateways, client SDKs generated from <a href="#/api-design-versioning">OpenAPI</a>, and retry/circuit-breaker logic (see <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a>) all key off the status code to decide whether to retry, alert, or fail fast. A 200-wrapped error is invisible to all of them until someone inspects the body.</p>
+  <p>A common and costly mistake is collapsing every failure into 400 or, worse, always returning 200 with an <code>"error"</code> field in the body. This defeats every piece of HTTP-aware infrastructure sitting in front of your service — API gateways, client SDKs generated from OpenAPI (see section 7), and retry/circuit-breaker logic (see <a href="#/resilience-fault-tolerance">resilience-fault-tolerance</a>) all key off the status code to decide whether to retry, alert, or fail fast. A 200-wrapped error is invisible to all of them until someone inspects the body.</p>
 </div>
 
 <h2>4. Idempotency: the property that makes retries safe</h2>
@@ -197,14 +197,14 @@ else:
   <tr><td>Header-based</td><td><code>Api-Version: 2</code> or a custom header</td><td>Keeps the URI stable as the true resource identifier; version is metadata about the request, not the resource's identity.</td><td>Invisible in logs, browser address bars, and casual curl testing unless you know to look; easy for a client to forget to set it and silently get default (often latest, sometimes oldest) behavior; harder to route at some gateway layers without deeper packet inspection.</td></tr>
   <tr><td>Content negotiation (media type)</td><td><code>Accept: application/vnd.shopsphere.v2+json</code></td><td>The most "correct" from a REST purity standpoint — version is a property of the representation format, negotiated the same way HTTP negotiates JSON vs XML vs HTML.</td><td>Least ergonomic for API consumers to discover and set correctly; tooling support (Postman collections, quick manual testing) is weaker; still shares the header approach's invisibility problem.</td></tr>
 </table>
-<p>In practice, URI versioning dominates public APIs because its visibility lowers the support burden — a client can see <code>/api/v1/</code> in a stack trace or a support ticket and immediately know which contract is in play. For ShopSphere's <code>/products</code> catalog specifically, this matters more than for most resources: the catalog API is consumed by external Seller integrations (bulk inventory upload tools, price-sync scripts written by third-party Sellers' own engineering teams) who have no ongoing relationship with ShopSphere's platform team and would never reliably set a custom header correctly — a visible <code>/v1/</code> vs <code>/v2/</code> path is the only versioning signal likely to actually reach them. Header and media-type versioning are more common internally, where the team controls both ends and can enforce header discipline through generated clients (see the <a href="#/api-design-versioning">OpenAPI</a> section below), and where keeping the URI stable matters more because internal tooling often treats the URI as a durable resource identifier.</p>
+<p>In practice, URI versioning dominates public APIs because its visibility lowers the support burden — a client can see <code>/api/v1/</code> in a stack trace or a support ticket and immediately know which contract is in play. For ShopSphere's <code>/products</code> catalog specifically, this matters more than for most resources: the catalog API is consumed by external Seller integrations (bulk inventory upload tools, price-sync scripts written by third-party Sellers' own engineering teams) who have no ongoing relationship with ShopSphere's platform team and would never reliably set a custom header correctly — a visible <code>/v1/</code> vs <code>/v2/</code> path is the only versioning signal likely to actually reach them. Header and media-type versioning are more common internally, where the team controls both ends and can enforce header discipline through generated clients (see the OpenAPI section below), and where keeping the URI stable matters more because internal tooling often treats the URI as a durable resource identifier.</p>
 <div class="callout warn">
   <p>Whichever strategy you pick, version the smallest thing that actually changed. Bumping ShopSphere's entire API from v1 to v2 because the <code>/products</code> catalog's price shape changed forces every client of every <em>other</em> unaffected endpoint — <code>/orders</code>, <code>/cart</code>, <code>/reviews</code> — to migrate too, or forces the platform team to run two nearly-identical copies of the whole API surface. Versioning just <code>/api/v2/products</code> while leaving <code>/api/v1/orders</code>, <code>/api/v1/cart</code>, etc. untouched, while more bookkeeping (the OpenAPI spec now describes a mixed-version surface), avoids this blast radius problem entirely.</p>
 </div>
 
 <h2>6. Pagination: offset vs. cursor</h2>
 <h3>Offset-based pagination</h3>
-<pre><code>GET /api/v1/products?category=electronics&offset=200&limit=50</code></pre>
+<pre><code>GET /api/v1/products?category=electronics&amp;offset=200&amp;limit=50</code></pre>
 <p>Simple to implement (<code>LIMIT 50 OFFSET 200</code> in SQL) and lets a client jump directly to "page 5" of the catalog. It has two structural problems that get worse as the dataset grows and changes:</p>
 <ul>
   <li><strong>Performance degrades with offset size.</strong> Most databases implement <code>OFFSET</code> by scanning and discarding the first N rows before returning the next page — <code>OFFSET 1000000</code> means the database still touches a million rows it throws away. There's no way to seek directly to row 1,000,000 without an index that already orders rows by position, which generally doesn't exist.</li>
@@ -212,7 +212,7 @@ else:
 </ul>
 
 <h3>Cursor-based (keyset) pagination</h3>
-<pre><code>GET /api/v1/orders?limit=50&after=eyJpZCI6IDIwMH0=   // opaque cursor encoding {"id": 200}
+<pre><code>GET /api/v1/orders?limit=50&amp;after=eyJpZCI6IDIwMH0=   // opaque cursor encoding {"id": 200}
 
 -- underlying query, assuming id is the sort key and indexed
 SELECT * FROM orders WHERE id > 200 ORDER BY id ASC LIMIT 50</code></pre>
@@ -274,6 +274,195 @@ components:
   <p>A useful discipline is to make the additive/breaking distinction part of code review for API changes specifically, backed by the OpenAPI spec: diff the spec between versions and treat any removal, type change, or new required field as requiring a deliberate version bump and a documented migration window, not something that ships silently in a routine deploy.</p>
 </div>
 
+<h2>9. JSON serialization with Jackson: the layer between your objects and the wire</h2>
+<p>Every one of the request/response bodies discussed so far — the <code>Order</code> resource, the OpenAPI <code>schemas</code> block, the error bodies in the next section — has to actually be converted between a Java object graph and JSON bytes on the wire. In a Spring Boot service that conversion is handled by Jackson, and Spring wires it in automatically: a <code>@RestController</code> method that returns an <code>Order</code> gets it serialized by an <code>ObjectMapper</code> bean without you ever calling it directly. Understanding what that <code>ObjectMapper</code> is doing, and where its defaults are dangerous, matters because serialization bugs are invisible in code review — they only show up as a field silently missing from a response, or a security report six months later.</p>
+
+<h3>ObjectMapper basics</h3>
+<p>The <code>ObjectMapper</code> is Jackson's central class — it's what walks a Java object's fields (or, for deserialization, a JSON tree) and converts between the two representations. Spring Boot auto-configures a shared, thread-safe <code>ObjectMapper</code> bean for you (thread safety matters because it's reused across every request), but the same operations are visible if you use it directly:</p>
+<pre><code>ObjectMapper mapper = new ObjectMapper();
+
+// Java object -> JSON string
+String json = mapper.writeValueAsString(order);
+
+// JSON string -> Java object
+Order order = mapper.readValue(json, Order.class);
+
+// JSON string -> a generic type, e.g. List&lt;Order&gt;
+List&lt;Order&gt; orders = mapper.readValue(json, new TypeReference&lt;List&lt;Order&gt;&gt;() {});</code></pre>
+<p>By default, Jackson matches JSON field names to Java field names (or, more precisely, to the property implied by a getter/setter pair) using reflection, with no annotations required at all. This "it just works" default is exactly why the annotations below matter — the moment your JSON shape and your Java shape need to diverge even slightly, you need a way to tell Jackson explicitly.</p>
+
+<h3>Controlling the mapping: @JsonProperty, @JsonIgnore, @JsonCreator, @JsonInclude</h3>
+<p>The default name-matching convention breaks down the instant the wire format and the Java model disagree — a common case is an external payment provider's webhook using <code>snake_case</code> while ShopSphere's <code>Payment</code> class uses Java's <code>camelCase</code> convention. <code>@JsonProperty</code> gives you an explicit, per-field mapping instead of relying on the convention matching by accident:</p>
+<pre><code>public class Payment {
+    @JsonProperty("payment_id")
+    private String paymentId;
+
+    @JsonProperty("card_last_four")
+    private String cardLastFour;
+}</code></pre>
+<p><code>@JsonIgnore</code> excludes a field from serialization (and, by default, deserialization too) entirely — the field exists on the Java object but never appears on the wire in either direction. This is the mechanism that keeps a <code>Customer</code> entity's <code>passwordHash</code> field from ever leaking into an API response just because it happens to sit on the same JPA entity that gets returned from a controller:</p>
+<pre><code>public class Customer {
+    private Long id;
+    private String email;
+
+    @JsonIgnore
+    private String passwordHash;   // never serialized, regardless of caller
+}</code></pre>
+<p><code>@JsonCreator</code>, usually paired with <code>@JsonProperty</code> on constructor parameters, tells Jackson which constructor to use when deserializing — essential once a class has no no-arg constructor, is immutable, or has multiple constructors and Jackson's default "guess the right one" heuristic can't be trusted:</p>
+<pre><code>public class Money {
+    private final BigDecimal amount;
+    private final String currency;
+
+    @JsonCreator
+    public Money(@JsonProperty("amount") BigDecimal amount,
+                 @JsonProperty("currency") String currency) {
+        this.amount = amount;
+        this.currency = currency;
+    }
+}</code></pre>
+<p><code>@JsonInclude</code> controls whether a field is written out at all based on its value — the most common use is <code>@JsonInclude(JsonInclude.Include.NON_NULL)</code>, which omits a field from the JSON entirely rather than emitting <code>"discountCode": null</code>. This matters for API consumers that use "is this key present" as a signal distinct from "is this key present with a null value" (a common convention in PATCH semantics — see the error-contract section below for how validation failures are shaped), and it keeps response payloads smaller when a resource has many optional fields that are usually absent, such as an <code>Order</code>'s optional <code>giftMessage</code> or <code>couponCode</code>.</p>
+
+<h3>Polymorphic deserialization: @JsonTypeInfo and @JsonSubTypes</h3>
+<p>Deserialization gets genuinely harder when a JSON payload needs to become one of several possible Java subtypes, and the correct subtype isn't knowable from the target field's declared type alone. ShopSphere's payment domain is a natural example: a <code>PaymentMethod</code> field on a checkout request might need to become a <code>CreditCardPayment</code>, a <code>WalletPayment</code>, or a <code>BankTransferPayment</code> depending on what the client sent, and Jackson has no way to know which one to instantiate just by looking at the abstract <code>PaymentMethod</code> type. <code>@JsonTypeInfo</code> and <code>@JsonSubTypes</code> solve this by embedding a discriminator field in the JSON that tells Jackson which concrete class to pick:</p>
+<pre><code>@JsonTypeInfo(
+    use = JsonTypeInfo.Id.NAME,
+    include = JsonTypeInfo.As.PROPERTY,
+    property = "type")
+@JsonSubTypes({
+    @JsonSubTypes.Type(value = CreditCardPayment.class, name = "CREDIT_CARD"),
+    @JsonSubTypes.Type(value = WalletPayment.class, name = "WALLET"),
+    @JsonSubTypes.Type(value = BankTransferPayment.class, name = "BANK_TRANSFER")
+})
+public abstract class PaymentMethod {
+    // common fields, e.g. amount
+}
+
+public class CreditCardPayment extends PaymentMethod {
+    private String cardNumberLastFour;
+    private String expiryDate;
+}</code></pre>
+<pre><code>{
+  "type": "CREDIT_CARD",
+  "amount": 49.99,
+  "cardNumberLastFour": "4242",
+  "expiryDate": "09/27"
+}</code></pre>
+<p>On deserialization, Jackson reads the <code>type</code> property first, looks it up in the <code>@JsonSubTypes</code> table, and instantiates <code>CreditCardPayment</code> instead of trying (and failing) to instantiate the abstract <code>PaymentMethod</code> directly. This is the same underlying problem as an <code>OrderEvent</code> hierarchy on a Kafka topic (<code>OrderPlaced</code>, <code>OrderCancelled</code>, <code>OrderShipped</code> all deserialized off one topic based on an event-type discriminator) — polymorphic deserialization by discriminator field is a recurring pattern anywhere one wire format needs to become one of several possible types.</p>
+
+<h3>The security risk: deserializing untrusted input into overly permissive types</h3>
+<p>Polymorphic deserialization is also one of the most well-documented sources of remote code execution vulnerabilities in the Java ecosystem, and it's worth understanding precisely why. The danger appears when Jackson is configured to determine the target class from a type name embedded in the JSON itself — most dangerously via a global setting like <code>ObjectMapper.enableDefaultTyping()</code> (deprecated precisely because of this issue) or by deserializing directly into a maximally generic type such as <code>Object</code> or a loosely-bounded interface, combined with polymorphic type handling turned on. An attacker who controls the JSON payload can then specify an arbitrary class name as the discriminator — including classes never intended to be deserialization targets at all, such as classes from logging frameworks or connection pools whose constructors or setters have observable side effects (opening a JNDI lookup, reading a file, executing a process) purely as a consequence of being instantiated and populated. Chaining such "gadget classes" together is the basis of well-known Jackson deserialization CVEs.</p>
+<p>The defense is architectural, not a single flag: never enable global default typing; scope any <code>@JsonTypeInfo</code> polymorphism to a specific, closed, explicitly-enumerated set of subtypes via <code>@JsonSubTypes</code> exactly as shown above, rather than an open type hierarchy; and never deserialize a request body directly into <code>Object</code>, <code>Map&lt;String,Object&gt;</code> passed on to further polymorphic processing, or any other type whose universe of possible concrete classes isn't fully controlled by your own codebase. This is the JSON-specific instance of a general rule covered in <a href="#/security-hardening-owasp">security-hardening-owasp</a>: never let untrusted input control which code runs, and a type discriminator that selects a Java class to instantiate is exactly that kind of control if the set of selectable classes isn't tightly closed.</p>
+<div class="callout warn">
+  <p>A concrete rule of thumb for ShopSphere services: any controller endpoint accepting a payload with an open-ended <code>@JsonTypeInfo</code> hierarchy (like the checkout endpoint accepting different <code>PaymentMethod</code> subtypes above) must keep <code>@JsonSubTypes</code> as an explicit, reviewed allowlist. Adding a new payment method type should require a code change and review, never a value the client is free to invent, because the instant the discriminator can select a class no one on the team chose, deserialization stops being a data-mapping concern and becomes a code-execution attack surface.</p>
+</div>
+
+<h2>10. A consistent, centralized error-response contract</h2>
+<p>Section 3 established precise semantics for which status code a given failure should return. That solves half the problem — the other half is what the <em>body</em> of an error response looks like, and without a deliberate answer, every controller in a codebase tends to invent its own shape: one throws a raw exception message straight into the body, another wraps it in <code>{"error": "..."}</code>, a third returns a bare string. A client integrating against ShopSphere's API then has to write a different error-parsing branch per endpoint, which is exactly the kind of inconsistency an API contract is supposed to prevent.</p>
+
+<h3>Mapping an exception hierarchy to status codes with @ControllerAdvice</h3>
+<p>Spring MVC's <code>@ControllerAdvice</code> (combined with <code>@ExceptionHandler</code>) lets you centralize this decision in one place instead of scattering try/catch blocks across every controller method. A <code>@ControllerAdvice</code>-annotated class is applied globally, across every <code>@RestController</code> in the application, and each <code>@ExceptionHandler</code> method declares which exception type it handles:</p>
+<pre><code>@RestControllerAdvice
+public class ApiExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity&lt;ErrorResponse&gt; handleNotFound(ResourceNotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(ErrorResponse.of("RESOURCE_NOT_FOUND", ex.getMessage()));
+    }
+
+    @ExceptionHandler(OrderConflictException.class)
+    public ResponseEntity&lt;ErrorResponse&gt; handleConflict(OrderConflictException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ErrorResponse.of("ORDER_CONFLICT", ex.getMessage()));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity&lt;ErrorResponse&gt; handleUnexpected(Exception ex) {
+        // last resort: never leak stack traces or internal messages to the client
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ErrorResponse.of("INTERNAL_ERROR", "An unexpected error occurred"));
+    }
+}</code></pre>
+<p>The design work here is really in the exception hierarchy this class is mapping, not in the Spring plumbing itself: a well-designed domain defines specific exceptions (<code>ResourceNotFoundException</code>, <code>OrderConflictException</code>, <code>InsufficientInventoryException</code>) that carry enough semantic meaning to determine a status code unambiguously, rather than throwing generic <code>RuntimeException</code>s everywhere and forcing the <code>@ControllerAdvice</code> to guess. Spring dispatches to the most specific matching <code>@ExceptionHandler</code> for the thrown exception's actual type, falling back to a broader handler (like the catch-all <code>Exception.class</code> above) only when nothing more specific matches — which is precisely why that catch-all must never leak a raw exception message or stack trace into the response body: it's the backstop for the failure modes you didn't anticipate, and those are exactly the ones most likely to contain something you don't want a client to see (a SQL fragment, an internal class name, a file path).</p>
+
+<h3>A consistent error-body shape</h3>
+<p>Whatever the status code, the body should follow one predictable shape across the entire API, so client-side error handling can be written once instead of per-endpoint. A typical shape carries a stable machine-readable error code, a human-readable message, and — for validation failures specifically — a list of field-level problems:</p>
+<pre><code>public class ErrorResponse {
+    private String errorCode;         // stable, machine-readable: "VALIDATION_FAILED", "ORDER_CONFLICT"
+    private String message;           // human-readable summary, safe to display or log
+    private List&lt;FieldError&gt; fieldErrors;   // populated only for validation failures; else empty/omitted
+    private Instant timestamp;
+
+    public static class FieldError {
+        private String field;         // e.g. "email", "items[0].quantity"
+        private String message;       // e.g. "must not be blank", "must be greater than 0"
+    }
+}</code></pre>
+<pre><code>{
+  "errorCode": "VALIDATION_FAILED",
+  "message": "Request validation failed",
+  "fieldErrors": [
+    { "field": "email", "message": "must be a well-formed email address" },
+    { "field": "items[0].quantity", "message": "must be greater than 0" }
+  ],
+  "timestamp": "2026-08-26T14:03:11Z"
+}</code></pre>
+<p>The <code>errorCode</code> is what client code should actually branch on — it's stable across releases and doesn't change if a translator later rewrites the human-readable <code>message</code> for clarity or localization. Relying on parsing the <code>message</code> string in client code is a classic hidden coupling: a well-intentioned copy edit to the error text ("Order not found" → "No order found with that ID") silently breaks any client that was string-matching on the old wording, whereas a stable <code>errorCode</code> like <code>RESOURCE_NOT_FOUND</code> gives them something safe to depend on.</p>
+
+<h3>Bean Validation failures map into the same contract</h3>
+<p>Bean Validation annotations (<code>@NotNull</code>, <code>@Email</code>, <code>@Min</code>, <code>@Size</code>, and the rest of the <code>jakarta.validation.constraints</code> package) on a <code>@RequestBody</code>-annotated DTO, triggered by <code>@Valid</code> on the controller parameter, are what produce the field-level errors above — but by default, Spring throws <code>MethodArgumentNotValidException</code> when validation fails, and left unhandled that exception serializes into Spring's own default error shape, not your custom <code>ErrorResponse</code>. The fix is to catch it in the same <code>@ControllerAdvice</code> and translate it into your contract:</p>
+<pre><code>@ExceptionHandler(MethodArgumentNotValidException.class)
+public ResponseEntity&lt;ErrorResponse&gt; handleValidation(MethodArgumentNotValidException ex) {
+    List&lt;ErrorResponse.FieldError&gt; fieldErrors = ex.getBindingResult()
+            .getFieldErrors()
+            .stream()
+            .map(fe -> new ErrorResponse.FieldError(fe.getField(), fe.getDefaultMessage()))
+            .toList();
+
+    ErrorResponse body = ErrorResponse.of("VALIDATION_FAILED", "Request validation failed");
+    body.setFieldErrors(fieldErrors);
+    return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+    // Note: some teams map this to 422 instead of 400 - see the 400-vs-422 distinction in section 3
+}</code></pre>
+<p><code>ex.getBindingResult()</code> is where Spring accumulates every individual constraint violation across the whole request body — every <code>@NotBlank</code>, <code>@Min</code>, and <code>@Pattern</code> failure on the DTO, not just the first one encountered — which is exactly what lets the handler above produce the full list of <code>fieldErrors</code> in one response instead of forcing the client through a frustrating fix-one-error-resubmit-see-the-next-one cycle. Handling this one exception type in the shared <code>@ControllerAdvice</code>, right alongside the domain exceptions from the previous subsection, is what makes "malformed checkout payload" and "order already shipped" show up to a client as the same predictable <code>ErrorResponse</code> shape rather than two unrelated formats — one accident of Bean Validation's default behavior, and one hand-rolled by whoever wrote that particular controller.</p>
+
+<h2>11. API documentation and developer experience</h2>
+<p>Section 7 covered OpenAPI as a machine-readable contract in the abstract; in a real Spring Boot service, that spec is almost never written by hand — it's generated from the controllers, DTOs, and validation annotations that already exist in the code, using <code>springdoc-openapi</code> (the actively maintained successor to the older springfox/Swagger 2 libraries).</p>
+
+<h3>springdoc-openapi and Swagger UI</h3>
+<p>Adding the <code>springdoc-openapi-starter-webmvc-ui</code> dependency to a Spring Boot application is enough, with zero configuration, to get a working OpenAPI spec at <code>/v3/api-docs</code> and an interactive Swagger UI at <code>/swagger-ui.html</code> — springdoc inspects the application's <code>@RestController</code> classes, their <code>@RequestMapping</code>/<code>@GetMapping</code>/<code>@PostMapping</code> methods, the DTOs used as <code>@RequestBody</code> and return types, and the Bean Validation annotations on those DTOs, and derives the spec's paths and schemas directly from them. Annotations refine what's auto-derived when the code alone is ambiguous or under-documented:</p>
+<pre><code>@RestController
+@RequestMapping("/api/v1/orders")
+@Tag(name = "Orders", description = "Order lifecycle operations")
+public class OrderController {
+
+    @Operation(summary = "Fetch an order by ID")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "Order found"),
+        @ApiResponse(responseCode = "404", description = "No order with this ID")
+    })
+    @GetMapping("/{orderId}")
+    public OrderDto getOrder(@PathVariable Long orderId) {
+        // ...
+    }
+}</code></pre>
+<p>The practical payoff mirrors section 7's point about generated documentation: because the spec is derived from the same source code that actually executes, it cannot silently drift out of date the way a hand-maintained wiki page or Postman collection does — if a field is removed from the DTO, it disappears from the generated spec and the Swagger UI in the very same deploy, with no separate documentation-update step to forget.</p>
+
+<h3>Code-first vs. contract-first</h3>
+<p>What springdoc does is the "code-first" approach — the code is the source of truth, and the OpenAPI spec is a derived artifact generated after the fact. The alternative, "contract-first" (or "design-first"), reverses the order: the team hand-writes the OpenAPI YAML first, as an explicit design and negotiation step, and then generates server-side interface stubs (and client SDKs) from that spec before implementation begins.</p>
+<table>
+  <tr><th></th><th>Code-first (springdoc)</th><th>Contract-first (hand-written spec)</th></tr>
+  <tr><td>Source of truth</td><td>The Java code</td><td>The YAML/JSON spec file</td></tr>
+  <tr><td>Speed for a small team</td><td>Fast — no separate design artifact to maintain</td><td>Slower up front — the spec is a deliverable before any code exists</td></tr>
+  <tr><td>Cross-team / external API design</td><td>Weaker — the shape emerges from implementation details, and other teams can't review it until code exists</td><td>Stronger — consumers (mobile team, third-party Sellers) can review and agree on the contract before a single controller is written</td></tr>
+  <tr><td>Risk of drift</td><td>Low — spec is regenerated from code every build, can't lag behind it</td><td>Higher — nothing forces the implementation to actually match the hand-written spec unless contract tests enforce it</td></tr>
+  <tr><td>Good fit for</td><td>Internal services with one team owning both API and implementation</td><td>Public/partner-facing APIs (like ShopSphere's Seller integration APIs) where the contract needs sign-off from multiple independent teams before implementation</td></tr>
+</table>
+<p>Neither approach is universally correct — the trade-off is essentially "optimize for implementation speed and freshness" versus "optimize for up-front cross-team agreement," and it's reasonable for a platform team to use code-first internally for services only they consume, while using contract-first for the small set of APIs that external Sellers or partner teams build against, where an API's shape changing out from under a partner mid-integration is a far more expensive mistake than the extra up-front design time.</p>
+
+<h3>Generating client SDKs from the spec</h3>
+<p>Whichever approach produces the spec, the same OpenAPI document — whether generated by springdoc or hand-written contract-first — is what tools like OpenAPI Generator consume to produce typed client libraries, exactly as introduced in section 7. This closes the loop between documentation and actual developer experience: a third-party Seller's engineering team, or ShopSphere's own mobile team, doesn't need to hand-write HTTP calls and hope they match the Swagger UI's description — they run a code-generation step against the published spec and get a typed <code>OrdersApi</code> client class whose method signatures are checked by their own compiler, so a breaking change to the spec (a field removed, a type changed) shows up as their build failing immediately, rather than as a runtime error discovered by a confused end user weeks later.</p>
+
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
 
 <details class="concept-qa">
@@ -314,6 +503,26 @@ components:
 <details class="concept-qa">
 <summary>Why does the 4xx/5xx boundary matter more for retry logic than the specific status code within each class?</summary>
 <div class="qa-body">The first digit of a status code is a deliberate, coarse signal about where the failure originates: 4xx says the problem is in the request itself (a Customer's malformed checkout payload, a Coupon code that doesn't exist), and 5xx says the problem is on the server's side (order-service crashed, payment-service timed out calling its own database). This distinction is exactly what a resilience layer (circuit breaker, retry-with-backoff middleware) needs to make a retry decision without understanding any application-specific semantics: retrying the identical bytes of a 4xx request will fail identically every time, because nothing about the server's state changed and the request was the defect — retrying just wastes a round trip and adds load for no benefit. A 5xx, by contrast, often reflects a transient condition (a momentary overload, a dependency blip) that may have cleared by the time a retry arrives, so backing off and retrying is a reasonable default. This is precisely why generic HTTP infrastructure — API gateways, load balancers, client SDK retry policies — can implement a single, universal rule ("retry 5xx with backoff, don't retry 4xx") without knowing anything about orders, payments, or ShopSphere's domain at all; the status-code class alone carries enough information to make the decision correctly.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is unrestricted polymorphic JSON deserialization a security risk, not just a data-mapping inconvenience?</summary>
+<div class="qa-body">When Jackson resolves a concrete class to instantiate from a type name embedded in the JSON itself, and that resolution isn't scoped to a small, explicit, developer-controlled set of classes, an attacker who controls the request body effectively gets to choose which Java class gets instantiated and populated on your server. If that universe of selectable classes is unbounded (as it is with global default typing enabled, or deserialization into a bare <code>Object</code>/loosely-typed <code>Map</code>), the attacker can pick classes never intended as deserialization targets — ones whose constructors or setters have side effects purely from being invoked, such as opening a network connection or invoking a lookup. Chaining such classes together is the basis of real, well-documented remote code execution vulnerabilities. The fix is to always scope polymorphism to an explicit, closed <code>@JsonSubTypes</code> allowlist and never enable global default typing, so the set of classes a JSON payload can cause to be instantiated is exactly the set your own code chose, not the set an attacker can name.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why should client error-handling code branch on an errorCode field rather than the message string in an error response?</summary>
+<div class="qa-body">The message field exists to be read by a human — it's expected to change over time as copy gets clarified, localized, or made more specific, and none of those changes are meant to be breaking. If client code parses or string-matches against message, a purely cosmetic wording change on the server becomes a silent breaking change for every client that depended on the old phrasing. A stable, machine-readable errorCode (like RESOURCE_NOT_FOUND or ORDER_CONFLICT) is explicitly designed not to change across such edits, giving clients something safe and durable to branch their logic on, while the message remains free to evolve for readability without needing a version bump or a migration notice.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does centralizing exception-to-status-code mapping in one @ControllerAdvice matter more than just getting each individual status code right?</summary>
+<div class="qa-body">Getting a single endpoint's status code right is necessary but not sufficient — if every controller in a codebase independently decides how to catch and translate its own exceptions, the resulting error bodies inevitably drift into inconsistent shapes: one controller returns a bare string, another wraps a message in a differently-named field, a third leaks a raw stack trace by accident. A single, centralized @ControllerAdvice makes the mapping from exception type to status code and body shape a one-time architectural decision applied uniformly across the entire API, including a catch-all handler for exceptions no one anticipated. That uniformity is what actually lets a client write one error-parsing code path for the whole API instead of one per endpoint, and it's also what guarantees the catch-all backstop for unexpected exceptions never accidentally leaks internal details, since that logic lives in exactly one place instead of being re-implemented, and potentially forgotten, per controller.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why would a team choose contract-first API design over code-first even though it's slower up front?</summary>
+<div class="qa-body">Code-first (generating the OpenAPI spec from annotated controllers, as springdoc does) optimizes for a single team moving fast and never having the spec drift from the implementation, since the spec is regenerated from the code on every build. But it means the API's actual shape only becomes visible to other teams once the code exists, which is a problem when the consumers of that API — a mobile team, or especially independent third-party partners like ShopSphere's Sellers — need to review, negotiate, and even start building their own integration before the server-side implementation is finished. Contract-first flips the order: the spec is hand-written and agreed upon first, as an explicit design artifact multiple teams can review and sign off on, and both server stubs and client SDKs are generated from that agreed contract afterward. The up-front cost is slower initial delivery and the need for contract tests to keep the implementation honest against the spec, but that cost buys cross-team agreement before anyone has written code that's expensive to change — worth it precisely for the APIs where a mid-integration breaking change would be costly for a partner who doesn't share your deploy pipeline.</div>
 </details>
 
 <h2>Related Topics</h2>

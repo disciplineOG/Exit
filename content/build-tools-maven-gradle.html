@@ -1,0 +1,322 @@
+<p class="topic-breadcrumb">Phase 4 — Additional Topics · Core Gaps · Java / Bonus</p>
+<h1>Build Tools: Maven &amp; Gradle for Java Backend Projects</h1>
+<div class="topic-tags">
+<span class="tag">Maven</span>
+<span class="tag">Gradle</span>
+<span class="tag">Dependency Management</span>
+<span class="tag">BOM</span>
+<span class="tag">Multi-Module Builds</span>
+<span class="tag">Build Lifecycle</span>
+</div>
+
+<div class="callout tip">
+<div class="callout-title">Why this matters</div>
+<p>Every ShopSphere microservice — <code>order-service</code>, <code>inventory-service</code>, <code>payment-service</code> — starts with a <code>pom.xml</code> or <code>build.gradle</code>, and nearly every mysterious production incident that traces back to "it worked on my machine" or "the JAR we deployed wasn't the one we tested" is really a build-tool problem in disguise: a transitive dependency resolved to a different version than expected, a test that silently didn't run in CI, or a multi-module project that packaged a stale <code>shopsphere-common</code> JAR. Spring Boot itself leans on Maven/Gradle far more than most engineers realize — starters are just curated dependency declarations, and auto-configuration only fires because certain classes happen to be on the classpath the build assembled. Understanding the build lifecycle, dependency resolution, and version management covered here is what lets you diagnose a <code>NoSuchMethodError</code> at runtime, a version clash between two starters, or a broken multi-module release, instead of guessing and re-running <code>mvn clean install</code> until it happens to work.</p>
+</div>
+
+<h2>1. Two Philosophies: Declarative Convention vs. Programmable Task Graph</h2>
+<p>Maven and Gradle solve the same underlying problem — compile source, resolve dependencies, run tests, produce an artifact, publish it — but they start from opposite design premises, and most of the friction people feel switching between them traces back to this root difference rather than to superficial syntax.</p>
+<p>Maven is fundamentally <strong>declarative and convention-based</strong>. A <code>pom.xml</code> (Project Object Model) describes <em>what</em> your project is — its coordinates (<code>groupId</code>, <code>artifactId</code>, <code>version</code>), its dependencies, its packaging type — and Maven's build lifecycle (covered in the next section) is a fixed, predefined sequence of phases that every Maven project goes through in the same order. You rarely write imperative logic in a POM; instead you configure plugins that bind their behavior to specific lifecycle phases. This makes Maven builds highly predictable and easy to reason about across projects — if you've seen one Spring Boot Maven project, you can navigate any other one, because the phase names, the directory layout (<code>src/main/java</code>, <code>src/test/java</code>, <code>src/main/resources</code>), and the overall shape are conventionally fixed. The cost is flexibility: doing something Maven's plugin ecosystem didn't anticipate (a genuinely custom build step with conditional logic) often means fighting the plugin configuration XML into contortions, because XML is a data format, not a programming language.</p>
+<p>Gradle is fundamentally <strong>programmable</strong>. A <code>build.gradle</code> (Groovy DSL) or <code>build.gradle.kts</code> (Kotlin DSL) file is actual code, evaluated to build up a <strong>task graph</strong> — a directed acyclic graph of <code>Task</code> objects, each with declared inputs, outputs, and dependencies on other tasks. There's no fixed lifecycle baked into the tool itself the way Maven has one; instead, plugins (like the <code>java</code> plugin or the <code>org.springframework.boot</code> plugin) register tasks such as <code>compileJava</code>, <code>test</code>, and <code>bootJar</code>, and wire up their dependency relationships (e.g., <code>test</code> depends on <code>compileTestJava</code>, which depends on <code>compileJava</code>). Because it's real code, you can express conditional logic, custom tasks, and cross-cutting build logic directly, which is why Gradle tends to win for large, custom, performance-sensitive builds (Android's official build tool is Gradle, not Maven, precisely because mobile builds have unusual, project-specific needs). The cost is the flip side of the same coin: two Gradle projects can look nothing alike, because the DSL doesn't force a shared shape the way Maven's fixed lifecycle does, and a build script with real logic in it is something that can have real bugs.</p>
+<p>Neither philosophy is objectively better — they're different trade-offs between predictability and expressiveness. A team standardizing dozens of microservice repos (like ShopSphere's five services) often prefers Maven's rigidity precisely because it makes every repo interchangeable to work in; a team with unusual build requirements (generating code from Protobuf definitions, assembling multiple platform-specific artifacts) often prefers Gradle's programmability.</p>
+
+<pre><code>&lt;!-- Maven: pom.xml — declarative, fixed lifecycle --&gt;
+&lt;project&gt;
+    &lt;groupId&gt;com.shopsphere&lt;/groupId&gt;
+    &lt;artifactId&gt;order-service&lt;/artifactId&gt;
+    &lt;version&gt;1.4.0&lt;/version&gt;
+    &lt;dependencies&gt;
+        &lt;dependency&gt;
+            &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+            &lt;artifactId&gt;spring-boot-starter-web&lt;/artifactId&gt;
+        &lt;/dependency&gt;
+    &lt;/dependencies&gt;
+&lt;/project&gt;
+
+// Gradle: build.gradle.kts — programmable task graph
+plugins {
+    id("org.springframework.boot") version "3.3.0"
+    id("java")
+}
+
+group = "com.shopsphere"
+version = "1.4.0"
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+}
+
+tasks.test {
+    useJUnitPlatform()   // ordinary code, not just configuration
+}</code></pre>
+
+<h2>2. The Maven Build Lifecycle: Phases, Goals, and Plugin Bindings</h2>
+<p>Maven organizes a build into a fixed sequence of <strong>phases</strong>. Running any phase executes every phase before it, in order, which is the single most important thing to internalize about Maven: <code>mvn install</code> doesn't just run the install logic, it runs validate, then compile, then test, then package, then verify, then finally install, because each phase is assumed to depend on everything before it having already happened.</p>
+<p>The core phases of the <code>default</code> lifecycle, in order, are:</p>
+<ul>
+<li><strong>validate</strong> — checks the project is structurally correct and all information needed for the build is available (POM is well-formed, required properties are set).</li>
+<li><strong>compile</strong> — compiles the main source code in <code>src/main/java</code> into <code>target/classes</code>.</li>
+<li><strong>test</strong> — runs unit tests (via the Surefire plugin) against the compiled classes, using a test compiler step first for <code>src/test/java</code>.</li>
+<li><strong>package</strong> — takes the compiled code and packages it into its distributable format — a JAR for most ShopSphere services, or a WAR for a traditional servlet container deployment.</li>
+<li><strong>verify</strong> — runs any additional checks on the packaged artifact, including integration tests (via the Failsafe plugin, which is deliberately a separate plugin from Surefire so that integration tests can run against the packaged artifact after package but be distinguished from fast unit tests).</li>
+<li><strong>install</strong> — copies the packaged artifact into your local Maven repository (<code>~/.m2/repository</code>), making it available as a dependency for other projects built locally on the same machine — useful when developing <code>shopsphere-common</code> and wanting to test a change in <code>order-service</code> before publishing anywhere.</li>
+<li><strong>deploy</strong> — copies the final artifact to a remote repository (an internal Nexus or Artifactory instance, for instance) so other developers and CI machines can depend on it without needing to build it themselves.</li>
+</ul>
+<p>Crucially, <strong>phases by themselves do nothing</strong> — a phase is just a named point in the sequence. The actual work happens because plugins bind specific <strong>goals</strong> (a goal is a single, concrete unit of work a plugin knows how to perform, like <code>compiler:compile</code> or <code>surefire:test</code>) to phases. The <code>maven-compiler-plugin</code> binds its <code>compile</code> goal to the <code>compile</code> phase; the <code>maven-surefire-plugin</code> binds its <code>test</code> goal to the <code>test</code> phase. This is why adding a plugin to your POM with no explicit phase binding often "just works" — most plugins ship with sensible default phase bindings for their goals, and Spring Boot's <code>spring-boot-maven-plugin</code> binds its <code>repackage</code> goal to the <code>package</code> phase, which is what turns a plain JAR into an executable "fat JAR" with an embedded Tomcat and all dependencies bundled, right after the ordinary packaging step produces the thin JAR.</p>
+
+<pre><code>&lt;build&gt;
+    &lt;plugins&gt;
+        &lt;plugin&gt;
+            &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+            &lt;artifactId&gt;spring-boot-maven-plugin&lt;/artifactId&gt;
+            &lt;!-- default phase binding: repackage -&gt; package phase --&gt;
+            &lt;!-- no explicit &lt;executions&gt; block needed for the common case --&gt;
+        &lt;/plugin&gt;
+    &lt;/plugins&gt;
+&lt;/build&gt;</code></pre>
+
+<p>Gradle has no equivalent fixed lifecycle in the tool itself, but the <code>java</code> plugin (and, layered on top, the Spring Boot Gradle plugin) registers an analogous chain of tasks: <code>compileJava</code> → <code>processResources</code> → <code>classes</code> → <code>compileTestJava</code> → <code>test</code> → <code>jar</code> → <code>bootJar</code> → <code>assemble</code> → <code>check</code> → <code>build</code>. Running <code>./gradlew build</code> executes the whole graph in dependency order — the same conceptual shape as Maven's phase sequence, just expressed as an explicit graph of task dependencies rather than a hardcoded lifecycle, which is exactly why Gradle can incrementally skip tasks whose inputs haven't changed (covered in section 5) in a way Maven's fixed lifecycle model doesn't naturally support.</p>
+
+<div class="callout">
+<div class="callout-title">Why Failsafe is a separate plugin from Surefire</div>
+<p>Surefire (bound to the <code>test</code> phase) is meant for fast, isolated unit tests that don't need the packaged artifact or external resources. Failsafe (bound to <code>integration-test</code>, which sits between <code>package</code> and <code>verify</code>) is meant for slower integration tests — the kind that spin up a real database via TestContainers to test <code>order-service</code>'s repository layer against a real Postgres instance. Splitting them into separate plugins means a Surefire failure fails the build immediately at the <code>test</code> phase (fast feedback, don't even bother packaging), while Failsafe is explicitly designed so its tests can fail without immediately stopping the build before its own <code>verify</code> goal runs, allowing post-integration cleanup (tearing down containers) to happen even when tests fail.</p>
+</div>
+
+<h2>3. Dependency Scopes and Transitive Resolution</h2>
+<p>A dependency scope tells the build tool two things at once: which classpath the dependency belongs on (compile-time, test-time, runtime-only), and whether it should be carried along transitively to anything that depends on your artifact. Getting scopes wrong is one of the most common sources of bloated JARs, leaked internal dependencies, and <code>ClassNotFoundException</code>s that only appear in one environment.</p>
+<p>Maven's core scopes:</p>
+<ul>
+<li><strong>compile</strong> (the default) — available at compile time, test time, and runtime, and propagated transitively to consumers. Most ordinary library dependencies, like <code>spring-boot-starter-web</code> in <code>order-service</code>, use this scope implicitly.</li>
+<li><strong>provided</strong> — available at compile time and test time, but <em>not</em> packaged into the final artifact, because the runtime environment is expected to supply it. The classic example is the Servlet API when deploying a WAR to an application server that already provides it — packaging it again would risk a version clash with the container's own copy.</li>
+<li><strong>runtime</strong> — not needed to compile your code, but needed when it executes. A JDBC driver is the textbook case: <code>order-service</code>'s code talks to the database through Spring Data JPA's abstractions (compile-time dependency), and the concrete Postgres driver class is only loaded reflectively at runtime, so it can be scoped <code>runtime</code> rather than <code>compile</code>.</li>
+<li><strong>test</strong> — available only for compiling and running tests (<code>src/test/java</code>), excluded entirely from the packaged artifact. JUnit 5, Mockito, and TestContainers all belong here — you never want test frameworks bloating a production JAR or, worse, becoming an attack surface in a deployed service.</li>
+</ul>
+<p>Gradle's equivalent configurations map closely but with clearer separation between "needed by consumers" and "needed only internally": <code>implementation</code> is like <code>compile</code> but explicitly <em>not</em> exposed to consumers' compile classpath (a deliberate Gradle improvement over Maven's default, discussed more below), <code>api</code> is the configuration that <em>is</em> exposed transitively (used in library modules), <code>compileOnly</code> maps to <code>provided</code>, <code>runtimeOnly</code> maps to <code>runtime</code>, and <code>testImplementation</code>/<code>testRuntimeOnly</code> map to <code>test</code>.</p>
+<p>The reason scopes matter beyond just "which classpath": Maven (and Gradle) dependencies are <strong>transitive</strong> by default — if <code>order-service</code> depends on <code>spring-boot-starter-web</code>, and that starter depends on <code>spring-webmvc</code>, which depends on <code>spring-core</code>, all of those become part of <code>order-service</code>'s effective dependency graph without you declaring any of them explicitly. This is what makes starters so convenient (one declared dependency pulls in dozens of correctly-versioned transitive ones) and also what makes dependency graphs genuinely large and occasionally surprising — running <code>mvn dependency:tree</code> or <code>./gradlew dependencies</code> against any real Spring Boot service will typically reveal fifty-plus resolved artifacts from a handful of direct declarations.</p>
+
+<div class="callout warn">
+<div class="callout-title">Maven's <code>compile</code>-by-default leaks your dependencies to consumers</div>
+<p>If <code>shopsphere-common</code> (a shared library module used by multiple ShopSphere services) declares a dependency with the default <code>compile</code> scope, every service that depends on <code>shopsphere-common</code> also transitively gets that dependency on its own compile classpath — even if it's purely an implementation detail inside <code>shopsphere-common</code> that no consumer should ever need to know about, like a specific JSON-parsing utility library. This is exactly the problem Gradle's <code>implementation</code> vs. <code>api</code> split was designed to fix: declaring an internal-only dependency as <code>implementation</code> in Gradle keeps it off consumers' compile classpath entirely, shrinking their effective classpath and preventing them from accidentally compiling against a library they never explicitly chose to depend on. Maven has no equivalent distinction — everything not explicitly scoped otherwise leaks as <code>compile</code>.</p>
+</div>
+
+<h2>4. Dependency Conflict Resolution and Exclusions</h2>
+<p>Because dependencies are transitive and multiple paths through a dependency graph can request different versions of the same library, every non-trivial project eventually hits a <strong>diamond dependency conflict</strong>: <code>order-service</code> depends directly on library A, and also depends on library B, which itself depends on a different version of A. Only one version of A can actually end up on the classpath (the JVM has no notion of "two versions of the same class simultaneously" within one classloader), so the build tool must pick one deterministically.</p>
+<p>Maven resolves this with a rule called <strong>nearest-wins</strong> (also called nearest-definition): the version declared at the shallowest depth in the dependency tree wins, measured from your project's own POM. If <code>order-service</code> declares library A version 2.0 directly (depth 1), and also depends on library B (depth 1) which pulls in library A version 1.5 (depth 2), Maven picks 2.0 because it's nearer — closer to the root of the tree — regardless of which version is newer or which was declared first in the POM file. If two dependencies are at the exact same depth, the first one declared in the POM wins, which makes Maven's resolution sensitive to declaration order in genuinely ambiguous cases — a sharp edge worth knowing about when debugging a version that seems to have been picked "randomly."</p>
+<p>Gradle instead defaults to <strong>highest-version-wins</strong> among conflicting requests, but exposes this as an explicit, inspectable, and overridable resolution strategy rather than an implicit depth-based rule — you can force a specific version, fail the build loudly on any conflict instead of silently picking one, or write custom resolution logic:</p>
+
+<pre><code>configurations.all {
+    resolutionStrategy {
+        // force a specific version across the whole dependency graph
+        force("com.fasterxml.jackson.core:jackson-databind:2.17.1")
+
+        // or fail the build instead of silently resolving a conflict
+        failOnVersionConflict()
+    }
+}</code></pre>
+
+<p>Both tools also let you cut a specific transitive dependency out of the graph entirely via an <strong>exclusion</strong>, which is the right tool when a transitive dependency is actively wrong for your project — a common ShopSphere example is excluding the default Logback binding that <code>spring-boot-starter-web</code> pulls in transitively, in favor of Log4j2:</p>
+
+<pre><code>&lt;!-- Maven --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-web&lt;/artifactId&gt;
+    &lt;exclusions&gt;
+        &lt;exclusion&gt;
+            &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+            &lt;artifactId&gt;spring-boot-starter-logging&lt;/artifactId&gt;
+        &lt;/exclusion&gt;
+    &lt;/exclusions&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-log4j2&lt;/artifactId&gt;
+&lt;/dependency&gt;
+
+// Gradle
+implementation("org.springframework.boot:spring-boot-starter-web") {
+    exclude group: "org.springframework.boot", module: "spring-boot-starter-logging"
+}
+implementation("org.springframework.boot:spring-boot-starter-log4j2")</code></pre>
+
+<p>Exclusions and forced versions are blunt instruments — they change what's on the classpath without changing what any individual library's own POM or Gradle metadata declares it needs, so an aggressively-forced version can, in principle, be incompatible with what a dependency was actually tested against. This is exactly the problem BOMs (next section) solve more systematically, by curating a whole set of mutually-compatible versions up front rather than resolving conflicts one exclusion at a time after the fact.</p>
+
+<h2>5. BOMs: Curating a Compatible Version Set Across the Whole Graph</h2>
+<p>A <strong>Bill of Materials</strong> (BOM) is a special POM whose only job is to declare a curated, internally-consistent set of dependency versions — it doesn't add any of those dependencies to your build by itself, it just says "if you use any of these artifacts, here is the version that is known to work correctly together with everything else in this list." You "import" a BOM, and from then on, any dependency you declare from that BOM's coordinate list can omit its <code>&lt;version&gt;</code> entirely — the version comes from the BOM.</p>
+<p>Spring Boot's <code>spring-boot-dependencies</code> BOM is the canonical example, and it's what actually solves the version-compatibility problem that would otherwise make Spring Boot upgrades a nightmare. When ShopSphere's <code>order-service</code> inherits from <code>spring-boot-starter-parent</code> (a parent POM that itself imports <code>spring-boot-dependencies</code> as a BOM) or explicitly imports the BOM, declaring <code>spring-boot-starter-web</code>, <code>spring-boot-starter-data-jpa</code>, and <code>jackson-databind</code> with no version numbers at all means every one of those artifacts resolves to the exact version that the Spring Boot team tested together for that Boot release — not whatever version happens to win nearest-wins or highest-version-wins resolution against some unrelated transitive dependency elsewhere in the graph. Bumping the entire service to a new Spring Boot version becomes changing <em>one number</em> (the parent/BOM version) instead of hunting down and manually aligning dozens of individually-versioned dependencies.</p>
+
+<pre><code>&lt;!-- Maven: inheriting Spring Boot's BOM via the parent POM --&gt;
+&lt;parent&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-parent&lt;/artifactId&gt;
+    &lt;version&gt;3.3.0&lt;/version&gt;
+&lt;/parent&gt;
+
+&lt;dependencies&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+        &lt;artifactId&gt;spring-boot-starter-web&lt;/artifactId&gt;
+        &lt;!-- no &lt;version&gt; needed — comes from the inherited BOM --&gt;
+    &lt;/dependency&gt;
+&lt;/dependencies&gt;
+
+&lt;!-- Alternative: import the BOM without inheriting the whole parent POM
+     (useful if order-service already has its own parent, e.g. a
+     ShopSphere-wide internal parent POM) --&gt;
+&lt;dependencyManagement&gt;
+    &lt;dependencies&gt;
+        &lt;dependency&gt;
+            &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+            &lt;artifactId&gt;spring-boot-dependencies&lt;/artifactId&gt;
+            &lt;version&gt;3.3.0&lt;/version&gt;
+            &lt;type&gt;pom&lt;/type&gt;
+            &lt;scope&gt;import&lt;/scope&gt;
+        &lt;/dependency&gt;
+    &lt;/dependencies&gt;
+&lt;/dependencyManagement&gt;</code></pre>
+
+<pre><code>// Gradle — the Spring Boot Gradle plugin applies the equivalent BOM
+// automatically via its "dependency management" behavior; you can
+// also import it explicitly like any other platform:
+dependencies {
+    implementation(platform("org.springframework.boot:spring-boot-dependencies:3.3.0"))
+    implementation("org.springframework.boot:spring-boot-starter-web")   // version from the platform
+}</code></pre>
+
+<p>It's important to distinguish a BOM from a parent POM, because Maven conflates the two mechanisms in a way that confuses people new to the ecosystem. A <strong>parent POM</strong> is inherited (<code>&lt;parent&gt;</code>) and can supply far more than versions — plugin configuration, properties, a shared build section, resource filtering rules. A <strong>BOM</strong> is imported (<code>&lt;dependencyManagement&gt;</code> with <code>&lt;scope&gt;import&lt;/scope&gt;</code>) and supplies <em>only</em> version numbers for a set of coordinates — it doesn't affect plugin configuration or anything else about your build. <code>spring-boot-starter-parent</code> is convenient because it does both (it's a parent POM that happens to import the BOM internally and also sets sensible plugin defaults), but a project that already has its own required parent — as is common in larger organizations with an internal ShopSphere-wide parent POM providing common plugin config — can still get all of Spring Boot's version curation by importing <code>spring-boot-dependencies</code> as a BOM alone, without inheriting Spring's parent POM and losing its own.</p>
+
+<h2>6. Gradle's Task Graph, Incremental Builds, and the Build Cache</h2>
+<p>Gradle's defining performance advantage over Maven comes directly from the fact that its build model is an explicit graph of tasks with declared inputs and outputs, rather than a fixed sequence of phases. Because Gradle knows exactly what files and configuration each task reads and writes, it can determine, before running a task, whether anything relevant has actually changed since the last run — if <code>compileJava</code>'s inputs (source files, classpath, compiler options) are byte-for-byte identical to the last successful run, and its outputs (the compiled <code>.class</code> files) still exist and are untouched, Gradle skips re-executing it entirely and reports it as <strong>UP-TO-DATE</strong>. This is <strong>incremental build</strong>: only the tasks whose inputs actually changed, and anything downstream of them in the task graph, need to re-run.</p>
+<p>The <strong>build cache</strong> takes this further by making the up-to-date check non-local: instead of only remembering "did this exact machine already build this exact input set," Gradle can store task outputs in a cache (local, on disk, or a shared remote cache reachable by every developer and CI machine) keyed by a hash of the task's inputs. If another developer on the ShopSphere team — or a CI runner building the same commit — already compiled the exact same source with the exact same compiler settings, your build can pull the compiled output straight from the cache instead of recompiling at all. For a monorepo-style setup with a shared <code>shopsphere-common</code> module rebuilt by every service's CI pipeline, a shared remote build cache can turn a several-minute compile-and-test step into a near-instant cache hit for any commit that hasn't touched that module.</p>
+<p>Maven has historically had no equivalent mechanism baked into the core tool — its fixed-phase model doesn't naturally expose the fine-grained, declared input/output metadata a caching system needs, though incremental-compile plugins and (more recently) experimental build-cache support have narrowed this gap. This difference is the single biggest reason large, multi-module organizations with dozens of interdependent modules — think a full ShopSphere monorepo containing every microservice plus <code>shopsphere-common</code> — often gravitate toward Gradle specifically for build-speed reasons at scale, even when a single small service would build about equally fast in either tool.</p>
+
+<div class="callout">
+<div class="callout-title">Incremental correctness depends on accurate input declarations</div>
+<p>Gradle's UP-TO-DATE checking is only as trustworthy as the task's declared inputs and outputs. A custom Gradle task that reads a file it never declared as an <code>@InputFile</code> can silently produce stale output when that undeclared file changes — Gradle has no way to know it should invalidate the cache, because from its point of view nothing relevant changed. This is a real, recurring source of "but I changed the code and the build still used the old version" bug reports in custom Gradle build logic, and the fix is always to make sure every task's actual inputs and outputs are fully and correctly declared, not to disable caching wholesale.</p>
+</div>
+
+<h2>7. Multi-Module Projects: Splitting a Service and Declaring Inter-Module Dependencies</h2>
+<p>As a service grows, splitting a single monolithic module into several sub-modules inside one build often clarifies architecture and enforces boundaries that a single flat module can't. A common ShopSphere refactor is splitting <code>order-service</code> into <code>order-service-api</code> (request/response DTOs and the public interface other services might need to know about), <code>order-service-domain</code> (the core business logic — <code>Order</code>, <code>OrderItem</code>, pricing rules, state transitions — with no framework dependencies at all), and <code>order-service-infra</code> (Spring-specific wiring — REST controllers, JPA repositories, Kafka producers/consumers for <code>OrderPlaced</code>/<code>PaymentCaptured</code> events). This structure makes dependency direction explicit and enforceable at the build level: <code>infra</code> depends on <code>domain</code> and <code>api</code>, but <code>domain</code> has no idea <code>infra</code> exists — a real architectural boundary (this is one flavor of hexagonal/ports-and-adapters architecture) that the build tool now physically enforces, because <code>domain</code>'s module simply has no dependency declaration that could let it import anything from <code>infra</code>, so any accidental coupling is a compile error, not just a code-review nitpick.</p>
+<p>A second common pattern is a <strong>shared library module</strong> rather than a split of one service — <code>shopsphere-common</code>, containing genuinely cross-cutting code every service needs: shared event DTOs for Kafka messages, a common error-response format, shared validation annotations. Every microservice (order-service, inventory-service, payment-service, notification-service, catalog-service) depends on <code>shopsphere-common</code> as an ordinary dependency, whether it lives in the same multi-module build or is published independently to an artifact repository and consumed as a regular versioned dependency by otherwise-separate repos.</p>
+
+<h3>Maven multi-module structure</h3>
+<p>A Maven multi-module project has a root <strong>aggregator</strong> POM (packaging <code>pom</code>, not <code>jar</code>) listing its <code>&lt;modules&gt;</code>, and each sub-module has its own POM declaring the parent and its inter-module dependencies by coordinates:</p>
+
+<pre><code>&lt;!-- root pom.xml (aggregator) --&gt;
+&lt;project&gt;
+    &lt;groupId&gt;com.shopsphere&lt;/groupId&gt;
+    &lt;artifactId&gt;order-service-parent&lt;/artifactId&gt;
+    &lt;version&gt;1.4.0&lt;/version&gt;
+    &lt;packaging&gt;pom&lt;/packaging&gt;
+    &lt;modules&gt;
+        &lt;module&gt;order-service-domain&lt;/module&gt;
+        &lt;module&gt;order-service-api&lt;/module&gt;
+        &lt;module&gt;order-service-infra&lt;/module&gt;
+    &lt;/modules&gt;
+&lt;/project&gt;
+
+&lt;!-- order-service-infra/pom.xml --&gt;
+&lt;project&gt;
+    &lt;parent&gt;
+        &lt;groupId&gt;com.shopsphere&lt;/groupId&gt;
+        &lt;artifactId&gt;order-service-parent&lt;/artifactId&gt;
+        &lt;version&gt;1.4.0&lt;/version&gt;
+    &lt;/parent&gt;
+    &lt;artifactId&gt;order-service-infra&lt;/artifactId&gt;
+    &lt;dependencies&gt;
+        &lt;dependency&gt;
+            &lt;groupId&gt;com.shopsphere&lt;/groupId&gt;
+            &lt;artifactId&gt;order-service-domain&lt;/artifactId&gt;
+            &lt;version&gt;${project.version}&lt;/version&gt;
+        &lt;/dependency&gt;
+    &lt;/dependencies&gt;
+&lt;/project&gt;</code></pre>
+
+<h3>Gradle multi-module (multi-project) structure</h3>
+<p>Gradle calls this a multi-project build. A <code>settings.gradle.kts</code> at the root declares the included projects, and inter-module dependencies use the special <code>project(":path")</code> notation instead of full coordinates, because Gradle already knows these are sibling modules in the same build rather than externally-published artifacts:</p>
+
+<pre><code>// settings.gradle.kts
+rootProject.name = "order-service-parent"
+include("order-service-domain", "order-service-api", "order-service-infra")
+
+// order-service-infra/build.gradle.kts
+dependencies {
+    implementation(project(":order-service-domain"))
+    implementation(project(":order-service-api"))
+}</code></pre>
+
+<p>In both tools, running a build from the root aggregator/root project builds every module in the correct dependency order automatically — Maven does a topological sort of the module graph (the <strong>reactor</strong>), and Gradle does the same via its task graph — so you never have to manually sequence "build domain, then api, then infra" yourself.</p>
+
+<h2>8. Reproducibility Across Many Repos: Parent POM vs. Version Catalogs</h2>
+<p>Once ShopSphere has five (or fifty) separate microservice repositories, each with its own build file, a new problem appears that neither dependency scopes nor BOMs alone fully solve: how do you keep the Spring Boot version, the internal <code>shopsphere-common</code> version, and shared plugin versions consistent across repos that aren't even part of the same multi-module build, without manually editing every repo every time something needs to bump?</p>
+<p>Maven's answer is an organization-wide <strong>parent POM</strong>, published once to an internal artifact repository, that every service's own POM inherits from — not a multi-module aggregator (the services aren't part of one reactor build), just a shared ancestor providing common <code>&lt;properties&gt;</code>, an imported BOM, shared plugin configuration, and common dependency versions via <code>&lt;dependencyManagement&gt;</code>. Bumping the whole fleet to a new Spring Boot version, a new internal linting plugin version, or a new company-wide Java version target becomes releasing a new version of one internal parent POM and updating each service's <code>&lt;parent&gt;</code> version tag — still a per-repo change, but a single-line one instead of a multi-line hunt through each POM's dependency versions.</p>
+<p>Gradle's more modern answer to the same problem is the <strong>version catalog</strong> — a centrally-defined, type-safe set of dependency and plugin version aliases, typically declared in a <code>libs.versions.toml</code> file, that can itself be published as a shared artifact and consumed from multiple otherwise-unrelated Gradle builds:</p>
+
+<pre><code>## gradle/libs.versions.toml
+[versions]
+spring-boot = "3.3.0"
+shopsphere-common = "2.1.0"
+
+[libraries]
+spring-boot-starter-web = { module = "org.springframework.boot:spring-boot-starter-web", version.ref = "spring-boot" }
+shopsphere-common = { module = "com.shopsphere:shopsphere-common", version.ref = "shopsphere-common" }
+
+[plugins]
+spring-boot = { id = "org.springframework.boot", version.ref = "spring-boot" }</code></pre>
+
+<pre><code>// build.gradle.kts — consuming the catalog with type-safe accessors
+dependencies {
+    implementation(libs.spring.boot.starter.web)
+    implementation(libs.shopsphere.common)
+}</code></pre>
+
+<p>The advantage over a parent POM is twofold: version catalogs are purely data (a TOML file, not inherited build logic), so they can't accidentally carry along unwanted plugin configuration the way an inherited parent POM sometimes does, and the generated type-safe accessors (<code>libs.spring.boot.starter.web</code>) catch a typo'd dependency coordinate at build-script-compile time rather than failing much later during dependency resolution. The trade-off is that a version catalog only centralizes version <em>numbers</em> and coordinates — it doesn't carry shared plugin configuration or build logic the way a Maven parent POM (or a Gradle convention plugin, a related but separate mechanism for sharing actual build logic across projects) can.</p>
+
+<div class="callout warn">
+<div class="callout-title">Reproducibility also depends on the wrapper, not just version pinning</div>
+<p>Pinning dependency versions via a BOM, parent POM, or version catalog only solves half of reproducibility — the other half is pinning the build tool's own version. Both ecosystems solve this with a <strong>wrapper</strong> (<code>mvnw</code>/<code>mvnw.cmd</code> for Maven, <code>gradlew</code>/<code>gradlew.bat</code> for Gradle): a small checked-in script plus a properties file recording the exact Maven or Gradle version the project was built and tested with, which downloads that exact version on first use if it isn't already present. Without the wrapper, "reproducible" dependency versions are undermined by two developers (or a developer and a CI runner) running different Maven or Gradle versions, which can themselves resolve dependencies slightly differently or behave differently around plugin defaults. Every ShopSphere repo should commit its wrapper scripts and never rely on a globally-installed Maven or Gradle version.</p>
+</div>
+
+<h2>Concepts Worth Being Able to Explain From First Principles</h2>
+
+<details class="concept-qa">
+<summary>Why does running "mvn package" also run the test phase, even though you didn't ask for tests?</summary>
+<div class="qa-body">Maven's default lifecycle is a strictly ordered sequence of phases, and invoking any phase implicitly invokes every phase before it in that sequence, because each phase's work is assumed to depend on the previous ones having already succeeded — packaging code that hasn't been verified to compile and pass its tests would risk producing a broken artifact. Since <code>test</code> comes before <code>package</code> in the sequence (validate, compile, test, package, verify, install, deploy), asking Maven for <code>package</code> means Maven first runs validate, then compile, then test, and only then package. This is also why <code>-DskipTests</code> exists as an explicit escape hatch — without it, there would be no way to package quickly during local iteration without waiting on the full test suite every time, but it's a flag you reach for deliberately, not the default behavior.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why can nearest-wins dependency resolution in Maven silently pick an older version of a library than what you'd expect?</summary>
+<div class="qa-body">Nearest-wins resolves purely on tree depth from your project's own POM, not on version number or recency — the version declared closer to your project root wins even if it's numerically older than a competing version declared deeper in the tree via a transitive dependency. If order-service directly declares an old library A version 1.0 (depth 1) as a leftover from an earlier refactor, and also depends on a starter that transitively pulls in library A version 3.0 (depth 3) which actually fixes a bug your code is hitting, Maven still picks 1.0, because "nearest" was never about "best" or "newest," it's purely structural. This is exactly the kind of surprise a BOM is designed to eliminate — with a BOM in play, the version comes from the curated dependency-management section rather than from tree-depth arithmetic, sidestepping the whole nearest-wins mechanism for anything the BOM covers.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What problem does a BOM actually solve that plain dependency declarations with explicit versions don't?</summary>
+<div class="qa-body">Declaring explicit versions for every dependency works until you have dozens of interdependent libraries (Spring MVC, Jackson, Hibernate, various Spring Boot starters) that all need to be mutually compatible — one wrong manual version bump anywhere in that set can produce a runtime NoSuchMethodError or NoClassDefFoundError from two libraries compiled against incompatible versions of a shared third dependency, and there's no compile-time signal that this happened. A BOM replaces "you manually keep dozens of versions compatible" with "one team (Spring's release engineering) already tested this exact combination of versions together and published the matrix as data you import." Upgrading becomes changing the one BOM version number, and every dependency covered by that BOM moves in lockstep to a version already known to work with all the others in that same release — you're borrowing someone else's compatibility testing instead of redoing it yourself for every dependency combination.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is Gradle generally faster on repeated builds than Maven, and when does that advantage disappear?</summary>
+<div class="qa-body">Gradle's speed advantage on repeated builds comes from incremental build and the build cache, both of which depend on Gradle's task model exposing explicit, declared inputs and outputs for every task, letting it skip re-executing a task whose inputs are provably unchanged, and even fetch previously-computed outputs from a shared cache instead of recomputing them locally. The advantage is largest on large, mostly-unchanged codebases where only a small fraction of modules changed since the last build — a monorepo-style ShopSphere build where you touched only inventory-service benefits enormously from skipping recompilation of the other four services entirely. The advantage mostly disappears on a clean build with a cold cache (nothing to compare against, nothing to reuse) and on small single-module projects where the fixed overhead of computing up-to-date checks and cache lookups isn't meaningfully smaller than just doing the work.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does splitting order-service into api/domain/infra modules actually change what mistakes are possible, rather than just being organizational tidiness?</summary>
+<div class="qa-body">In a single flat module, nothing stops a developer from importing a Spring-specific class directly into what's conceptually pure business logic, because the compiler has no notion of "this package shouldn't depend on that package" — it's purely a convention that code review has to catch. Once domain is a separate module with no dependency declaration on infra, that boundary becomes a compile error rather than a style violation: domain's build file simply has no path to any class living in infra, so the Java compiler itself refuses to build code that tries to violate the boundary. This matters concretely for testability and portability — order-service-domain, having zero Spring or JPA dependencies, can be unit-tested with plain JUnit at very high speed with no Spring context startup at all, and could in principle be reused in a different framework entirely, neither of which is true if the same code is entangled with framework-specific classes in one flat module.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does an internal parent POM or version catalog matter more as an organization grows from one repo to many microservice repos?</summary>
+<div class="qa-body">Within a single repo (or a single multi-module build), a BOM or dependency-management section already keeps versions consistent across everything built together in one place. The new problem that appears once you have several genuinely separate repos — order-service, inventory-service, payment-service, each with its own independent build file — is that there's no shared build to hold a single dependency-management section for all of them; each repo's BOM import or version pins are independent files that can silently drift apart over time as different engineers bump different services at different times. A shared internal parent POM or a published version catalog gives every repo a single upstream source of truth to inherit or import, so that bumping the whole fleet to a new Spring Boot version or a new internal library version is a change to one shared artifact plus a one-line version bump per repo, rather than an uncoordinated, error-prone hunt through every repo's dependency versions independently.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why can an exclusion or a forced version fix a dependency conflict but still leave a subtly broken build?</summary>
+<div class="qa-body">An exclusion or a forced version changes what ends up on the classpath, but it does nothing to verify that the forced version is actually compatible with everything else that expected a different version — it's a purely mechanical override, not a compatibility check. If library B was built and tested against library A version 1.5, and you force library A to version 3.0 to resolve a conflict with some other dependency, library B now runs against a version of A it was never actually tested with; it might work by luck, or it might fail at runtime in a way no compiler could have caught, because the incompatibility (a changed method signature, a changed default behavior) only manifests when that specific code path executes. This is precisely why BOMs are considered a more robust solution than reactive exclusions and forced versions — a BOM's version set was chosen and tested as a coherent whole upfront, rather than assembled after the fact by forcing individual conflicts to resolve one at a time.</div>
+</details>
+
+<h2>Related Topics</h2>
+<div class="related-grid">
+<div class="related-card" onclick="window.location.hash='/spring-core-mechanics'"><div class="rc-title">Spring Core Mechanics</div><div class="rc-sub">Auto-configuration and starters are themselves Maven/Gradle dependencies that trigger classpath-based bean registration</div></div>
+<div class="related-card" onclick="window.location.hash='/ci-cd-deployment'"><div class="rc-title">CI/CD &amp; Deployment Strategies</div><div class="rc-sub">The build step in every CI/CD pipeline is exactly the Maven/Gradle lifecycle covered here</div></div>
+<div class="related-card" onclick="window.location.hash='/testing-strategies'"><div class="rc-title">Testing Strategy: JUnit5, Mockito, TestContainers</div><div class="rc-sub">JUnit 5's Surefire/Failsafe (Maven) and test task (Gradle) wiring is part of the build lifecycle</div></div>
+<div class="related-card" onclick="window.location.hash='/docker-kubernetes'"><div class="rc-title">Containers &amp; Orchestration: Docker, Kubernetes</div><div class="rc-sub">A multi-stage Dockerfile's build stage runs this exact Maven/Gradle build before copying the JAR into a slim runtime image</div></div>
+</div>

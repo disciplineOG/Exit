@@ -267,6 +267,108 @@ if (!rateLimiter.tryAcquire(rateLimitKey(customerId, channel))) {
   <p>The state machine doubles as the foundation for <a href="#/observability-production">production observability</a>: a dashboard tracking the count of notifications in each state over time surfaces a provider degradation (a spike in FAILED-transient) long before a user complaint does, and DLQ depth alarms catch systematic failures — a bad template deploy, a provider API contract change — within minutes instead of being discovered when someone notices a whole class of notifications silently stopped.</p>
 </div>
 
+<h2>9. Rendering Content and Talking to the Provider API</h2>
+<p>Everything up to this point has been about getting a notification-intent event to the right place, exactly once, in the right order, with a fallback if a provider is unhealthy. None of that has actually touched the two most concrete pieces of the problem: turning <code>templateVars</code> into an HTML email a customer opens in Gmail, and what the actual HTTP conversation with a provider like SendGrid or Amazon SES looks like when it's failing. Those mechanics deserve their own treatment, because "call the provider" hides a surprising amount of design.</p>
+
+<h3>9.1 Templating: separating copy from code</h3>
+<p>The notification event carries structured data — <code>{ "orderId": "ORD-77213", "amount": "49.00" }</code> — not markup. Something has to turn that into the actual HTML body of an email, and the wrong way to do it is string concatenation inside a Java service class, because that couples a marketing wording change to a code deploy, which is exactly the coupling section 1 argued against for the service boundary as a whole. The same argument applies one layer down, inside notification-service itself: templates should be data-like artifacts a non-engineer can edit, not <code>String.format</code> calls buried in <code>OrderShippedHandler.java</code>.</p>
+<p>This is what a server-side templating engine like <strong>Thymeleaf</strong> or <strong>FreeMarker</strong> is for. Both let you author an HTML file with placeholders and light control flow (loops for line items, conditionals for "show a discount banner only if one applies"), and both integrate directly with Spring Boot's templating support so the same engine used for server-rendered web pages elsewhere in the stack can render an email body from a Java model object. A minimal Thymeleaf email template looks like this:</p>
+<pre><code>&lt;!-- templates/email/order-shipped.html --&gt;
+&lt;html xmlns:th="http://www.thymeleaf.org"&gt;
+&lt;body&gt;
+  &lt;p&gt;Hi &lt;span th:text="${customerName}"&gt;Customer&lt;/span&gt;,&lt;/p&gt;
+  &lt;p&gt;Your order &lt;strong th:text="${orderId}"&gt;ORD-00000&lt;/strong&gt; has shipped
+     and should arrive by &lt;span th:text="${eta}"&gt;a date&lt;/span&gt;.&lt;/p&gt;
+  &lt;a th:href="${trackingUrl}" href="#"&gt;Track your package&lt;/a&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+<pre><code>@Service
+public class EmailTemplateRenderer {
+
+    private final TemplateEngine templateEngine; // Spring's ThymeleafAutoConfiguration wires this
+
+    public String render(String templateName, Map&lt;String, Object&gt; templateVars) {
+        Context context = new Context();
+        context.setVariables(templateVars);
+        return templateEngine.process("email/" + templateName, context);
+    }
+}
+</code></pre>
+<p>The notification-type-to-template mapping (<code>ORDER_SHIPPED</code> → <code>order-shipped.html</code>) is itself data, typically a row in a <code>notification_templates</code> table keyed by type, channel, and locale, so that adding French-language order-shipped emails or A/B testing two subject lines is a content change, not a code change. Rendering happens after the idempotency claim in section 4.2 and before the provider call — a rendering exception (a missing template variable) is exactly the kind of permanent, non-retryable failure section 5 routes straight to the DLQ rather than retrying with backoff, since retrying won't fix a template bug.</p>
+
+<h3>9.2 Calling the provider: request shape and retry/backoff on outages</h3>
+<p>Once rendered, the HTML body and the recipient's address get handed to a provider client — SendGrid's REST API or Amazon SES's API are the canonical examples, and both follow the same shape: a synchronous HTTPS call that either accepts the message for delivery (2xx, usually with a provider-assigned message ID you store for the <code>SENT</code> state in section 8) or rejects it. The rejection cases fall into the same transient/permanent split already established for the DLQ:</p>
+<ul>
+  <li><strong>Transient failures</strong> — a 429 (provider-side rate limiting), a 5xx, or a connection timeout — mean the provider is temporarily unable or unwilling to accept the request, and the correct response is exactly the exponential-backoff-with-jitter retry from section 8, not an immediate hammering retry. A SendGrid or SES outage during a flash sale is precisely the scenario that makes jitter matter: thousands of emails queued at once, all backing off and retrying on a spread-out schedule instead of a synchronized one.</li>
+  <li><strong>Permanent failures</strong> — a 400 for a malformed recipient address, a 401 for a bad API key — will never succeed no matter how many times you retry, and should be routed straight to the DLQ the same way a template rendering exception is, rather than burning through retry attempts pointlessly.</li>
+</ul>
+<pre><code>public DeliveryResult sendEmail(RenderedEmail email) {
+    try {
+        ProviderResponse resp = sendGridClient.send(email); // or sesClient.sendEmail(...)
+        return DeliveryResult.sent(resp.getMessageId());
+    } catch (ProviderRateLimitException | ProviderServerException | TimeoutException e) {
+        throw new RetryableDeliveryException(e); // scheduled retry, backoff + jitter (section 8)
+    } catch (ProviderRejectedException e) {
+        throw new NonRetryableDeliveryException(e); // straight to DLQ (section 5)
+    }
+}
+</code></pre>
+<p>This is the same <code>NotificationProvider</code> abstraction from section 6 — the SMS example there and the email example here are the same interface shape, and the same primary/secondary circuit-breaker fallback applies: SendGrid down for four minutes during a flash sale should fail over to a secondary transactional email provider using the identical mechanics already built for SMS, not a parallel bespoke resilience path written just for email.</p>
+
+<h3>9.3 Bounce and complaint webhooks: delivery status doesn't end at "provider accepted it"</h3>
+<p>A 202 from SendGrid or a successful <code>SendEmailResponse</code> from SES means the provider accepted the message for delivery — it does not mean a human received it. Real delivery outcomes (the mailbox doesn't exist, the mailbox is full, the recipient marked it as spam) are discovered asynchronously, after the original request already returned, and providers report them the same way ShopSphere reports events to notification-service in the first place: as a webhook callback to an HTTP endpoint you register with the provider.</p>
+<p>Two categories of webhook matter enough to require explicit handling, because both feed back into decisions notification-service makes about future sends to that address:</p>
+<ul>
+  <li><strong>Bounce webhooks</strong> distinguish a soft bounce (mailbox temporarily full, provider's mail server was unreachable — safe to retry later) from a hard bounce (mailbox doesn't exist, domain doesn't resolve — retrying is pointless and repeatedly trying to send to a dead address damages ShopSphere's sender reputation with every mailbox provider watching that metric). A hard bounce should flip that address to a suppressed state so no future notification — not just this one — is attempted against it until a customer supplies a corrected address.</li>
+  <li><strong>Complaint webhooks</strong> fire when a recipient clicks "mark as spam" in their mail client. This is a stronger signal than an unsubscribe click and is typically treated the same way legally and operationally: immediate, permanent suppression for that address, independent of the customer's stored notification preferences, since continuing to email an address that generated a spam complaint is what gets a sending domain blacklisted by mailbox providers, which would break email delivery for every ShopSphere customer, not just this one.</li>
+</ul>
+<pre><code>@PostMapping("/webhooks/sendgrid/events")
+public ResponseEntity&lt;Void&gt; handleProviderEvents(@RequestBody List&lt;ProviderEvent&gt; events) {
+    for (ProviderEvent event : events) {
+        switch (event.getType()) {
+            case "bounce" -> {
+                if (event.isPermanent()) {
+                    suppressionListService.suppress(event.getRecipient(), Reason.HARD_BOUNCE);
+                } // soft bounces just update delivery status, no suppression
+            }
+            case "spamreport" -> suppressionListService.suppress(event.getRecipient(), Reason.COMPLAINT);
+            case "delivered" -> deliveryStatusService.markDelivered(event.getMessageId());
+        }
+    }
+    return ResponseEntity.ok().build();
+}
+</code></pre>
+<p>Notice this webhook endpoint has the same correctness concerns as any other externally-triggered handler on this page: providers retry webhook delivery on their side too, so this handler must itself be idempotent (keyed on the provider's event ID, same pattern as section 4.2), and the suppression check belongs alongside the preference and rate-limit checks from section 7 — a suppressed address should be skipped before a provider call is even attempted, the same way an opted-out customer is.</p>
+
+<h3>9.4 One content template, many channels</h3>
+<p>An <code>OrderShipped</code> notification isn't really "an email" — it's a piece of content ("your order ORD-77213 has shipped, arriving by Friday") that might go out as an email, an SMS, and a push notification, depending on the customer's channel preference from section 7. The naive approach writes three separate copies of that message — an HTML template for email, a hardcoded string for SMS, a hardcoded string for push — and every future wording change (marketing wants to add the carrier name) now has to be found and edited in three places, in three different formats, by whoever remembers all three exist.</p>
+<p>The more durable design treats the notification's <em>content</em> as channel-independent data and pushes channel-specific formatting to the last possible step. A single template record per notification type carries the semantic content once — a title, a body with placeholders, an optional call-to-action URL — and a thin per-channel renderer decides how to express that content within the channel's constraints:</p>
+<pre><code>{
+  "notificationType": "ORDER_SHIPPED",
+  "title": "Your order has shipped",
+  "body": "Order {{orderId}} has shipped and should arrive by {{eta}}.",
+  "ctaText": "Track your package",
+  "ctaUrl": "{{trackingUrl}}"
+}
+</code></pre>
+<pre><code>public interface ChannelRenderer {
+    RenderedContent render(NotificationTemplate template, Map&lt;String, Object&gt; vars);
+}
+
+// Email: wraps title/body/cta in the full HTML template from section 9.1
+public class EmailChannelRenderer implements ChannelRenderer { ... }
+
+// SMS: title dropped (no subject line concept), body truncated to carrier limits,
+// CTA becomes a bare URL appended to the body
+public class SmsChannelRenderer implements ChannelRenderer { ... }
+
+// Push: title becomes the notification heading, body truncated further,
+// CTA URL becomes a deep-link payload rather than visible text
+public class PushChannelRenderer implements ChannelRenderer { ... }
+</code></pre>
+<p>This is the same lesson as templates being data rather than code (9.1), applied one level higher: the wording lives once, per notification type, and each <code>ChannelRenderer</code> is responsible only for the mechanical transformation into that channel's format — truncation, markup stripping, deep-link construction — never for re-authoring the message. A wording change to the "your order has shipped" copy is now one edit that automatically propagates to email, SMS, and push, rather than three edits that can quietly drift out of sync with each other over time.</p>
+
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
 
 <details class="concept-qa">
@@ -307,6 +409,26 @@ if (!rateLimiter.tryAcquire(rateLimitKey(customerId, channel))) {
 <details class="concept-qa">
 <summary>Why does rate limiting have to live in the shared notification-service rather than in each upstream producing service?</summary>
 <div class="qa-body">A per-customer rate limit is only meaningful if it's checked against a single, shared count of everything sent to that customer. If order-service and a marketing campaign service each maintain their own independent rate-limit counters, a customer can receive the full quota from each service simultaneously — the limits don't compose, they just multiply. The only way to enforce "this customer gets at most 5 SMS per hour, period" is to have exactly one component sit on the send path for every notification to that customer and check a single shared counter (a token bucket keyed by customer and channel) before any dispatch happens, which is only achievable with a centralized notification-service.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why should email templates be rendered through Thymeleaf/FreeMarker with the template stored as data, rather than built with string concatenation in the handler class?</summary>
+<div class="qa-body">If the HTML for a "your order has shipped" email is assembled with <code>String.format</code> or concatenation inside <code>OrderShippedHandler.java</code>, then every wording change — even fixing a typo — requires a code change, a code review, and a full deploy of notification-service. That's the exact same coupling problem section 1 uses to justify pulling notifications out of order-service in the first place, just recurring one layer deeper: it doesn't matter that the concern is centralized in one service if the content is still welded to code inside that service. A templating engine like Thymeleaf or FreeMarker lets the template live as an HTML file (or a database row) with placeholders and light control flow, resolved against a model object at render time. That makes wording an operational, non-engineering change, and it also means the template can be authored and reviewed independently of the Java code that decides whether to send it.</div>
+</details>
+
+<details class="concept-qa">
+<summary>A SendGrid or SES call returns a 2xx response — does that mean the customer received the email, and how should notification-service react differently to a 429 versus a 400 from the provider?</summary>
+<div class="qa-body">No — a 2xx only means the provider accepted the message into its own sending pipeline; whether a human actually receives it is discovered later, asynchronously, via bounce and complaint webhooks. As for the two failure codes: a 429 (provider-side rate limiting) or a 5xx is a transient failure — the provider is temporarily unable to accept the request, and the correct response is the same exponential-backoff-with-jitter retry already used for any other transient failure in this design (section 8), because retrying later has a real chance of succeeding. A 400 for a malformed recipient address is a permanent failure — no amount of retrying changes whether that address is well-formed — so it should be routed straight to the DLQ (section 5) instead of consuming retry attempts that can't possibly help. Treating both the same way either wastes retries on failures that will never succeed, or gives up on failures that would have resolved themselves.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does a hard bounce need to permanently suppress an address, rather than just letting the next scheduled retry (section 8) try again?</summary>
+<div class="qa-body">The retry-with-backoff machinery in section 8 exists for transient failures — conditions expected to change given enough time, like a provider being temporarily overloaded. A hard bounce (mailbox doesn't exist, domain doesn't resolve) is not transient: retrying a fixed, permanent failure just repeats the same rejection on the same schedule forever, and it actively damages ShopSphere's sender reputation with mailbox providers, since repeated sends to invalid addresses is one of the signals spam filters use to judge a sending domain. That's why bounce handling needs its own suppression list, separate from the retry/DLQ machinery for the send itself: once a hard bounce webhook arrives, every future notification to that address — regardless of type or channel — should be skipped before a provider call is even attempted, the same way a rate-limited or opted-out customer is skipped in section 7.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why maintain one channel-independent content template per notification type instead of a separate email template, SMS string, and push string for the same event?</summary>
+<div class="qa-body">The content — "order ORD-77213 has shipped, arriving by Friday" — is the same regardless of which channel delivers it; only the presentation constraints differ (email supports rich HTML and a subject line, SMS has a character limit and no markup, push has a short heading and a deep link instead of a clickable URL). Maintaining three independent copies of that message means a wording change has to be found and applied in three different formats, in three different places, and nothing stops them from silently drifting apart over time — a customer might get "arriving by Friday" in their email and a stale "arriving in 3-5 days" in their SMS because only one copy got updated. Storing the content once per notification type and pushing channel-specific formatting into a thin per-channel renderer (truncate for SMS, wrap in HTML for email, build a deep link for push) means a wording change is one edit that automatically applies everywhere it's sent, which is the same "don't duplicate a cross-cutting concern" argument section 1 makes for the service boundary, applied to content instead of infrastructure.</div>
 </details>
 
 <h2>Related Topics</h2>

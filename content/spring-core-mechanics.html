@@ -248,6 +248,88 @@ public class CheckoutAuditAspect {
 <p>Auto-configuration is the same inversion-of-control idea from section 1, one level up: instead of your application code deciding "if Redis is on the classpath, construct a <code>RedisTemplate</code> with these settings," a starter declares the intent conditionally and the container decides, at startup, whether the condition holds. You get to skip writing that wiring entirely for the common case, and you retain full override power for the uncommon one.</p>
 </div>
 
+<h2>9. The Spring MVC Request Lifecycle, End to End</h2>
+<p>Everything in sections 1–8 explains how the container builds and wires the object graph. This section is about what happens to a single HTTP request once that graph already exists — the path a request takes from the servlet container down to a ShopSphere controller method and back out again. It's worth walking end to end because the names involved (<code>DispatcherServlet</code>, <code>HandlerMapping</code>, <code>HandlerAdapter</code>) are usually memorized as trivia without understanding why each one has to exist as a separate object.</p>
+<h3>9.1 DispatcherServlet as the front controller</h3>
+<p>A raw servlet container (Tomcat, embedded in a Spring Boot app by default) has no idea what a <code>@RestController</code> or an <code>@GetMapping</code> is — those are Spring concepts, not servlet-spec concepts. The bridge is <code>DispatcherServlet</code>, a single <code>HttpServlet</code> that Spring Boot registers to handle (by default) every request path. This is the Front Controller pattern: instead of the servlet container mapping different URLs to different servlet classes directly, it maps everything to one servlet, and that one servlet becomes the single funnel through which every request to the application passes. All of the routing intelligence — which controller method handles <code>GET /orders/{id}</code> versus <code>POST /orders</code> — lives inside Spring's own machinery behind that one servlet, not in the servlet container's own URL-mapping table.</p>
+<p>Centralizing on one servlet is what makes it possible for Spring to apply uniform, cross-cutting request handling — argument resolution, exception handling via <code>@ExceptionHandler</code>/<code>@ControllerAdvice</code>, view resolution — in exactly one place, rather than duplicating that machinery across many hand-registered servlets.</p>
+<h3>9.2 HandlerMapping: deciding which method handles the request</h3>
+<p>Once <code>DispatcherServlet</code> receives a request, its first job is to figure out <em>which</em> code should handle it. It delegates this to a <code>HandlerMapping</code> — for annotation-based controllers, concretely <code>RequestMappingHandlerMapping</code>, which was built at startup by scanning every <code>@Controller</code>/<code>@RestController</code> bean for <code>@RequestMapping</code>-family annotations (<code>@GetMapping</code>, <code>@PostMapping</code>, etc.) and indexing them by URL pattern, HTTP method, headers, and content type. Given an incoming request like <code>GET /orders/482</code>, <code>HandlerMapping</code> matches the path against that index and returns a <code>HandlerExecutionChain</code> — not just the target method, but that method bundled together with any <code>HandlerInterceptor</code>s (see 9.4) that should wrap the call.</p>
+<p>The "handler" at this point is represented as a <code>HandlerMethod</code> — effectively a reference to a specific method on a specific controller bean (e.g. <code>OrderController.getOrder(Long id)</code>), plus the resolved path variables. Nothing has been invoked yet; <code>HandlerMapping</code>'s only job is figuring out <em>what</em> should run, not running it.</p>
+<h3>9.3 HandlerAdapter: actually invoking the handler</h3>
+<p><code>DispatcherServlet</code> doesn't call the handler method directly, because "handler" is a deliberately generic concept — historically Spring supported handlers that weren't annotated methods at all (implementing <code>Controller</code> or <code>HttpRequestHandler</code> directly), and <code>DispatcherServlet</code> shouldn't need to know the invocation mechanics for every possible handler shape. Instead it delegates to a <code>HandlerAdapter</code> — for annotated controllers, <code>RequestMappingHandlerAdapter</code> — whose job is specifically knowing how to invoke a <code>HandlerMethod</code>: resolving its arguments, calling it, and packaging its return value into something <code>DispatcherServlet</code> can act on. This is the Adapter pattern applied to request dispatch: <code>DispatcherServlet</code> talks to one stable interface (<code>HandlerAdapter</code>), and different handler types (annotated methods, legacy <code>Controller</code> implementations, WebFlux functional endpoints) each get their own adapter implementation behind it.</p>
+<h3>9.4 Argument resolution and HttpMessageConverters</h3>
+<p>Before the controller method can actually be called, its parameters need real values — a <code>@PathVariable Long id</code>, a <code>@RequestBody CreateOrderRequest body</code>, an <code>@RequestParam String status</code>. <code>RequestMappingHandlerAdapter</code> delegates each parameter to a chain of <code>HandlerMethodArgumentResolver</code>s, each of which knows how to satisfy one category of parameter (path variables, query parameters, request headers, the request/response objects themselves, or an <code>@RequestBody</code>-annotated object).</p>
+<p>For an <code>@RequestBody</code> parameter specifically, the argument resolver (<code>RequestResponseBodyMethodProcessor</code>) doesn't do the byte-to-object conversion itself — it delegates to an <code>HttpMessageConverter</code>, chosen by matching the request's <code>Content-Type</code> header against each converter's supported media types (e.g. <code>MappingJackson2HttpMessageConverter</code> for <code>application/json</code>, backed by Jackson). The converter reads the raw request body bytes and deserializes them into the Java type the controller method declared — turning a raw JSON payload for a ShopSphere checkout into a fully-formed <code>CreateOrderRequest</code> object before <code>OrderController.placeOrder(...)</code> is even invoked. The same mechanism runs in reverse on the way out: whatever the controller method returns gets handed to a matching <code>HttpMessageConverter</code>, which serializes it back to bytes (JSON, by default, for a typical ShopSphere REST endpoint) and sets the response <code>Content-Type</code> accordingly.</p>
+<pre><code>@RestController
+@RequestMapping("/orders")
+public class OrderController {
+
+    // HandlerMapping matches "GET /orders/482" to this method.
+    // Argument resolvers turn "482" into a Long for `id`.
+    // The returned Order is handed to an HttpMessageConverter,
+    // which serializes it to JSON because of @RestController (see 9.5).
+    @GetMapping("/{id}")
+    public Order getOrder(@PathVariable Long id) {
+        return orderService.findById(id);
+    }
+
+    // @RequestBody triggers an HttpMessageConverter on the way IN:
+    // raw JSON bytes -> CreateOrderRequest, before this method runs.
+    @PostMapping
+    public Order placeOrder(@RequestBody CreateOrderRequest request) {
+        return orderService.placeOrder(request);
+    }
+}</code></pre>
+<h3>9.5 View resolution versus @ResponseBody</h3>
+<p>Once the handler method returns, <code>DispatcherServlet</code> has to decide what to actually send back. In classic Spring MVC (server-rendered HTML), a controller method returns a logical view name (a <code>String</code>, or a <code>ModelAndView</code> bundling a view name with model attributes), and a <code>ViewResolver</code> (e.g. <code>InternalResourceViewResolver</code> mapping a name like <code>"orderConfirmation"</code> to <code>/WEB-INF/views/orderConfirmation.jsp</code>) maps that logical name to an actual renderable <code>View</code>, which is then rendered with the model data to produce the HTML response body.</p>
+<p><code>@ResponseBody</code> — implied on every method of a class annotated <code>@RestController</code>, since <code>@RestController</code> is itself <code>@Controller</code> + <code>@ResponseBody</code> — skips view resolution entirely. It tells <code>RequestMappingHandlerAdapter</code> that the method's return value <em>is</em> the response body, not a view name, so it should be handed straight to an <code>HttpMessageConverter</code> (as in 9.4) instead of a <code>ViewResolver</code>. This is why virtually every ShopSphere REST controller is annotated <code>@RestController</code> rather than plain <code>@Controller</code>: a JSON API has no views to resolve, and the whole view-resolution machinery would simply never be exercised.</p>
+<h3>9.6 Servlet Filters versus Spring HandlerInterceptors</h3>
+<p>Both of these let you run code "around" a request, and it's a common point of confusion because they look similar from the outside — both can inspect a request before it's handled and both can act after a response is produced. But they operate at fundamentally different layers, and the distinction is a genuinely useful piece of architectural knowledge, not just interview trivia.</p>
+<p>A <strong>Servlet <code>Filter</code></strong> is a servlet-spec construct, registered with the servlet container itself, that sits entirely outside Spring's <code>DispatcherServlet</code> and has no knowledge that Spring, controllers, or handler methods even exist. Filters are chained: each one receives the request, the response, and a <code>FilterChain</code>, and is responsible for explicitly calling <code>chain.doFilter(request, response)</code> to pass control to the next filter (or, at the end of the chain, to <code>DispatcherServlet</code> itself). Because a filter runs before <code>DispatcherServlet</code> is even reached, it cannot know which controller method will eventually handle the request, and it has no access to Spring MVC concepts like the resolved <code>HandlerMethod</code> or a <code>ModelAndView</code> — by the time those exist, execution is already deep inside Spring's own dispatch logic, past the filter chain. Filters are the right tool for concerns that are legitimately request/response-level and framework-agnostic: authentication token validation, CORS headers, request/response logging at the wire level, compression, or wrapping the request/response streams (e.g. to make a request body re-readable).</p>
+<pre><code>public class RequestLoggingFilter implements Filter {
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        long start = System.nanoTime();
+        chain.doFilter(req, res); // MUST call this, or the request dead-ends here
+        long tookMs = (System.nanoTime() - start) / 1_000_000;
+        // no idea which controller method just ran - only the raw request/response
+        log.info("{} {} took {}ms", ((HttpServletRequest) req).getMethod(),
+                ((HttpServletRequest) req).getRequestURI(), tookMs);
+    }
+}</code></pre>
+<p>A <strong>Spring <code>HandlerInterceptor</code></strong>, by contrast, lives entirely inside Spring MVC — it's registered with a <code>HandlerMapping</code> (via a <code>WebMvcConfigurer</code>'s <code>addInterceptors</code>) and only ever runs for requests that reach <code>DispatcherServlet</code> and get matched to a handler. Unlike a filter's single <code>doFilter</code> method, an interceptor exposes three distinct lifecycle hooks tied directly to the MVC dispatch process:</p>
+<ul>
+<li><strong><code>preHandle(request, response, handler)</code></strong> — runs before the handler method is invoked, and critically, it receives the resolved <code>handler</code> object (the actual <code>HandlerMethod</code>/controller method that's about to run) as a parameter — something a filter can never see. Returning <code>false</code> here short-circuits the request; neither the handler nor any later interceptor runs.</li>
+<li><strong><code>postHandle(request, response, handler, modelAndView)</code></strong> — runs after the handler method returns but before the view is rendered, and it receives the <code>ModelAndView</code> the handler produced, so it can inspect or modify model attributes or even swap the view name before rendering happens. This hook is skipped entirely if the handler threw an exception.</li>
+<li><strong><code>afterCompletion(request, response, handler, ex)</code></strong> — runs after the view has been fully rendered (or, for a <code>@ResponseBody</code>/<code>@RestController</code> endpoint, after the response body has been written), regardless of whether the request succeeded or an exception propagated — <code>ex</code> is non-null in the failure case. This is the right place for cleanup that needs to run no matter what, analogous to <code>@After</code> advice in AOP.</li>
+</ul>
+<pre><code>public class AuditInterceptor implements HandlerInterceptor {
+
+    @Override
+    public boolean preHandle(HttpServletRequest req, HttpServletResponse res, Object handler) {
+        if (handler instanceof HandlerMethod hm) {
+            // full access to which controller method is about to run - a filter cannot do this
+            log.info("about to invoke {}", hm.getMethod().getName());
+        }
+        return true; // false would stop the chain before the controller ever runs
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest req, HttpServletResponse res,
+                                 Object handler, Exception ex) {
+        if (ex != null) {
+            log.warn("request failed after handler execution: {}", ex.toString());
+        }
+    }
+}</code></pre>
+<p>The practical dividing line: reach for a <strong>filter</strong> when the concern doesn't need to know anything about which Spring controller method is involved (security token checks, CORS, gzip, raw access logging) — it's inherently a servlet-container-level concern and Spring shouldn't even need to be in the picture. Reach for a <strong><code>HandlerInterceptor</code></strong> when the concern genuinely needs MVC context — the resolved handler method (to read a custom annotation on it, for example, like a <code>@RequiresRole</code> marker on specific ShopSphere admin endpoints), or the <code>ModelAndView</code> to adjust what gets rendered. Ordering also matters operationally: every registered filter runs (in chain order) before <em>any</em> interceptor's <code>preHandle</code>, because the entire filter chain — including the final <code>chain.doFilter</code> call that hands off to <code>DispatcherServlet</code> — completes its "before" portion prior to <code>DispatcherServlet</code> even starting to resolve a handler.</p>
+<div class="callout">
+<div class="callout-title">The full path, assembled</div>
+<p>Putting sections 9.1–9.6 together, a single ShopSphere <code>POST /orders</code> request travels: servlet container → registered <code>Filter</code> chain (auth check, CORS, logging) → <code>DispatcherServlet</code> → <code>HandlerMapping</code> resolves the target <code>HandlerExecutionChain</code> (the <code>OrderController.placeOrder</code> method plus any matching interceptors) → registered <code>HandlerInterceptor.preHandle</code> hooks run → <code>HandlerAdapter</code> resolves arguments (path variables, and an <code>HttpMessageConverter</code> deserializing the JSON body into a <code>CreateOrderRequest</code>) → the controller method actually executes, invoking <code>OrderService</code> as covered in sections 1–8 → the returned <code>Order</code> is handed to an <code>HttpMessageConverter</code> for serialization (because <code>@RestController</code> implies <code>@ResponseBody</code>, skipping view resolution) → <code>postHandle</code> runs (no-op here, since there's no <code>ModelAndView</code> on a REST endpoint) → the response is written → <code>afterCompletion</code> runs on every interceptor → control unwinds back out through the filter chain.</p>
+</div>
+
 <h2>Concepts Worth Being Able to Explain From First Principles</h2>
 
 <details class="concept-qa">
@@ -288,6 +370,26 @@ public class CheckoutAuditAspect {
 <details class="concept-qa">
 <summary>ApplicationContext is described as a "superset" of BeanFactory — what does that actually mean in terms of the Java interfaces involved?</summary>
 <div class="qa-body"><code>ApplicationContext</code> is not a separate, competing container design — it's a Java interface that itself extends <code>BeanFactory</code> (through intermediate interfaces like <code>ListableBeanFactory</code>, which adds the ability to enumerate all registered bean definitions rather than only fetch one by name, and <code>AutowireCapableBeanFactory</code>, which adds the ability to autowire dependencies into an object the container didn't create itself). On top of that base contract, <code>ApplicationContext</code> additionally mixes in <code>EnvironmentCapable</code> (profiles and property sources), <code>ApplicationEventPublisher</code> (publish/subscribe for events like an in-process <code>OrderPlaced</code> notification), <code>ResourceLoader</code>, and <code>MessageSource</code> (i18n). The concrete class Spring Boot actually instantiates at startup — <code>AnnotationConfigServletWebServerApplicationContext</code> — implements all of this plus <code>ConfigurableApplicationContext</code>'s lifecycle control (<code>refresh()</code>, <code>close()</code>). So "superset" is literal: every method a <code>BeanFactory</code> exposes is also callable on an <code>ApplicationContext</code>, plus a large amount more, and the eager-singleton-instantiation behavior is specifically part of what <code>refresh()</code> does that plain <code>BeanFactory</code> usage never triggers on its own.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Walk through what happens, mechanically, between a request hitting Tomcat and a controller method actually running.</summary>
+<div class="qa-body">The embedded servlet container hands the request to <code>DispatcherServlet</code>, the single front-controller servlet Spring Boot registers for (typically) all paths. <code>DispatcherServlet</code> asks a <code>HandlerMapping</code> (<code>RequestMappingHandlerMapping</code> for annotated controllers) which handler matches the request's path/method/headers — this returns a <code>HandlerExecutionChain</code> wrapping a <code>HandlerMethod</code> plus any applicable interceptors, but nothing has executed yet. <code>DispatcherServlet</code> then delegates actual invocation to a <code>HandlerAdapter</code> (<code>RequestMappingHandlerAdapter</code>), because it doesn't know how to invoke arbitrary handler types itself. The adapter resolves each method parameter via <code>HandlerMethodArgumentResolver</code>s — path variables, query params, and, for an <code>@RequestBody</code> parameter, delegating to an <code>HttpMessageConverter</code> that deserializes the raw request bytes into a Java object based on <code>Content-Type</code>. Only after all arguments are resolved does the controller method actually run.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why does DispatcherServlet delegate to both a HandlerMapping and a separate HandlerAdapter instead of just calling the handler method directly?</summary>
+<div class="qa-body">These are two genuinely separate responsibilities. <code>HandlerMapping</code>'s job is purely to decide <em>which</em> handler should process a given request, based on URL pattern, HTTP method, headers, and content type matching — it returns a reference to a handler without invoking anything. <code>HandlerAdapter</code>'s job is knowing <em>how</em> to actually invoke whatever kind of handler was returned, since Spring MVC has historically supported multiple handler shapes (annotated <code>@RequestMapping</code> methods, legacy <code>Controller</code> implementations, functional endpoints). By keeping "what handles this" and "how do I call that kind of thing" as separate interfaces, <code>DispatcherServlet</code> stays agnostic to handler type entirely — it just asks a <code>HandlerMapping</code> for a handler and hands that handler to whichever <code>HandlerAdapter</code> claims it supports it, without ever needing a big if/else over handler types itself.</div>
+</details>
+
+<details class="concept-qa">
+<summary>What's the real difference between a Servlet Filter and a Spring HandlerInterceptor, beyond "they both run around a request"?</summary>
+<div class="qa-body">A <code>Filter</code> is a servlet-spec construct registered with the container itself; it runs before <code>DispatcherServlet</code> is even reached and has no visibility into Spring MVC concepts at all — it only ever sees the raw request/response and a <code>FilterChain</code> it must explicitly call <code>doFilter</code> on to continue. It cannot know which controller method will eventually run, because that hasn't been resolved yet at the point a filter executes. A <code>HandlerInterceptor</code> is a Spring MVC construct registered with a <code>HandlerMapping</code>; it only runs for requests that <code>DispatcherServlet</code> has already matched to a handler, and its <code>preHandle</code> hook receives that resolved handler object directly, letting it inspect the target controller method (e.g. read a custom annotation on it) — something a filter structurally cannot do. Interceptors also expose three distinct lifecycle points (<code>preHandle</code>, <code>postHandle</code>, <code>afterCompletion</code>) tied to specific moments in MVC dispatch, versus a filter's single before/after wrap around <code>chain.doFilter</code>.</div>
+</details>
+
+<details class="concept-qa">
+<summary>Why is postHandle skipped when a controller throws, but afterCompletion always runs?</summary>
+<div class="qa-body"><code>postHandle</code> is defined to run after the handler method returns successfully and before the view is rendered, specifically so it can inspect or adjust the <code>ModelAndView</code> the handler produced — but if the handler threw an exception instead of returning normally, there is no <code>ModelAndView</code> to hand it, so the hook is skipped entirely rather than called with a meaningless null. <code>afterCompletion</code> exists specifically to be the guaranteed cleanup hook regardless of outcome — it runs after request processing completes whether that completion was a normal render or an exception, and it receives the exception (or null) as an explicit parameter so cleanup code can branch on success versus failure. This mirrors the same before/around/after-regardless-of-outcome split as AOP advice types (<code>@Before</code>/<code>@AfterReturning</code> vs. <code>@After</code>), just applied at the MVC dispatch layer instead of the method-invocation layer.</div>
 </details>
 
 
