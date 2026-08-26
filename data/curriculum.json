@@ -137,6 +137,46 @@
             { "id": "batch-processing-scheduled-jobs", "track": "Spring / Bonus", "title": "Batch Processing & Scheduled Jobs", "file": "content/batch-processing-scheduled-jobs.html" },
             { "id": "data-privacy-compliance", "track": "Bonus", "title": "Data Privacy & Compliance: GDPR & PCI-DSS", "file": "content/data-privacy-compliance.html" }
           ]
+        },
+        {
+          "range": "Core Gaps",
+          "topics": [
+            { "id": "build-tools-maven-gradle", "track": "Java / Bonus", "title": "Build Tools: Maven & Gradle for Java Backend Projects", "file": "content/build-tools-maven-gradle.html" },
+            { "id": "reflection-annotations", "track": "Java / Bonus", "title": "Reflection & Custom Annotations: How Spring Works Under the Hood", "file": "content/reflection-annotations.html" },
+            { "id": "java-io-nio", "track": "Java / Bonus", "title": "Java I/O & NIO: Files, Channels, Buffers & Non-Blocking I/O", "file": "content/java-io-nio.html" },
+            { "id": "spring-webflux-reactive", "track": "Spring / Bonus", "title": "Reactive Spring: WebFlux & Project Reactor", "file": "content/spring-webflux-reactive.html" },
+            { "id": "bean-validation-jakarta", "track": "Spring / Bonus", "title": "Bean Validation Deep-Dive: Custom Validators & Validation Groups", "file": "content/bean-validation-jakarta.html" },
+            { "id": "database-migrations-flyway-liquibase", "track": "Bonus", "title": "Database Schema Migrations: Flyway, Liquibase & Safe Production Rollouts", "file": "content/database-migrations-flyway-liquibase.html" },
+            { "id": "multi-tenancy-database-design", "track": "HLD / Bonus", "title": "Multi-Tenancy Database Design Patterns", "file": "content/multi-tenancy-database-design.html" },
+            { "id": "infrastructure-as-code", "track": "Bonus", "title": "Infrastructure as Code: Terraform Fundamentals for Backend Engineers", "file": "content/infrastructure-as-code.html" },
+            { "id": "websockets-realtime", "track": "Spring / Bonus", "title": "Real-Time Communication: WebSockets, STOMP & Server-Sent Events", "file": "content/websockets-realtime.html" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "phase-5",
+      "title": "Phase 5 — Interview FAQ Bank",
+      "days": "Reference",
+      "focus": "The most commonly asked backend Java developer interview questions, split by topic for quick review.",
+      "dayRanges": [
+        {
+          "range": "FAQ",
+          "topics": [
+            { "id": "faq-index", "track": "FAQ", "title": "FAQ: Browse All Categories", "file": "content/faq-index.html" },
+            { "id": "faq-core-java-oop", "track": "FAQ", "title": "FAQ: Core Java & OOP", "file": "content/faq-core-java-oop.html" },
+            { "id": "faq-collections-streams", "track": "FAQ", "title": "FAQ: Collections & Streams API", "file": "content/faq-collections-streams.html" },
+            { "id": "faq-concurrency-jvm", "track": "FAQ", "title": "FAQ: Concurrency & JVM/GC", "file": "content/faq-concurrency-jvm.html" },
+            { "id": "faq-spring-boot", "track": "FAQ", "title": "FAQ: Spring Framework & Spring Boot", "file": "content/faq-spring-boot.html" },
+            { "id": "faq-spring-security", "track": "FAQ", "title": "FAQ: Spring Security, Auth & JWT", "file": "content/faq-spring-security.html" },
+            { "id": "faq-hibernate-jpa", "track": "FAQ", "title": "FAQ: Hibernate, JPA & ORM", "file": "content/faq-hibernate-jpa.html" },
+            { "id": "faq-sql-database", "track": "FAQ", "title": "FAQ: SQL, Databases & Indexing", "file": "content/faq-sql-database.html" },
+            { "id": "faq-microservices-kafka", "track": "FAQ", "title": "FAQ: Microservices, REST APIs & Kafka", "file": "content/faq-microservices-kafka.html" },
+            { "id": "faq-system-design", "track": "FAQ", "title": "FAQ: System Design (HLD & LLD)", "file": "content/faq-system-design.html" },
+            { "id": "faq-docker-kubernetes", "track": "FAQ", "title": "FAQ: Docker, Kubernetes & Cloud", "file": "content/faq-docker-kubernetes.html" },
+            { "id": "faq-testing-cicd", "track": "FAQ", "title": "FAQ: Testing & CI/CD", "file": "content/faq-testing-cicd.html" },
+            { "id": "faq-git-tools", "track": "FAQ", "title": "FAQ: Git & Dev Tools", "file": "content/faq-git-tools.html" }
+          ]
         }
       ]
     }
