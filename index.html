@@ -29,6 +29,7 @@
       <div class="search-wrap">
         <input id="search" type="text" placeholder="Search topics… (e.g. GC, Kafka, CAP)" autocomplete="off" />
       </div>
+      <button id="sidebar-toggle" class="sidebar-toggle desktop-only" title="Collapse sidebar" aria-label="Toggle sidebar">⟨⟩</button>
       <button id="theme-toggle" class="theme-toggle" title="Toggle appearance" aria-label="Toggle appearance">◐</button>
     </div>
   </header>
@@ -57,5 +58,12 @@
   </div>
 
   <script src="assets/app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(() => {});
+      });
+    }
+  </script>
 </body>
 </html>
