@@ -8,6 +8,7 @@
   const sidebarEl = document.getElementById('sidebar');
   const sidebarScrim = document.getElementById('sidebar-scrim');
   const menuToggle = document.getElementById('menu-toggle');
+  const sidebarToggle = document.getElementById('sidebar-toggle');
   const contentEl = document.getElementById('content');
   const searchEl = document.getElementById('search');
   const cmdk = document.getElementById('cmdk');
@@ -27,6 +28,15 @@
     sidebarEl.classList.contains('open') ? closeSidebar() : openSidebar();
   });
   sidebarScrim.addEventListener('click', closeSidebar);
+
+  function initSidebarCollapse() {
+    const collapsed = localStorage.getItem('sidebarCollapsed') === '1';
+    document.body.classList.toggle('sidebar-collapsed', collapsed);
+  }
+  sidebarToggle.addEventListener('click', () => {
+    const collapsed = document.body.classList.toggle('sidebar-collapsed');
+    localStorage.setItem('sidebarCollapsed', collapsed ? '1' : '0');
+  });
 
   const trackClass = (track) => {
     const t = track.toLowerCase();
@@ -128,9 +138,10 @@
 
   function buildPageToc(articleEl) {
     const headers = Array.from(articleEl.querySelectorAll('h2, h3'));
-    if (headers.length < 3) return null;
+    if (!headers.length) return { toc: null, numberToId: {} };
 
     const used = new Set();
+    const numberToId = {};
     const items = headers.map((h) => {
       let id = slugify(h.textContent);
       let n = 2;
@@ -139,8 +150,12 @@
       }
       used.add(id);
       h.id = id;
+      const numMatch = h.textContent.trim().match(/^(\d+(?:\.\d+)?)\b/);
+      if (numMatch) numberToId[numMatch[1]] = id;
       return { id, text: h.textContent, level: h.tagName.toLowerCase() };
     });
+
+    if (headers.length < 3) return { toc: null, numberToId };
 
     const toc = document.createElement('details');
     toc.className = 'page-toc';
@@ -173,8 +188,87 @@
       if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
 
-    return toc;
+    return { toc, numberToId };
   }
+
+  // Turns plain-text same-page references like "(see §5.2)" or "see section 3"
+  // into clickable spans that smooth-scroll to the target heading.
+  function wrapSectionRefs(articleEl, numberToId) {
+    if (!numberToId || !Object.keys(numberToId).length) return;
+    const skipTags = new Set(['SCRIPT', 'STYLE', 'PRE', 'CODE', 'A', 'H1', 'H2', 'H3']);
+    const walker = document.createTreeWalker(articleEl, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        let el = node.parentElement;
+        while (el && el !== articleEl) {
+          if (skipTags.has(el.tagName)) return NodeFilter.FILTER_REJECT;
+          el = el.parentElement;
+        }
+        return /§|section\s+\d/i.test(node.nodeValue) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      },
+    });
+
+    const textNodes = [];
+    let n;
+    while ((n = walker.nextNode())) textNodes.push(n);
+
+    const pattern = /§\s?(\d+(?:\.\d+)?)|\bsection\s+(\d+(?:\.\d+)?)\b/gi;
+    textNodes.forEach((node) => {
+      const text = node.nodeValue;
+      pattern.lastIndex = 0;
+      let match;
+      let lastIndex = 0;
+      let found = false;
+      const frag = document.createDocumentFragment();
+      while ((match = pattern.exec(text))) {
+        const num = match[1] || match[2];
+        const targetId = numberToId[num];
+        if (!targetId) continue;
+        found = true;
+        frag.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+        const span = document.createElement('span');
+        span.className = 'sec-ref';
+        span.dataset.secTarget = targetId;
+        span.textContent = match[0];
+        frag.appendChild(span);
+        lastIndex = match.index + match[0].length;
+      }
+      if (!found) return;
+      frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+      node.parentNode.replaceChild(frag, node);
+    });
+  }
+
+  let backJumpBtn = null;
+  let savedScrollY = null;
+
+  function hideBackJumpButton() {
+    if (backJumpBtn) backJumpBtn.remove();
+    backJumpBtn = null;
+    savedScrollY = null;
+  }
+
+  function showBackJumpButton() {
+    if (backJumpBtn) return;
+    backJumpBtn = document.createElement('button');
+    backJumpBtn.className = 'back-jump-btn';
+    backJumpBtn.textContent = '↩ Back to where you were';
+    backJumpBtn.addEventListener('click', () => {
+      const y = savedScrollY;
+      hideBackJumpButton();
+      if (y !== null) window.scrollTo({ top: y, behavior: 'smooth' });
+    });
+    document.body.appendChild(backJumpBtn);
+  }
+
+  contentEl.addEventListener('click', (e) => {
+    const ref = e.target.closest('.sec-ref');
+    if (!ref) return;
+    const target = document.getElementById(ref.dataset.secTarget);
+    if (!target) return;
+    savedScrollY = window.scrollY;
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    showBackJumpButton();
+  });
 
   function setActiveLink(topicId) {
     document.querySelectorAll('.topic-link').forEach((el) => {
@@ -221,13 +315,15 @@
     contentEl.innerHTML = `<article class="topic-page">${html}${footer}</article>`;
 
     const articleEl = contentEl.querySelector('.topic-page');
-    const toc = buildPageToc(articleEl);
+    const { toc, numberToId } = buildPageToc(articleEl);
     if (toc) {
       const tagsEl = articleEl.querySelector('.topic-tags');
       const anchor = tagsEl || articleEl.querySelector('h1');
       if (anchor) anchor.insertAdjacentElement('afterend', toc);
       else articleEl.insertBefore(toc, articleEl.firstChild);
     }
+    wrapSectionRefs(articleEl, numberToId);
+    hideBackJumpButton();
 
     window.scrollTo({ top: 0, behavior: 'instant' in window ? 'instant' : 'auto' });
   }
@@ -241,6 +337,7 @@
     if (!hash) {
       contentEl.innerHTML = document.getElementById('hero').outerHTML;
       setActiveLink(null);
+      hideBackJumpButton();
       return;
     }
     renderTopic(hash);
@@ -309,5 +406,6 @@
   });
 
   initTheme();
+  initSidebarCollapse();
   loadCurriculum().then(handleRoute);
 })();

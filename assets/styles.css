@@ -81,6 +81,21 @@ a:hover { text-decoration: underline; }
   flex-shrink: 0;
 }
 .menu-toggle:hover { background: var(--accent-soft); }
+.sidebar-toggle {
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  color: var(--text);
+  border-radius: 10px;
+  width: 34px;
+  height: 34px;
+  cursor: pointer;
+  font-size: 15px;
+  flex-shrink: 0;
+}
+.sidebar-toggle:hover { background: var(--accent-soft); }
+@media (max-width: 900px) {
+  .sidebar-toggle { display: none; }
+}
 .brand {
   display: flex;
   align-items: center;
@@ -133,6 +148,16 @@ a:hover { text-decoration: underline; }
   position: sticky;
   top: 58px;
   border-right: 1px solid var(--border);
+  transition: width 0.2s ease, padding 0.2s ease;
+}
+
+@media (min-width: 901px) {
+  body.sidebar-collapsed .sidebar {
+    width: 0;
+    padding: 24px 0 60px 0;
+    overflow: hidden;
+    border-right: none;
+  }
 }
 
 .phase-block { margin-bottom: 22px; }
@@ -288,7 +313,12 @@ kbd {
     max-height: calc(100vh - 110px);
     overflow-y: auto;
   }
-  .page-toc summary { display: none; }
+  .page-toc summary { display: block; }
+  .page-toc:not([open]) {
+    width: auto;
+    padding: 8px 14px;
+    overflow: visible;
+  }
 }
 .topic-page p { font-size: 16px; line-height: 1.7; color: var(--text); margin: 0 0 16px; }
 .topic-page ul, .topic-page ol { font-size: 16px; line-height: 1.7; padding-left: 22px; margin: 0 0 16px; }
@@ -379,6 +409,33 @@ th { font-weight: 650; color: var(--text-secondary); font-size: 13px; text-trans
 .concept-qa summary::before { content: "▸ "; color: var(--accent); }
 .concept-qa[open] summary::before { content: "▾ "; }
 .concept-qa .qa-body { padding-bottom: 16px; font-size: 14.5px; line-height: 1.65; color: var(--text-secondary); }
+
+/* Same-page section references, e.g. "(see §5.2)" */
+.sec-ref {
+  color: var(--accent);
+  cursor: pointer;
+  border-bottom: 1px dotted var(--accent);
+  white-space: nowrap;
+}
+.sec-ref:hover { text-decoration: none; background: var(--accent-soft); }
+
+.back-jump-btn {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 110;
+  background: var(--text);
+  color: var(--bg);
+  border: none;
+  border-radius: 999px;
+  padding: 10px 20px;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+}
+.back-jump-btn:hover { opacity: 0.9; }
 
 .footer-nav {
   display: flex;
